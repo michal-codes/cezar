@@ -330,6 +330,21 @@ describe('workspace semaphore across RunManagers (step 2.5)', () => {
     }
   }, 45_000);
 
+  it('a dispatch cap above maxParallel never raises concurrency — the host cap still decides', async () => {
+    const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 2, dispatchMaxConcurrent: 8 } });
+    const a = project('cez-wsem-dcapabove-', semaphore);
+    const children = [0, 1, 2].map((n) => a.manager.startRun(SLOW, CHILD(`child ${n}`, `root-${n}`)));
+    await waitFor(
+      () => children.filter((c) => a.store.getRun(c.id)?.status === 'running').length >= 2,
+      'two children to run under the workspace cap',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    // The dispatch key is additive capacity policy, never extra capacity: `capacity()` is
+    // untouched, so `maxParallel` still bounds how many children may hold a slot at once.
+    expect(children.filter((c) => a.store.getRun(c.id)?.status === 'running')).toHaveLength(2);
+    expect(a.store.getRun(children[2]!.id)?.status).toBe('queued');
+  }, 45_000);
+
   it('counts dispatch children across projects: one project’s child spends the workspace ceiling', async () => {
     const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 4, dispatchMaxConcurrent: 1 } });
     const a = project('cez-wsem-dcapx-a-', semaphore);
