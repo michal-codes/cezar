@@ -1,11 +1,15 @@
 # Dispatch admission cap — an opt-in ceiling on concurrently running dispatch children
 
-> Slug: `dispatch-admission-scheduler` · Status: **design complete (v2.1) — for specification review** · Brief:
+> Slug: `dispatch-admission-scheduler` · Status: **design complete (v2.2) — for specification review** · Brief:
 > `.ai/specs/briefs/2026-09-20-dispatch-admission-scheduler.md` · Extends
 > `.ai/specs/2026-09-10-dispatch.md` (the 0.11 dispatch engine) · Review trail:
 > unit `b2a52605` (doctrine/simplicity/UX, verdict *changes*) drove the v2 shape; unit `4289c731`
 > (technical, verdict *changes*) reviewed the superseded v1, verified v2's base mechanics, and
-> contributed one v2 fix — the `waiting ⊆ active` exclusion in the counter · Delivery: one
+> contributed one v2 fix — the `waiting ⊆ active` exclusion in the counter; unit `b24f3534`
+> (specification review of this PR, verdict *changes*) found the per-sweep admission counter
+> double-counting (`startable()` read and `starting.add` are one synchronous block, so the live
+> counter already sees the child), the missing parked-vs-aggregate distinction in the counter's
+> rule, and two wrong line citations — all folded into v2.2 · Delivery: one
 > implementation PR referencing this spec.
 
 ## 📝 TLDR
@@ -22,7 +26,8 @@ route, no record field, no browser loop, no timer, no dead-end state.
 ## 📝 Problem Statement
 
 - **Dispatch has brakes on how much, never on when/how many at once.** 4 children in flight per
-  parent (`packages/cezar/src/dispatch/engine.ts:33,49-51`), a per-tree `maxSubtasks` cap and a
+  parent (`packages/cezar/src/dispatch/engine.ts:25` defines it, `workflows/run.ts:2035-2038`
+  enforces it), a per-tree `maxSubtasks` cap and a
   carved child budget (`engine.ts:62-79`) bound the blast radius, but admission is immediate:
   `dispatch()` → `startRun()` (`workflows/run.ts:1978-2086`, `:1145-1223`) → `queue.push` +
   `pump()` (`:1220-1222`), and `pump()` starts any queued run under
@@ -31,7 +36,9 @@ route, no record field, no browser loop, no timer, no dead-end state.
   never "how many of them may be dispatch children"; a four-child fan-out can saturate the host
   the moment slots free.
 - **The gap is named in the shipped design.** `.ai/specs/2026-09-10-dispatch.md` §"Not done
-  (deliberately)" lists `mission-scoped concurrency`; this spec is the smallest useful slice.
+  (deliberately)" lists `mission-scoped concurrency` — the same gap, named for the missions
+  experiment the dispatch engine replaced. This spec is the smallest useful slice, and it keeps
+  the ceiling workspace-wide rather than per-tree for the reason in A4.
 - **Evidence it matters:** the owner asked for a throttle on dispatch-generated runners with no
   database, configured from the cockpit; the three research units
   (`3006b0b7`, `61b93cd8`, `eae13733`) mapped the engines and the browser, and the doctrine review
@@ -53,10 +60,13 @@ route, no record field, no browser loop, no timer, no dead-end state.
 3. **A workspace-wide counter on the existing semaphore.** `WorkspaceSemaphore` gains an optional
    `dispatchBusy?(): number` participant member and sums it across managers exactly like `busy()`
    (`semaphore.ts:151-184`); `RunManager` counts the runs that hold a compute slot — `starting`
-   plus `active` minus `waiting`, mirroring `busySlots()` (`run.ts:1253-1265`; `waiting ⊆ active`
-   at `:1680-1682`, so the subtraction is load-bearing) — whose record has
-   `dispatch.parentRunId`. Within one pump sweep the predicate also tracks the dispatch children
-   it started in that sweep, so two free slots and `cap = 1` still start exactly one child.
+   plus `active` minus `waiting` (`waiting ⊆ active` — a parked run is in both sets, which is why
+   the subtraction is load-bearing) — whose record has `dispatch.parentRunId`. Note what this rule is NOT: it does
+   not reproduce the aggregate bookkeeping `busySlots()` layers on top (`run.ts:1253-1266`
+   subtracts ordinary waiting runs, `min(watchers, maxMonitoringSessions)` and spawn-parked
+   parents). Those exemptions widen the HOST's parallel budget for parents parked on their own
+   children; this counter answers a different question — how many children are running — so a
+   child that is `waiting` is excluded by the per-run `waiting` test alone.
 4. **Fully event-driven.** `releaseSlot() → semaphore.release()` already pumps the whole workspace
    when a slot frees (`run.ts:1307-1318`), and `PUT /workspace/config` already refreshes the
    semaphore cache and pumps every project (`server.ts:3033`, `semaphore.ts:296`). No timer, no
@@ -93,22 +103,27 @@ interface gains optional `dispatchBusy?(): number` and the semaphore sums it acr
 `busy()` (`:175-184`).
 
 **`RunManager` (`workflows/run.ts`).** `dispatchBusy()` counts the slot-holding runs —
-`starting` plus `active` minus `waiting`, the same exclusion as `busySlots()` at `:1253-1265` —
-whose record carries `dispatch.parentRunId`. The `startable(id)` closure inside `pump()` gains,
-after the existing `accountHeldFor` branch:
+`starting`, plus `active` runs that are not `waiting` — whose record carries
+`dispatch.parentRunId`. The `startable(id)` closure inside `pump()` gains, after the existing
+`accountHeldFor` branch:
 
 ```ts
 const cap = this.semaphore.dispatchMaxConcurrent();
-if (queued && cap !== null && cap > 0 && isDispatchChild(queued)
-    && this.semaphore.dispatchBusy() + startedDispatchThisSweep >= cap) return false;
+if (queued && cap !== null && cap > 0 && queued.dispatch?.parentRunId !== undefined
+    && this.semaphore.dispatchBusy() >= cap) return false;
 return capacity();
 ```
 
-`startedDispatchThisSweep` increments when a dispatch child is dequeued, so a single sweep cannot
-overshoot the cap before the child lands in `starting`. `capacity()` (`:1353-1356`) is untouched;
-the new predicate is per-run precisely so a blocked dispatch child does not block ordinary work.
+**No per-sweep counter — adding one would be the bug.** The admission decision
+(`findIndex(startable)`, `:1387`) and the admitted run's arrival in `starting` (`:1399`) sit in
+the same SYNCHRONOUS block of `pump()`, and `dispatchBusy()` reads the live sets, so a child this
+sweep admitted is already counted when the next candidate is evaluated. A
+`+ startedDispatchThisSweep` term would count it twice and admit only `ceil(cap / 2)` children —
+`cap = 4` with four free slots would start two — which fails safe but is simply wrong; step 5
+pins it with a `cap = 2` sweep test. `capacity()` (`:1353-1356`) is untouched; the new predicate
+is per-run precisely so a blocked dispatch child does not block ordinary work.
 `findIndex(startable)` already leaves blocked runs in the queue and considers the next candidate
-(the usage-limit hold is the precedent, `:1381-1389`).
+(the usage-limit hold is the precedent, `:1379-1389`).
 
 **No other engine changes.** The child stays a normal `queued` run: the 4-in-flight cap, the
 budget carve, restart recovery, cancel/delete and the SSE stream all keep their current
@@ -127,6 +142,11 @@ dispatchMaxConcurrent: z.number().int().min(0).max(16).nullable().default(null).
 
 - `null` and `0` both mean "no cap"; the Settings field sends `null` when cleared, matching the
   `memoryLimitMb` convention.
+- `.catch(null)` degrades a malformed value to "no cap" instead of failing the file — deliberately
+  fail-OPEN, and stated here because it is a real choice: the predicate may only ever *delay* a
+  start, while failing closed on a hand-edited key would strand every dispatched child in that
+  workspace. The PUT boundary is where a bad value is refused (`400`), so the shipped paths rarely
+  reach the `.catch`; the worst case of a wrong value is a missing ceiling, never a blocked queue.
 - The GET body materializes `null`; the PUT body accepts it optionally and applies it only when
   present (`PUT` is partial, like every other resource key).
 - `backward compatibility`: an older cezar ignores the unknown key through `.passthrough()`;
@@ -156,8 +176,10 @@ section are updated.
   dispatched tasks", a number input (`1..16`, empty = no cap), saved with the existing Save
   button pattern of the section. Hint: "Dispatched children wait in the queue while this many are
   already running. Ordinary tasks are not affected. Leave empty for no limit."
-- The field is a real control with no dead knob, per the repo's settings doctrine; its value is
-  workspace-wide, so every browser and the CLI show the same number after the query refetch.
+- The field is a real control with no dead knob, per the repo's settings doctrine — the worked
+  example being Appearance, which states the rule in its own header
+  (`packages/web/src/routes/settings/appearance.tsx:17-29`); its value is workspace-wide, so every
+  browser and the CLI show the same number after the query refetch.
 - **No new task-table surface.** A capped child is an ordinary `queued` row and already shows its
   queue position; there is no held chip, no Release action and no stale-state cleanup.
 - States: `null` → field empty, behavior unchanged; `CEZ_DISPATCH=0` → no child is ever created,
@@ -173,6 +195,7 @@ section are updated.
 | Cap higher than `maxParallel` | Effective concurrency is still `min(maxParallel, projectMax)`; the key never raises it. |
 | Cap lowered while children run | Running children are not preempted; only new admissions are gated. |
 | Child parked in `waiting` (monitor) | Not counted — it holds no turn and no slot (#347); `active` includes it, and `dispatchBusy()` subtracts `waiting`. |
+| A capped child with no slot in sight | Stays `queued`, with its position visible in the task list. Deliberately **not** re-checked on a timer, and unlike the usage-limit hold it needs no durable re-check record: the events that change the answer (a child settling, being cancelled or deleted, a `resources` write, a restart re-enqueueing it) are exactly the ones that already pump or rebuild the queue. |
 | Cross-project | `dispatchBusy()` sums every manager, so the ceiling is workspace-wide like `maxParallel`. |
 | Restart | The key persists in `~/.cezar/config.json`; queued children resume through the normal `recover()` path with no special handling. |
 | Cancel/delete a queued dispatch child | Unchanged; the next startable run takes the freed position. |
@@ -247,9 +270,11 @@ Every step leaves the app working and is covered by a test.
 4. Implement `RunManager.dispatchBusy()` over the slot-holding set (`starting` +
    `active − waiting`) with `dispatch.parentRunId`; test that a child parked in `waiting` is
    excluded even though it is still in `active`.
-5. Add the per-run predicate (with the per-sweep started counter) to `pump().startable()`; test:
-   `cap = 1` starts exactly one of two queued children; an ordinary run passes a capped child;
-   `null`/`0` is byte-identical; `cap > maxParallel` never raises concurrency.
+5. Add the per-run predicate to `pump().startable()` — `dispatchBusy()` only, no per-sweep
+   counter; test: `cap = 1` starts exactly one of two queued children; `cap = 2` starts BOTH in a
+   single sweep (the counter must see live slot holders, not admissions); an ordinary run passes a
+   capped child; a child queued in another project is capped by this project's running child;
+   `null`/`0` is byte-identical; a lowered cap never preempts a running child.
 6. Wire the GET body and PUT handler for the new key in `server/server.ts`; test partial PUT,
    clearing with `null`, and that `semaphore.refresh()` + pump apply a change without restart.
 7. Add the Settings → Resources field with validation (empty = no cap, 1..16) and its test.
@@ -267,8 +292,9 @@ claim below is also verifiable in the source files named inline):
   (`startable()` `run.ts:1379-1383`, `capacity()` `:1353-1356`, `busySlots()` `:1265`,
   `releaseSlot()` `:1307-1318`, dispatch creation `:2032` → `:1220-1222`).
 - Governance/prior art: `.ai/cezar/dispatch/06328893-4e50-4dbe-9a56-243891c933bc/units/61b93cd8/notes.md`
-  (semaphore `busy()`/`maxParallel()` `semaphore.ts:175-184,284-287`; dispatch caps
-  `dispatch/engine.ts:33,49-51,62-79`; `queued` already counts in flight and reserves budget).
+  (semaphore `busy()`/`maxParallel()` `semaphore.ts:175-184`, `projectMaxParallel()` `:284-287`;
+  dispatch caps `dispatch/engine.ts:25,45-51,62-79` and the enforcement in `run.ts:2035-2038`;
+  `queued` already counts in flight and reserves budget).
 - Browser/policy doctrine: `.ai/cezar/dispatch/06328893-4e50-4dbe-9a56-243891c933bc/units/b2a52605/notes.md`
   (`BACKWARD_COMPATIBILITY.md:40` browser-state vs workspace choices; `appearance.tsx:17-26`;
   origin/port split `index.ts:252,266,281,290`; Settings patterns).
