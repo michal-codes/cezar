@@ -44,7 +44,13 @@ Five moves that make the cockpit worth the browser tab:
   holds the rest in a FIFO queue with visible positions (`#1`, `#2`, …). Cancel a
   queued task before it starts; the queue even survives a cockpit restart —
   everything still `queued` is re-enqueued in order. It's the orchestration layer
-  that turns "one agent at a time" into a backlog that drains itself.
+  that turns "one agent at a time" into a backlog that drains itself. Tasks that
+  dispatch other tasks can be bounded separately: **Settings → Resources → Max
+  running dispatched tasks** (`dispatchMaxConcurrent`, default *no limit*) admits a
+  dispatched child only while fewer than N dispatch children are running
+  workspace-wide. Ordinary tasks keep their normal share of `maxParallel`, a capped
+  child simply waits in the queue, and lowering the value never stops a child that
+  is already running.
 - 🧠 **Memory-aware runs.** Each run's whole process tree is sampled (~2 s) for CPU
   and RSS, and its **peak memory** is recorded and shown in the task table. Set an
   optional per-task **memory ceiling** (`memoryLimitMb`) and a run that crosses it
