@@ -119,6 +119,15 @@ const resourcesSchema = z
     /** Per-task memory ceiling in MiB; null = no limit (matches the file's
      *  literal `"memoryLimitMb": null` in the spec's Data Model). */
     memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().default(null).catch(null),
+    /**
+     * Ceiling on concurrently RUNNING dispatch children (`dispatch.parentRunId` present),
+     * workspace-wide like `maxParallel` (spec 2026-09-20-dispatch-admission-scheduler). `null`
+     * and `0` both mean "no cap" — the shipped default, i.e. today's behavior byte-for-byte.
+     * Ordinary tasks are unaffected: the predicate lives per queued run, not in the shared
+     * capacity check, so a capped child waits in the queue while ordinary work keeps starting.
+     * Lowering it below the running count never preempts anything — it gates new admissions.
+     */
+    dispatchMaxConcurrent: z.number().int().min(0).max(16).nullable().default(null).catch(null),
     /** Default worktree retention for projects that don't override it. */
     worktreeRetentionDefault: z.number().int().min(0).max(1000).default(10).catch(10),
   })

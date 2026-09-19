@@ -47,6 +47,9 @@ export const workspaceConfigResponseSchema = z.object({
     /** Resume a run a provider usage limit stopped, once the limit resets. Default `true`. */
     autoResumeOnUsageLimit: z.boolean(),
     memoryLimitMb: z.number().nullable(),
+    /** Ceiling on concurrently running dispatch children; null = no cap (spec
+     *  2026-09-20-dispatch-admission-scheduler). Workspace-wide, like `maxParallel`. */
+    dispatchMaxConcurrent: z.number().nullable(),
     worktreeRetentionDefault: z.number(),
   }),
   /**
@@ -108,6 +111,8 @@ export const setWorkspaceConfigInputSchema = z.object({
       monitoringWakeIntervalMinutes: z.number().int().min(1).max(60).nullable().optional(),
       autoResumeOnUsageLimit: z.boolean().optional(),
       memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().optional(),
+      /** `null`/`0` clears the ceiling back to "no cap". */
+      dispatchMaxConcurrent: z.number().int().min(0).max(16).nullable().optional(),
       worktreeRetentionDefault: z.number().int().min(0).max(1000).optional(),
     })
     .optional(),
