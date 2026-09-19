@@ -261,6 +261,111 @@ describe('workspace semaphore across RunManagers (step 2.5)', () => {
     );
   }, 45_000);
 
+  /**
+   * Dispatch admission cap (spec 2026-09-20-dispatch-admission-scheduler): the engine admits a
+   * dispatched child only while fewer than `resources.dispatchMaxConcurrent` children hold a
+   * compute slot WORKSPACE-wide. Three properties matter and each is pinned here: the gate is
+   * per-candidate (ordinary work keeps flowing past a capped child), the ceiling cannot overshoot
+   * within a single sweep (cap 2 really starts two), and `null`/`0` is byte-for-byte today's
+   * behavior.
+   */
+  const CHILD = (task: string, root: string) => ({
+    task,
+    dispatch: { rootRunId: root, parentRunId: root },
+  });
+
+  it('cap 1: one dispatch child runs, the next queues, and an ordinary run passes it', async () => {
+    const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 4, dispatchMaxConcurrent: 1 } });
+    const a = project('cez-wsem-dcap1-', semaphore);
+
+    const child1 = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+    await waitFor(() => a.store.getRun(child1.id)?.status === 'running', 'the first child to run');
+    const child2 = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(a.store.getRun(child2.id)?.status).toBe('queued'); // capped, keeps its place
+
+    // The one thing the cap must NOT do is starve ordinary work: the gate lives in the
+    // per-candidate predicate, not in `capacity()`, so this run starts and finishes.
+    const ordinary = a.manager.startRun(INSTANT, { task: 'ordinary work' });
+    await waitFor(
+      () => settled.includes(a.store.getRun(ordinary.id)?.status ?? ''),
+      'the ordinary run to finish beside the capped child',
+    );
+    expect(a.store.getRun(ordinary.id)?.status).toBe('done');
+
+    // A freed dispatch slot admits the queued child (event-driven: `releaseSlot` → `release()`).
+    await waitFor(
+      () => a.store.getRun(child2.id)?.status === 'running',
+      'the queued child to start once the first child settles',
+      30_000,
+    );
+  }, 45_000);
+
+  it('cap 2 starts TWO queued children in one sweep — the counter counts live slot holders only', async () => {
+    const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 4, dispatchMaxConcurrent: 2 } });
+    const a = project('cez-wsem-dcap2-', semaphore);
+
+    const child1 = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+    const child2 = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+    await waitFor(
+      () =>
+        a.store.getRun(child1.id)?.status === 'running' &&
+        a.store.getRun(child2.id)?.status === 'running',
+      'both children to run under a cap of 2',
+    );
+  }, 45_000);
+
+  it('no cap configured (null, and the explicit 0) starts children exactly as before', async () => {
+    for (const dispatchMaxConcurrent of [null, 0]) {
+      const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 4, dispatchMaxConcurrent } });
+      const a = project(`cez-wsem-dcapoff-${String(dispatchMaxConcurrent)}-`, semaphore);
+      const child1 = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+      const child2 = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+      await waitFor(
+        () =>
+          a.store.getRun(child1.id)?.status === 'running' &&
+          a.store.getRun(child2.id)?.status === 'running',
+        `both children to run with dispatchMaxConcurrent=${String(dispatchMaxConcurrent)}`,
+      );
+    }
+  }, 45_000);
+
+  it('counts dispatch children across projects: one project’s child spends the workspace ceiling', async () => {
+    const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 4, dispatchMaxConcurrent: 1 } });
+    const a = project('cez-wsem-dcapx-a-', semaphore);
+    const b = project('cez-wsem-dcapx-b-', semaphore);
+
+    const childA = a.manager.startRun(SLOW, CHILD('child in A', 'root-a'));
+    await waitFor(() => a.store.getRun(childA.id)?.status === 'running', 'A’s child to run');
+    const childB = b.manager.startRun(SLOW, CHILD('child in B', 'root-b'));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(b.store.getRun(childB.id)?.status).toBe('queued');
+  }, 45_000);
+
+  it('a parked dispatch child holds no dispatch slot while it is `waiting` (#347)', () => {
+    const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 2, dispatchMaxConcurrent: 1 } });
+    const a = project('cez-wsem-dcappark-', semaphore);
+    const internals = a.manager as unknown as {
+      active: Map<string, object>;
+      waiting: Set<string>;
+      dispatchBusy(): number;
+    };
+    // The record — not the in-memory input — is what the counter classifies, so build it the
+    // way a real child arrives: created, then stamped with its tree position.
+    const child = a.store.createRun({ title: 'parked child', workflow: 'slow', task: 'parked child', steps: [] });
+    a.store.updateRun(child.id, { dispatch: { rootRunId: 'root', parentRunId: 'root' } });
+    internals.active.set(child.id, {});
+    expect(internals.dispatchBusy()).toBe(1);
+    expect(semaphore.dispatchBusy()).toBe(1);
+
+    internals.waiting.add(child.id); // parked — holds no agent turn
+    expect(internals.dispatchBusy()).toBe(0);
+    expect(semaphore.dispatchBusy()).toBe(0);
+    // The record is synthetic — only `dispatchBusy()`'s classification is under test here — so
+    // retire it before teardown tries to cancel a run this manager never queued.
+    a.store.updateRun(child.id, { status: 'cancelled' });
+  });
+
   it('per-project cap: project A limited to 1 runs one at a time while B fills the workspace cap', async () => {
     // Shared snapshot the load hook copies on each refresh — mutating the map
     // and calling refresh() mirrors a settings write to a project's maxParallel.
