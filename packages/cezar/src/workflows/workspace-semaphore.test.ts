@@ -59,6 +59,13 @@ const INSTANT: WorkflowDef = {
   source: 'built-in',
   steps: [{ id: 'noop', command: 'node -e ""' }],
 };
+/** Holds a slot far longer than any assertion window in this file, so a wedged admission cannot
+ *  be laundered by a later re-sweep — the shape the per-sweep-counter regression needs to show. */
+const HOLD_LONG: WorkflowDef = {
+  name: 'hold-long',
+  source: 'built-in',
+  steps: [{ id: 'hold', command: 'node -e "setTimeout(()=>{},30000)"' }],
+};
 /** One interactive agent step — the mock parks at `waiting` after its turn. */
 const AGENT: WorkflowDef = {
   name: 'quick-task',
@@ -313,6 +320,62 @@ describe('workspace semaphore across RunManagers (step 2.5)', () => {
         a.store.getRun(child2.id)?.status === 'running',
       'both children to run under a cap of 2',
     );
+  }, 45_000);
+
+  /**
+   * The discriminating guard for the counter regression (raised by the independent code review of
+   * PR #1034): the cap-2 case above is smoke only — a build carrying the rejected per-sweep
+   * counter still passes it, because the second `startRun()` lands while the first `pump()` is at
+   * `await getRepoInfo`, so `pumpAgain` re-sweeps and releases the blocked child within
+   * milliseconds. With four children queued in ONE tick and a hold longer than the assertion
+   * window, a per-sweep counter admits only `ceil(4 / 2) = 2` and the re-sweep cannot launder it:
+   * the counter re-sets, sees two admissions in the fresh sweep, and blocks the rest again.
+   */
+  it('cap 4 admits all FOUR children queued in one tick — the pin a per-sweep counter cannot pass', async () => {
+    const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 8, dispatchMaxConcurrent: 4 } });
+    const a = project('cez-wsem-dcap4-', semaphore);
+
+    const children = [0, 1, 2, 3].map((n) => a.manager.startRun(HOLD_LONG, CHILD(`child ${n}`, `root-${n}`)));
+    await waitFor(
+      () => children.every((c) => a.store.getRun(c.id)?.status === 'running'),
+      'all four children to run under a cap of 4',
+      10_000,
+    );
+    expect(children.map((c) => a.store.getRun(c.id)?.status)).toEqual(['running', 'running', 'running', 'running']);
+  }, 45_000);
+
+  /**
+   * Spec implementation step 5 also names this one: lowering the ceiling is a gate on NEW
+   * admissions, never a preemption. The setting write goes through the semaphore's own cache hook
+   * (`refresh()`, what `PUT /workspace/config` calls), and the already-running children keep their
+   * slots while a third child waits.
+   */
+  it('lowering the cap below the running count never preempts a running child', async () => {
+    let cap: number | null = 2;
+    const semaphore = new WorkspaceSemaphore({
+      load: () => Promise.resolve({ maxParallel: 4, memoryLimitMb: null, dispatchMaxConcurrent: cap }),
+      initial: { maxParallel: 4, dispatchMaxConcurrent: cap },
+    });
+    const a = project('cez-wsem-dcaplower-', semaphore);
+
+    const first = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+    const second = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+    await waitFor(
+      () =>
+        a.store.getRun(first.id)?.status === 'running' && a.store.getRun(second.id)?.status === 'running',
+      'both children to run under the cap of 2',
+    );
+
+    cap = 1; // the operator tightens the ceiling while two children hold slots
+    await semaphore.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(semaphore.dispatchMaxConcurrent()).toBe(1);
+    expect(a.store.getRun(first.id)?.status).toBe('running');
+    expect(a.store.getRun(second.id)?.status).toBe('running');
+
+    const third = a.manager.startRun(SLOW, CHILD('child three', 'root-three'));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(a.store.getRun(third.id)?.status).toBe('queued'); // gated, not preempted
   }, 45_000);
 
   it('no cap configured (null, and the explicit 0) starts children exactly as before', async () => {
