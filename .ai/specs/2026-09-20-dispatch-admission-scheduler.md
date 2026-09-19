@@ -26,7 +26,7 @@ route, no record field, no browser loop, no timer, no dead-end state.
 ## 📝 Problem Statement
 
 - **Dispatch has brakes on how much, never on when/how many at once.** 4 children in flight per
-  parent (`packages/cezar/src/dispatch/engine.ts:25` defines it, `workflows/run.ts:2035-2038`
+  parent (`packages/cezar/src/dispatch/engine.ts:25` defines it, `workflows/run.ts:1990-1996`
   enforces it), a per-tree `maxSubtasks` cap and a
   carved child budget (`engine.ts:62-79`) bound the blast radius, but admission is immediate:
   `dispatch()` → `startRun()` (`workflows/run.ts:1978-2086`, `:1145-1223`) → `queue.push` +
@@ -279,7 +279,8 @@ Every step leaves the app working and is covered by a test.
    clearing with `null`, and that `semaphore.refresh()` + pump apply a change without restart.
 7. Add the Settings → Resources field with validation (empty = no cap, 1..16) and its test.
 8. Update `docs/reference.md` (resources section) and `BACKWARD_COMPATIBILITY.md` (§2 resources
-   shape, §9 workspace config); run the full validation gate (`npm run typecheck`, `npm test`,
+   shape, §9 workspace config — completing BOTH lists, which currently name three of the seven
+   `resources` keys); run the full validation gate (`npm run typecheck`, `npm test`,
    `npm run test:unit`, `npm run build`, `npm run test:package`).
 
 ## 📚 Evidence
@@ -293,7 +294,7 @@ claim below is also verifiable in the source files named inline):
   `releaseSlot()` `:1307-1318`, dispatch creation `:2032` → `:1220-1222`).
 - Governance/prior art: `.ai/cezar/dispatch/06328893-4e50-4dbe-9a56-243891c933bc/units/61b93cd8/notes.md`
   (semaphore `busy()`/`maxParallel()` `semaphore.ts:175-184`, `projectMaxParallel()` `:284-287`;
-  dispatch caps `dispatch/engine.ts:25,45-51,62-79` and the enforcement in `run.ts:2035-2038`;
+  dispatch caps `dispatch/engine.ts:25,45-51,62-79` and the enforcement in `run.ts:1990-1996`;
   `queued` already counts in flight and reserves budget).
 - Browser/policy doctrine: `.ai/cezar/dispatch/06328893-4e50-4dbe-9a56-243891c933bc/units/b2a52605/notes.md`
   (`BACKWARD_COMPATIBILITY.md:40` browser-state vs workspace choices; `appearance.tsx:17-26`;
