@@ -47,6 +47,12 @@ export interface WorkspaceResourceLimits {
   /** Per-task process-tree memory ceiling in MiB; null = no limit. */
   memoryLimitMb: number | null;
   /**
+   * Ceiling on concurrently running dispatch children (spec
+   * 2026-09-20-dispatch-admission-scheduler); `null`/`0` = no cap. Optional so an older `load`
+   * stub keeps working — an absent key reads as "no cap", i.e. today's behavior.
+   */
+  dispatchMaxConcurrent?: number | null;
+  /**
    * Per-project concurrency ceilings, keyed by realpath-normalized project
    * root (the registry stores normalized `root`). A root absent from the map
    * inherits the workspace `maxParallel`. Optional so older `load` stubs that
@@ -88,6 +94,15 @@ export interface SemaphoreParticipant {
   /** Slots this manager currently holds. The #347 exemption lives in the
    *  participant's own accounting: `waiting` runs are already subtracted. */
   busySlots(): number;
+  /**
+   * Dispatch children THIS manager holds that are actually consuming a compute slot
+   * (`starting`, or `active` and not `waiting`) — the per-run predicate in `pump()`
+   * consults the workspace-wide sum so a fan-out in one project cannot take the
+   * dispatch budget of another (spec 2026-09-20-dispatch-admission-scheduler).
+   * Optional so a stub participant — and any caller that predates the key — keeps
+   * working; absent simply holds no dispatch slot.
+   */
+  dispatchBusy?(): number;
   /** Kick the manager's queue — capacity may have appeared. Awaited by
    *  `release()` so the manager taking a freed slot has registered it before
    *  the next participant evaluates capacity. */
@@ -114,6 +129,7 @@ const DEFAULT_LIMITS: WorkspaceResourceLimits = {
   monitoringWakeIntervalMinutes: DEFAULT_MONITORING_WAKE_MINUTES,
   autoResumeOnUsageLimit: true,
   memoryLimitMb: null,
+  dispatchMaxConcurrent: null,
 };
 
 /** Production loader: the `resources` slice of `~/.cezar/config.json`
@@ -134,6 +150,7 @@ async function loadResourceLimits(): Promise<WorkspaceResourceLimits> {
     monitoringWakeIntervalMinutes: resources.monitoringWakeIntervalMinutes,
     autoResumeOnUsageLimit: resources.autoResumeOnUsageLimit,
     memoryLimitMb: resources.memoryLimitMb,
+    dispatchMaxConcurrent: resources.dispatchMaxConcurrent,
     projectLimits,
   };
 }
@@ -178,9 +195,31 @@ export class WorkspaceSemaphore {
     return total;
   }
 
+  /**
+   * Dispatch children holding a compute slot across EVERY registered manager — the number the
+   * per-run admission predicate compares against `dispatchMaxConcurrent()`. Summed here for the
+   * same reason `busy()` is: the cap protects the host, so a fan-out in one project must not be
+   * able to spend another project's dispatch budget. Participants that predate the key (or test
+   * stubs) simply contribute nothing.
+   */
+  dispatchBusy(): number {
+    let total = 0;
+    for (const participant of this.participants) total += participant.dispatchBusy?.() ?? 0;
+    return total;
+  }
+
   /** Cached workspace-wide parallel cap. */
   maxParallel(): number {
     return this.limits.maxParallel;
+  }
+
+  /**
+   * Cached ceiling on concurrently running dispatch children, or null for "no cap".
+   * Mirrors `maxParallel()`/`memoryLimitMb()`: answered from the in-memory snapshot, refreshed
+   * by `refresh()` (boot and every `PUT /workspace/config`), never re-read per pump.
+   */
+  dispatchMaxConcurrent(): number | null {
+    return this.limits.dispatchMaxConcurrent ?? null;
   }
 
   maxMonitoringSessions(): number {
