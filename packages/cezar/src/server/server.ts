@@ -49,6 +49,7 @@ import {
 } from '@open-mercato/cezar-contract';
 import { dispatchInputSchema, dispatchIntentSchema, dispatchReportSchema } from '@open-mercato/cezar-contract';
 import { detectEnvironment } from '../core/backend-detect.ts';
+import { onHostUsage, sampleHostUsage } from '../core/host-usage.ts';
 import { RUNNER_IDS } from '../core/agent-runner.ts';
 import type { ContentBlock } from '../core/agent-runner.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
@@ -2948,6 +2949,13 @@ export function createApp(deps: ServerDeps) {
   // ---- chained family: workspace settings + GUI prefs (workspace-level) ----
   const workspaceConfigRoutes = new Hono<ProjectApiEnv>()
     .get('/workspace/config', async (c) => c.json(workspaceConfigBody(await loadWorkspaceConfig())))
+
+    // Live host totals for a REMOTE cockpit (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`):
+    // the local cockpit gets them pushed over the `host` topic, but a remote one opens no
+    // WebSocket, so this is its snapshot + reconcile target. Same staleness-ruled sampler read as
+    // the topic — never a second compute path — and `cpuPct` is absent until a bounded delta
+    // window exists (the card renders `sampling…` and follows up once ~2.5 s later).
+    .get('/workspace/host-usage', async (c) => c.json(sampleHostUsage()))
 
     .put('/workspace/config', jsonZodValidator(() => workspaceConfigUpdateSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
