@@ -183,6 +183,9 @@ describe('MachineCard — remote cockpit', () => {
     // on the bounded behavior: the card does eventually show the CPU value…
     await waitFor(() => expect(screen.getByText('8%')).toBeTruthy(), { timeout: 5_000 })
     expect(reads).toBe(2)
+    // A remote cockpit's updates are sparse, so it never draws the line scaled to the server's
+    // 2 s cadence — the instantaneous bar only.
+    expect(document.querySelector('[data-slot="machine-card-cpu-sparkline"]')).toBeNull()
   })
 
   it('admits failure instead of waiting forever when the route rejects', async () => {
@@ -204,5 +207,63 @@ describe('MachineCard — remote cockpit', () => {
     await waitFor(() => expect(screen.getByText('Host totals are unavailable right now.')).toBeTruthy())
     // The card still explains itself rather than going blank.
     expect(screen.getByText(/Host totals —/)).toBeTruthy()
+  })
+})
+
+describe('MachineCard — review fixes (freshness basis, cache read, swap pair)', () => {
+  it('ticks the age of the MEASUREMENT on a remote cockpit, not the age of the read', async () => {
+    // The sample is already a few seconds old when the card receives it; receipt time would
+    // stamp it `updated 0 s ago`, and a frozen clock would leave the line stuck forever.
+    serve(
+      { ...HEALTH, capabilities: { ...HEALTH.capabilities, localHandoff: false } },
+      sample({ cpuPct: 12, sampledAt: new Date(Date.now() - 3_500).toISOString() }),
+    )
+    render(<MachineCard />, { wrapper: wrapper() })
+
+    await waitFor(() => expect(screen.getByText(/^updated [34] s ago$/)).toBeTruthy())
+    // …and it keeps counting while the card is mounted (1 s interval), so a stalled remote read
+    // cannot keep showing the same age as if it were live.
+    await waitFor(() => expect(screen.getByText(/^updated [5-9] s ago$/)).toBeTruthy(), {
+      timeout: 4_000,
+    })
+  })
+
+  it('re-reads the route on a remount instead of presenting a cached sample as fresh', async () => {
+    let reads = 0
+    serve(
+      { ...HEALTH, capabilities: { ...HEALTH.capabilities, localHandoff: false } },
+      () => {
+        reads += 1
+        return sample({ cpuPct: reads === 1 ? 12 : 80 })
+      },
+    )
+    // One client across both mounts: the workspace default staleTime is five minutes, so without
+    // the per-query override the second mount would render the first answer as `updated 0 s ago`.
+    const client = createQueryClient()
+    const wrapperWith = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    )
+
+    const first = render(<MachineCard />, { wrapper: wrapperWith })
+    await waitFor(() => expect(screen.getByText('12%')).toBeTruthy())
+    first.unmount()
+
+    render(<MachineCard />, { wrapper: wrapperWith })
+    await waitFor(() => expect(screen.getByText('80%')).toBeTruthy())
+    expect(reads).toBe(2)
+  })
+
+  it('hides the swap row when only one of the pair is on the wire', async () => {
+    const { swapUsedBytes: _omitted, ...withoutUsed } = sample({ cpuPct: 12 })
+    serve(
+      { ...HEALTH, capabilities: { ...HEALTH.capabilities, localHandoff: false } },
+      withoutUsed,
+    )
+    render(<MachineCard />, { wrapper: wrapper() })
+
+    await waitFor(() => expect(screen.getByText('12%')).toBeTruthy())
+    // The pair is both-or-neither by construction; a partial producer must not print `Swap  / 8 GB`.
+    expect(document.querySelector('[data-slot="machine-card-swap"]')).toBeNull()
+    expect(screen.queryByText(/8\.0 GB/)).toBeNull()
   })
 })

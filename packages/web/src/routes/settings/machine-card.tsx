@@ -14,9 +14,19 @@ import { cn } from '@/lib/utils'
  * opens a socket — the hook reads `GET /api/v1/workspace/host-usage` instead, and its answer is
  * labelled `last known`.
  *
- * The 60 s sparkline lives in COMPONENT state on purpose: it restarts when the card unmounts.
- * The freshness line is receipt time, recomputed when a frame or a query result arrives — there
- * is no ticking clock in here, and none is needed: a live sampler pushes every 2 s.
+ * The 60 s sparkline lives in COMPONENT state on purpose: it restarts when the card unmounts,
+ * and it is LOCAL-only — a remote cockpit's updates are sparse (mount plus the reconnect/visibility
+ * reconcile), so plotting them on a line scaled to the server's 2 s cadence would announce minutes
+ * as seconds and lie to a screen reader. Remote renders the instantaneous bar and no chart.
+ *
+ * The freshness line is the age of the MEASUREMENT (`sampledAt`, the server's own stamp for the
+ * sample, clamped at zero), not the age of the read: that keeps a route answer served from the
+ * sampler's small cache from reading as fresher than it is. It TICKS — one interval per second
+ * while the card is mounted — because a sampler speaks every 2 s only while something holds the
+ * topic, so a socket that dies, a remote read that stops, or a tab whose server went away would
+ * otherwise leave `updated 3 s ago` frozen on screen forever, which reads as "live" while nobody
+ * is talking. A counter that keeps climbing is the honest signal; `waiting…` covers the case
+ * where nothing has ever arrived.
  */
 
 /** 30 frames × the server's 2 s cadence = the 60 s line. */
@@ -36,18 +46,30 @@ export function MachineCard() {
 
   const [history, setHistory] = useState<number[]>([])
   const [receivedAt, setReceivedAt] = useState<number | null>(null)
+  /** Drives the freshness line; see the note above on why this card keeps a ticking clock. */
+  const [now, setNow] = useState(() => Date.now())
 
+  const local = transport === 'local'
   const cpuPct = sample?.cpuPct
   useEffect(() => {
     if (sample === undefined) return
     setReceivedAt(Date.now())
-    if (cpuPct === undefined) return
+    if (!local || cpuPct === undefined) return
     setHistory((previous) => [...previous, cpuPct].slice(-HISTORY_LENGTH))
-  }, [sample, cpuPct])
+  }, [sample, cpuPct, local])
 
-  const local = transport === 'local'
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [])
+
+  const sampledAtMs = sample === undefined ? undefined : Date.parse(sample.sampledAt)
   const ageSeconds =
-    receivedAt === null ? undefined : Math.max(0, Math.round((Date.now() - receivedAt) / 1000))
+    sampledAtMs !== undefined && !Number.isNaN(sampledAtMs)
+      ? Math.max(0, Math.round((now - sampledAtMs) / 1_000))
+      : receivedAt === null
+        ? undefined
+        : Math.max(0, Math.round((now - receivedAt) / 1_000))
   const usedPct =
     sample !== undefined && sample.memTotalBytes > 0
       ? clampPct((sample.memUsedBytes / sample.memTotalBytes) * 100)
@@ -128,7 +150,7 @@ export function MachineCard() {
                 viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
                 preserveAspectRatio="none"
                 role="img"
-                aria-label={`CPU over the last ${history.length * 2} seconds`}
+                aria-label={`CPU over the last up to ${history.length * 2} seconds`}
               >
                 <polyline
                   points={points}
@@ -162,7 +184,7 @@ export function MachineCard() {
               </div>
             </div>
 
-            {sample.swapTotalBytes === undefined ? null : (
+            {typeof sample.swapTotalBytes === 'number' && typeof sample.swapUsedBytes === 'number' ? (
               <div
                 data-slot="machine-card-swap"
                 className="grid grid-cols-[86px_1fr] items-center gap-3"
@@ -172,7 +194,7 @@ export function MachineCard() {
                   {formatMem(sample.swapUsedBytes)} / {formatMem(sample.swapTotalBytes)}
                 </span>
               </div>
-            )}
+            ) : null}
 
             {sample.loadAvg === undefined ? null : (
               <div

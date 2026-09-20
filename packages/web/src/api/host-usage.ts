@@ -77,7 +77,9 @@ export function useHostTransport(): 'local' | 'remote' | undefined {
 /**
  * The Machine card's cache read. A pure read in local mode — the subscription below fills it —
  * and the bounded read pair in remote mode. `staleTime` stays at 0 so a remount or a reconcile
- * always refreshes; the rate is bounded by the card being on screen, not by a timer.
+ * always refreshes — the workspace default is five minutes, and a remount inside that window would
+ * otherwise render a five-minute-old sample as a fresh one. The rate is bounded by the card being
+ * on screen, not by a timer.
  */
 export function useHostUsage() {
   const transport = useHostTransport()
@@ -85,6 +87,9 @@ export function useHostUsage() {
     queryKey: workspaceQueryKeys.hostUsage,
     queryFn: ({ signal }) => readWorkspaceHostUsage(signal),
     enabled: transport === 'remote',
+    // Overrides the workspace default (5 min): every mount reads the route, because this card
+    // stamps the age of what it renders and a cached answer would stamp it wrong.
+    staleTime: 0,
     retry: false,
   })
 }

@@ -169,7 +169,16 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
     }
     const times = cpuTimesSource();
     const cpuPct =
-      previousCpu !== undefined && times !== undefined && at - previousCpuAt <= HOST_SAMPLE_STALE_MS
+      previousCpu !== undefined &&
+      times !== undefined &&
+      // A MINIMUM window as well as a maximum (review BLOCKER): the hub calls `start()` and then
+      // `snapshot()` back to back, and two `os.cpus()` reads are milliseconds apart - a single CPU
+      // tick inside that window computes to 50 % or 100 %, which is how the first frame of a fresh
+      // subscription painted a red 100 % bar that every surface promises cannot happen. A delta is
+      // only a RATE when its window is at least half a sampling interval; below that the field is
+      // omitted and the card shows `sampling…`.
+      at - previousCpuAt >= HOST_SAMPLE_INTERVAL_MS / 2 &&
+      at - previousCpuAt <= HOST_SAMPLE_STALE_MS
         ? computeCpuPct(previousCpu, times)
         : undefined;
     if (times !== undefined) {

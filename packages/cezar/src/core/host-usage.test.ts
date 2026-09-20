@@ -106,6 +106,32 @@ describe('host sampler', () => {
     sampler.dispose();
   });
 
+  it('never fabricates a cpuPct from the hub\u2019s start-then-snapshot order (review BLOCKER)', () => {
+    // The hub registers `start(onHostUsage)` and `snapshot(sampleHostUsage)` and calls them back to
+    // back, so the 0\u21921 prime and the snapshot's own `os.cpus()` read are milliseconds apart. A
+    // single CPU tick inside that window used to compute 50 % or 100 % - the red bar on a card that
+    // is supposed to show `sampling\u2026`. A minimum window makes the order irrelevant.
+    const probe = cpuTimesProbe();
+    const sampler = createHostSampler({ cpuTimes: probe.source, readMeminfo: () => undefined, now });
+
+    const stop = sampler.onHostUsage(() => {});
+    try {
+      // One CPU tick lands inside the millisecond window - the worst case.
+      probe.advance({ busy: 10 });
+      expect(sampler.sampleHostUsage().cpuPct).toBeUndefined();
+      // …and it stays absent on a second immediate read for the same reason.
+      expect(sampler.sampleHostUsage().cpuPct).toBeUndefined();
+      // A REAL interval later the delta is honest again.
+      nowMs += HOST_SAMPLE_INTERVAL_MS;
+      probe.advance({ busy: 1_000 });
+      // A full interval, all of it busy in the synthetic counter: 1000 / 1000 = 100 %.
+      expect(sampler.sampleHostUsage().cpuPct).toBe(100);
+    } finally {
+      stop();
+    }
+    sampler.dispose();
+  });
+
   it('returns the cached sample while it is fresh and carries cpuPct', () => {
     const probe = cpuTimesProbe();
     const sampler = createHostSampler({ cpuTimes: probe.source, readMeminfo: () => undefined, now });
