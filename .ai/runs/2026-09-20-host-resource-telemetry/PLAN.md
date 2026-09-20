@@ -18,7 +18,7 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 | 1 | 1.3 | Sampler unit tests (baseline, delta, staleness, start/stop, swap/load) | inline | done | — |
 | 1 | 1.4 | `GET /workspace/host-usage` route + parity/BC inventory entries | inline | done | — |
 | 1 | 1.5 | `host` WS topic + hub tests | inline | done | — |
-| 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | todo | — |
+| 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | done | — |
 | 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | todo | — |
 | 2 | 2.3 | Docs: `docs/reference.md` + `BACKWARD_COMPATIBILITY.md` §2 note | inline | todo | — |
 
