@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { createCgroupPressureSource, parsePsiAvg10 } from './cgroup-pressure.ts';
+import { levelForSample } from './admission-governor.ts';
 import { CGROUP_V1_MEMORY_UNLIMITED_SENTINEL, type CgroupFileReader } from './cgroup-probe.ts';
 
 /**
@@ -151,6 +152,67 @@ describe('cgroup v2 pressure source', () => {
     expect(sample?.cpuPressureAvg10).toBeUndefined();
   });
 
+  it('excludes reclaimable page cache, so a cache-heavy container reads as calm', () => {
+    // cgroup v2 charges page cache to the cgroup, so 960 MiB of `memory.current` against a 1 GiB
+    // limit looks like 94 % - but 900 MiB of it is `inactive_file` the kernel reclaims rather than
+    // stalling. The governor must see the 60 MiB that is actually held.
+    const files = without(
+      v2Files({
+        [`${V2_LEAF}/memory.current`]: `${960 * 1024 * 1024}\n`,
+        [`${V2_LEAF}/memory.max`]: `${1024 * 1024 * 1024}\n`,
+        [`${V2_LEAF}/memory.stat`]:
+          'anon 62914560\nfile 943718400\ninactive_file 943718400\nactive_file 0\n',
+      }),
+      // No PSI in the fixture: the ratio is the only signal, which is the case this pins.
+      `${V2_LEAF}/memory.pressure`,
+      `${V2_LEAF}/cpu.pressure`,
+    );
+    const source = createCgroupPressureSource({ readFile: fileReader(files), platform: 'linux' });
+
+    const sample = source();
+    expect(sample?.memoryUsedRatio).toBeCloseTo(0.0586, 3);
+    expect(levelForSample(sample)).toBe('normal');
+  });
+
+  it('falls back to the raw usage when memory.stat is unreadable', () => {
+    // A cgroup that will not hand over `memory.stat` is not evidence of calm: the raw ratio is the
+    // conservative reading, and the card's own probe makes the same choice.
+    const source = createCgroupPressureSource({
+      readFile: fileReader(without(v2Files(), `${V2_LEAF}/memory.stat`)),
+      platform: 'linux',
+    });
+    expect(source()?.memoryUsedRatio).toBe(0.5);
+  });
+
+  it('resolves the leaf once per source instead of re-parsing mountinfo every sweep', () => {
+    const files = v2Files();
+    const reads = new Map<string, number>();
+    const counting: CgroupFileReader = (path) => {
+      reads.set(path, (reads.get(path) ?? 0) + 1);
+      return files[path];
+    };
+    const source = createCgroupPressureSource({ readFile: counting, platform: 'linux' });
+
+    expect(source()?.memoryUsedRatio).toBe(0.5);
+    expect(source()?.memoryUsedRatio).toBe(0.5);
+    expect(reads.get('/proc/self/mountinfo')).toBe(1);
+    expect(reads.get('/proc/self/cgroup')).toBe(1);
+    // The cache is the RESOLUTION, not the sample: the per-sweep rows are still re-read.
+    expect(reads.get(`${V2_LEAF}/memory.current`)).toBe(2);
+  });
+
+  it('does not memoize an unreadable /proc, so a container that becomes readable is picked up', () => {
+    const files: Record<string, string> = {};
+    const source = createCgroupPressureSource({
+      readFile: (path) => files[path],
+      platform: 'linux',
+    });
+    expect(source()).toBeUndefined();
+
+    Object.assign(files, v2Files());
+    expect(source()?.memoryUsedRatio).toBe(0.5);
+  });
+
   it('answers events alone when the leaf has no limit and no PSI', () => {
     const readable = without(
       v2Files({
@@ -225,6 +287,16 @@ describe('cgroup v1 pressure source', () => {
   it('reads usage against the limit on the memory controller mount', () => {
     const source = createCgroupPressureSource({ readFile: fileReader(v1Files()), platform: 'linux' });
     expect(source()).toEqual({ memoryUsedRatio: 0.75 });
+  });
+
+  it('subtracts total_inactive_file on cgroup v1', () => {
+    const files = v1Files({
+      [`${V1_LEAF}/memory.stat`]: 'total_cache 402653184\ntotal_inactive_file 402653184\n',
+    });
+    const source = createCgroupPressureSource({ readFile: fileReader(files), platform: 'linux' });
+
+    // 384 MiB of usage, all of it reclaimable cache, against a 512 MiB limit.
+    expect(source()?.memoryUsedRatio).toBe(0);
   });
 
   it('answers no ratio for the v1 unlimited sentinel and for a missing limit file', () => {

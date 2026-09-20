@@ -38,19 +38,18 @@ admission() {
   '
 }
 
+# The ratio the GOVERNOR thresholds on, read from the container's own cgroup files - not the card's
+# rendered value, which is a different quantity (it resolves the tightest limit on the ancestor
+# chain). Narrating the display number next to a governor decision is how the page-cache inflation
+# stayed invisible in the first live run.
 pressure() {
-  curl -sf "$BASE_URL/api/v1/workspace/host-usage" | node -e '
-    let raw = "";
-    process.stdin.on("data", (chunk) => (raw += chunk));
-    process.stdin.on("end", () => {
-      const sample = JSON.parse(raw);
-      const container = sample.container ?? {};
-      if (container.memLimitBytes && container.memUsedBytes) {
-        console.log(`used=${(container.memUsedBytes / 1024 / 1024).toFixed(0)}MiB of ${(container.memLimitBytes / 1024 / 1024).toFixed(0)}MiB (${Math.round((container.memUsedBytes / container.memLimitBytes) * 100)}%)`);
-      } else {
-        console.log("(no finite memory limit visible to this process)");
-      }
-    });
+  docker exec "$CONTAINER" sh -c '
+    limit=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+    if [ "$limit" = "max" ]; then echo "(no finite memory limit on the container cgroup)"; exit 0; fi
+    current=$(cat /sys/fs/cgroup/memory.current)
+    inactive=$(awk "/^inactive_file /{print \$2; exit}" /sys/fs/cgroup/memory.stat 2>/dev/null)
+    awk -v c="$current" -v i="${inactive:-0}" -v l="$limit" \
+      "BEGIN { u = c - i; if (u < 0) u = 0; printf \"used=%dMiB of %dMiB (%d%% cache-excluded - the ratio the governor thresholds on)\n\", u/1048576, l/1048576, 100*u/l }"
   '
 }
 
