@@ -505,6 +505,19 @@ root — live once in `~/.cezar/config.json`, alongside the
 in a repo's `.ai/cezar/config.json` is imported into the workspace file the
 first time cezar boots there, and ignored afterwards.
 
+**Settings → Resources** opens on a live **Machine** card: host CPU (value, bar
+and a 60 s sparkline), memory, swap and load, sampled every ~2 s **only while the
+card is on screen**. A local cockpit gets the samples pushed over the `host`
+WebSocket topic; a remote one reads `GET /api/v1/workspace/host-usage` on mount,
+on a reconnect and when the tab becomes visible again — and follows a first
+answer that carries no CPU figure with exactly **one** warm-up read ~2.5 s later.
+That gap is honest, not a bug: CPU utilization is a delta between two samples, so
+the first read after an idle period has no window to measure and the card shows
+`sampling…` instead of a number it cannot back. The values are **host totals** —
+container and cgroup limits are not subtracted — and a metric the OS does not
+expose (swap outside Linux, load on Windows) is omitted rather than printed as a
+zero.
+
 ### Editing the agents' own config (Settings → Agent config)
 
 cezar picks *which* agent runs; **Settings → Agent config** lets you edit *how* it
