@@ -110,8 +110,12 @@ browser loop, no held flag, no timer.**
   so a parked child never consumes the dispatch budget.
 - `resources` is read through the semaphore's in-memory cache, refreshed on
   `PUT /workspace/config`; do not re-read the file per pump.
-- The key is additive: absent/`null` must stay distinguishable from a chosen `0` in the schema,
-  and `BACKWARD_COMPATIBILITY.md` §2's resources shape plus the GET body must carry it exactly.
+- The key is additive: `null` **and** `0` both mean "no cap" (the Settings field sends `null` when
+  cleared, matching `memoryLimitMb`), an older cezar ignores it through `.passthrough()`, and
+  `BACKWARD_COMPATIBILITY.md` §2's resources shape plus the GET body must carry it exactly.
+  (NIT-2 of the specification review: an earlier draft of this line said absent/`null` must stay
+  distinguishable from a chosen `0`; the spec's reading is the right one and this line now agrees
+  with it.)
 
 ## Review trail
 

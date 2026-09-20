@@ -17,8 +17,12 @@
 A parent task can dispatch up to four children in one turn, and every child starts the moment a
 shared `maxParallel` slot frees — a fan-out can take every slot from ordinary work. The proposed
 behavior adds one opt-in workspace setting, **`resources.dispatchMaxConcurrent`**: the engine
-admits a dispatched child only while fewer than N dispatch children are running workspace-wide,
-and ordinary tasks keep their normal capacity path. The default (`null`) is byte-for-byte today's
+admits a dispatched child **from the queue** only while fewer than N dispatch children hold a
+compute slot workspace-wide. It is an **admission** ceiling, not a *running* ceiling: a parked
+child returning to work (a delivered child report, the monitoring wake, an auto-resume after a
+usage limit) is never re-gated — the #347 exemption, carried verbatim, exactly as `maxParallel`
+already works — so the instantaneous running count may exceed N, deliberately. Ordinary tasks
+keep their normal capacity path. The default (`null`) is byte-for-byte today's
 behavior. It is configured in **Settings → Resources** (the browser surface), persisted in
 `~/.cezar/config.json`, enforced event-driven inside the existing `pump()` — no database, no new
 route, no record field, no browser loop, no timer, no dead-end state.
@@ -57,6 +61,16 @@ route, no record field, no browser loop, no timer, no dead-end state.
    reached the cap, the child is skipped and stays in the queue; the sweep then considers the
    next queued run. Ordinary tasks are unaffected — that is the point of a dispatch-specific
    ceiling.
+
+   **What the predicate does NOT gate, stated once and precisely:** it gates *admission from the
+   queue* only. `pump()`'s own comment (`run.ts:1350-1352`) says the slot gate is the only one and
+   that *resumes never pass through it*; a parked dispatch child resumes inside `deliverMessage`
+   (`waiting.delete`, `run.ts:3115`) and `run.ts:4524`, so it re-enters the counted set with no
+   cap check and may transiently push the running count above N. That is the design, not a hole:
+   gating resumes would reintroduce #347's deadlock, and `maxParallel` carries the same exemption
+   (`semaphore.ts:19-21`). The guarantee this feature ships is therefore: **no more than N
+   dispatch children are admitted from the queue; the instantaneous running count may exceed N
+   when parked children return, on purpose.**
 3. **A workspace-wide counter on the existing semaphore.** `WorkspaceSemaphore` gains an optional
    `dispatchBusy?(): number` participant member and sums it across managers exactly like `busy()`
    (`semaphore.ts:151-184`); `RunManager` counts the runs that hold a compute slot — `starting`
@@ -98,9 +112,14 @@ flowchart LR
 **`WorkspaceSemaphore` (`workspace/semaphore.ts`).** `WorkspaceResourceLimits` gains
 `dispatchMaxConcurrent?: number | null` (optional so existing load stubs keep working; absent =
 no cap); `DEFAULT_LIMITS` sets `null`; `loadResourceLimits` maps the config key; a
-`dispatchMaxConcurrent()` accessor mirrors `memoryLimitMb()` (`:206-208`); the participant
-interface gains optional `dispatchBusy?(): number` and the semaphore sums it across projects like
-`busy()` (`:175-184`).
+`dispatchMaxConcurrent()` accessor mirrors `maxMonitoringSessions()` / `autoResumeOnUsageLimit()`
+(`:186-188`, `:201-203`) — **not** `memoryLimitMb()`, which is required in
+`WorkspaceResourceLimits` and can therefore return bare (review MINOR-5). Because this field is
+optional, the accessor collapses absent to no-cap explicitly:
+`return this.limits.dispatchMaxConcurrent ?? null;`. That `?? null` is safe *because* `null` and
+absent mean the same thing here, unlike `monitoringWakeIntervalMinutes` (#810), where collapsing
+them was the bug. The participant interface gains optional `dispatchBusy?(): number` and the
+semaphore sums it across projects like `busy()` (`:175-184`).
 
 **`RunManager` (`workflows/run.ts`).** `dispatchBusy()` counts the slot-holding runs —
 `starting`, plus `active` runs that are not `waiting` — whose record carries
@@ -174,8 +193,9 @@ section are updated.
 
 - **Settings → Resources** gains one field under the existing resource group: "Max running
   dispatched tasks", a number input (`1..16`, empty = no cap), saved with the existing Save
-  button pattern of the section. Hint: "Dispatched children wait in the queue while this many are
-  already running. Ordinary tasks are not affected. Leave empty for no limit."
+  button pattern of the section. Hint (worded for what ships — an admission ceiling, not a running
+  one): "At most this many dispatched tasks will be **started** at a time; others wait in the
+  queue. Ordinary tasks are not affected. Leave empty for no limit."
 - The field is a real control with no dead knob, per the repo's settings doctrine — the worked
   example being Appearance, which states the rule in its own header
   (`packages/web/src/routes/settings/appearance.tsx:17-29`); its value is workspace-wide, so every
@@ -195,6 +215,8 @@ section are updated.
 | Cap higher than `maxParallel` | Effective concurrency is still `min(maxParallel, projectMax)`; the key never raises it. |
 | Cap lowered while children run | Running children are not preempted; only new admissions are gated. |
 | Child parked in `waiting` (monitor) | Not counted — it holds no turn and no slot (#347); `active` includes it, and `dispatchBusy()` subtracts `waiting`. |
+| **Parked dispatch child resumes** (child report, monitoring wake, auto-resume) while the cap is full | Counts again immediately; the cap is **not** re-checked and is transiently exceeded — the #347 precedent, stated in §Proposed Solution ¶2. Not a defect: gating resumes is the deadlock that exemption exists to prevent. |
+| Nested dispatch, child blocking **synchronously** on its own child with the last slot held | The intended flow resolves it: the parent ends its turn instead of foreground-waiting, which parks it (`waiting.add` + `releaseSlot()`, `run.ts:2685`) and pumps the whole workspace, so the grandchild is admitted. The containment argument in §Risks holds **under that condition** and is stated there. |
 | A capped child with no slot in sight | Stays `queued`, with its position visible in the task list. Deliberately **not** re-checked on a timer, and unlike the usage-limit hold it needs no durable re-check record: the events that change the answer (a child settling, being cancelled or deleted, a `resources` write, a restart re-enqueueing it) are exactly the ones that already pump or rebuild the queue. |
 | Cross-project | `dispatchBusy()` sums every manager, so the ceiling is workspace-wide like `maxParallel`. |
 | Restart | The key persists in `~/.cezar/config.json`; queued children resume through the normal `recover()` path with no special handling. |
@@ -212,10 +234,29 @@ section are updated.
 - **Performance.** `dispatchBusy()` iterates the manager's slot-holding set (`starting` +
   `active − waiting`, bounded by the parallel caps) and is called per candidate run during a
   pump — a few iterations, no file I/O, no timer, no SSE change.
-- **Failure containment.** The predicate can only *delay* a start; it cannot strand a run without
-  an exit, because the parent's completion and the workspace pump are the same events that
-  already advance the queue. A misconfigured cap is cleared by `PUT` and the pump runs
-  immediately.
+- **Failure containment, with its condition named (review MINOR-1).** The predicate can only
+  *delay* a start, and it cannot strand a run without an exit **because the slot-holder parks or
+  settles independently of the blocked run** — the parent's turn end (`waiting.add` +
+  `releaseSlot()`) and the workspace pump are the same events that already advance the queue. The
+  one pattern where that independence is broken is a dispatch child that blocks *synchronously*
+  on its own child while holding the only slot; the design's answer is that the intended lifecycle
+  ends the turn (park), not that the predicate detects the wait. A misconfigured cap is cleared by
+  `PUT` and the pump runs immediately.
+- **The cap cannot wedge the queue watchdog (review MINOR-2).** `rescueStalledQueue`
+  (`run.ts:2425`, `:2444-2478`) only fires when nothing is running anywhere
+  (`:2458-2459`), and a cap-blocked queue can never satisfy that precondition:
+  `busySlots() = (active − waiting) + starting + (watchers − min(watchers, maxMonitoringSessions))`
+  is ≥ `dispatchBusy()` (the trailing term is non-negative), so `dispatchBusy() > 0 ⟹
+  semaphore.busy() > 0`. The gate can only block *while* a slot holder exists, and that holder's
+  release is what pumps the queue — `forceNextPump` never needs to know about this cap.
+- **A cap-blocked child is silent — a stated choice (review MINOR-3).** The usage-limit hold
+  writes a transcript note (`run.ts:2416-2419`) because that hold is invisible to the user: it is
+  applied by the engine while the child looks startable. This cap is the opposite: the user just
+  set the number, the row reads `queued` with its position in the task list, and explaining it in
+  a durable record field would be state to migrate for an opt-in, self-inflicted queue
+  condition. v1 therefore accepts the silent queue; if a reviewer prefers parity with the
+  usage-limit note, a one-shot note on the first skip is a small, isolated addition and is listed
+  under §Deferred rather than left unstated.
 - **Scope.** One capability, one knob, two phases. Anything resembling approval or time-based
   pacing is deferred and named below rather than folded in.
 
@@ -227,12 +268,18 @@ section are updated.
 | A2 | Where does the policy live? | `~/.cezar/config.json` `resources` (workspace-wide). | Same home as `maxParallel`; agrees across browsers/projects/CLI; immune to origin/port changes. |
 | A3 | What is capped? | Dispatch children holding a compute slot (`starting` + `active − waiting`), workspace-wide. | "Admission of runners"; `waiting` holds no turn, and `active` includes it, so the exclusion is explicit. |
 | A4 | Cap scope | Global, no per-tree override. | Tree brakes already exist; the key protects the host. |
+| A4a | Why not just tighten `intent.inFlight`? | It bounds children **per parent**; this cap is workspace-wide. | Per-parent brakes do not compose across concurrent trees — four trees at `inFlight = 4` is sixteen children, exactly the saturation this feature exists to prevent — and a host cap cannot be expressed per tree. `intent.inFlight` remains the narrower, per-parent knob. |
 | A5 | Knobs | Exactly one: `dispatchMaxConcurrent` (`null`/`0` = off). | No interval, no mode, no manual approval in v1. |
 | A6 | Preemption | None; lowering the cap gates new starts only. | Reversible, no surprising cancellations. |
 | A7 | Enforcement point | Per-run predicate in `pump().startable()`. | Ordinary runs must keep their capacity path; a `capacity()`-wide gate would block the whole queue. |
 | A8 | Default | `null` = today's behavior, byte-for-byte. | Zero-config rule; a replacement that ships off is not a replacement, so the default must preserve the existing behavior while the opt-in adds the cap. |
 
 ## 📋 Deferred (explicitly not in this spec)
+
+- **A transcript note for a cap-blocked child** (review MINOR-3). v1 accepts the silent queue for
+  the reasons in §Risks; parity with the usage-limit hold's note (`run.ts:2416-2419`) is a small
+  follow-up if the review prefers it — it needs one durable record field and one write on the
+  first skip.
 
 - **Per-child approval / manual release** (the superseded v1 lease + `dispatch.held` + `admit`
   design). It is a different capability with its own product decision: closing the browser must
@@ -260,8 +307,13 @@ section are updated.
 
 Every step leaves the app working and is covered by a test.
 
-1. Add `dispatchMaxConcurrent` to `resourcesSchema` in `workspace/config.ts` and to both
-   `resources` shapes in `packages/contract/src/workspace.ts`; run contract-parity tests.
+1. Add `dispatchMaxConcurrent` to `resourcesSchema` in `workspace/config.ts` **and** to both
+   `resources` shapes in `packages/contract/src/workspace.ts` (the GET response AND the partial
+   PUT body), **and** wire the GET body + PUT handler in `server/server.ts` — all in this step.
+   `contract-parity.workspace.test.ts` is a compile-time mutual-assignability check
+   (`Exact<Schema, InferResponseType<route>>`, enforced by `npm run typecheck`), so a
+   response-only key would leave the gate red through steps 2–5 (review MINOR-4). Run
+   `npm run typecheck` and the contract-parity tests here.
 2. Extend `WorkspaceResourceLimits`/`DEFAULT_LIMITS`/`loadResourceLimits` with the key and add
    the `dispatchMaxConcurrent()` accessor; unit-test defaults, cache reads and the `0`/`null`
    equivalence.
@@ -274,13 +326,18 @@ Every step leaves the app working and is covered by a test.
    counter; test: `cap = 1` starts exactly one of two queued children; `cap = 2` starts BOTH in a
    single sweep (the counter must see live slot holders, not admissions); an ordinary run passes a
    capped child; a child queued in another project is capped by this project's running child;
-   `null`/`0` is byte-identical; a lowered cap never preempts a running child.
-6. Wire the GET body and PUT handler for the new key in `server/server.ts`; test partial PUT,
-   clearing with `null`, and that `semaphore.refresh()` + pump apply a change without restart.
+   `null`/`0` is byte-identical; a lowered cap never preempts a running child; **and a dispatch
+   child resumed out of `waiting` while `dispatchBusy() == cap` starts immediately** — the
+   admission-not-running invariant (review MAJOR-1). Without that last case an implementer reading
+   §Proposed Solution will write `expect(runningDispatchChildren).toBeLessThanOrEqual(cap)`, which
+   is green in a two-run fixture and false in any real two-level tree.
+6. Confirm the step-1 wiring end to end (no new schema work here): partial PUT, clearing with
+   `null`, and that `semaphore.refresh()` + pump apply a change without a restart.
 7. Add the Settings → Resources field with validation (empty = no cap, 1..16) and its test.
 8. Update `docs/reference.md` (resources section) and `BACKWARD_COMPATIBILITY.md` (§2 resources
-   shape, §9 workspace config — completing BOTH lists, which currently name three of the seven
-   `resources` keys); run the full validation gate (`npm run typecheck`, `npm test`,
+   shape, §9 workspace config — completing BOTH lists, which currently name three of the **six**
+   `resources` keys today, **seven** once this lands); run the full validation gate
+   (`npm run typecheck`, `npm test`,
    `npm run test:unit`, `npm run build`, `npm run test:package`).
 
 ## 📚 Evidence
