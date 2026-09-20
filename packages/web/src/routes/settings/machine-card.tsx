@@ -1,6 +1,6 @@
 import {
   useHostHistory,
-  useHostLastFrameAt,
+  useHostSampleAgeSeconds,
   useHostTransport,
   useHostUsage,
   useHostUsageRoute,
@@ -23,10 +23,13 @@ import { cn } from '@/lib/utils'
  * `GET /api/v1/workspace/host-usage` and folds each answer (with its one warm-up read) into the
  * store, and the header says `last known`.
  *
- * The 60 s sparkline and the receipt stamp now live in the per-app store rather than in component
- * state, so the sidebar widget and this card draw the same line and the same age. Values are read
- * through `effectiveHostView`, the one place that decides which number is effective: a limit whose
- * value is missing shows `—`, never the host figure.
+ * The 60 s sparkline lives in the per-app store rather than in component state, so the sidebar
+ * widget and this card draw the same line - local-only, because a remote cockpit's sparse route
+ * answers cannot honestly be plotted on a 2 s-scaled line. The age line ticks every second and is
+ * the age of the sample's own `sampledAt`, so a cockpit that has stopped receiving data counts up
+ * instead of freezing at a fresh-looking value. Values are read through `effectiveHostView`, the
+ * one place that decides which number is effective: a limit whose value is missing shows `—`,
+ * never the host figure.
  */
 
 /** How many points the sparkline plots; the store keeps exactly this ring. */
@@ -45,15 +48,11 @@ export function MachineCard() {
   const { isError } = useHostUsageRoute()
   const sample = useHostUsage()
   const history = useHostHistory()
-  const lastFrameAt = useHostLastFrameAt()
+  const ageSeconds = useHostSampleAgeSeconds()
 
   const view = sample === undefined ? undefined : effectiveHostView(sample)
   const cpuPct = view?.cpuPct
   const local = transport === 'local'
-  const ageSeconds =
-    lastFrameAt === undefined
-      ? undefined
-      : Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000))
   const memTotal = view?.memTotalBytes ?? 0
   const usedPct =
     view?.memUsedBytes !== undefined && memTotal > 0
@@ -161,7 +160,7 @@ export function MachineCard() {
                 viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
                 preserveAspectRatio="none"
                 role="img"
-                aria-label={`CPU over the last ${history.length * 2} seconds`}
+                aria-label={`CPU over the last up to ${history.length * 2} seconds`}
               >
                 <polyline
                   points={points}
@@ -197,7 +196,8 @@ export function MachineCard() {
               </div>
             </div>
 
-            {sample?.swapTotalBytes === undefined ? null : (
+            {typeof sample?.swapTotalBytes === 'number' &&
+            typeof sample?.swapUsedBytes === 'number' ? (
               <div
                 data-slot="machine-card-swap"
                 className="grid grid-cols-[86px_1fr] items-center gap-3"
@@ -207,7 +207,7 @@ export function MachineCard() {
                   {formatMem(sample.swapUsedBytes)} / {formatMem(sample.swapTotalBytes)}
                 </span>
               </div>
-            )}
+            ) : null}
 
             {sample?.loadAvg === undefined ? null : (
               <div

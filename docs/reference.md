@@ -515,7 +515,14 @@ later. That gap is honest, not a bug: CPU utilization is a delta between two
 samples, so the first read after an idle period has no window to measure and the
 readout shows `sampling…` instead of a number it cannot back. A metric the OS
 does not expose (swap outside Linux, load on Windows) is omitted rather than
-printed as a zero.
+printed as a zero. The `updated N s ago` line is the age of the sample's own
+server timestamp and ticks every second while the card is mounted, so a cockpit
+that has stopped receiving data counts up instead of freezing at a fresh-looking
+value. The 60 s sparkline is **local-only**: a remote cockpit's route answers are
+sparse, so it shows the instantaneous bar and no chart rather than plotting
+minutes as if they were seconds. A remount always re-reads the route (the host
+query overrides the workspace's five-minute `staleTime`), so a cached sample can
+never be stamped as fresh.
 
 **Which numbers are effective.** The plain process reads **host totals**. When
 cezar runs inside a cgroup with a real limit - a Docker `--cpus`/`--cpuset-cpus`,

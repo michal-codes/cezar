@@ -402,7 +402,9 @@ describe('MachineCard — review fixes (freshness basis, cache read, swap pair)'
     // the per-query override the second mount would render the first answer as `updated 0 s ago`.
     const client = createQueryClient()
     const wrapperWith = ({ children }: { children: ReactNode }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      <QueryClientProvider client={client}>
+        <HostUsageProvider>{children}</HostUsageProvider>
+      </QueryClientProvider>
     )
 
     const first = render(<MachineCard />, { wrapper: wrapperWith })
