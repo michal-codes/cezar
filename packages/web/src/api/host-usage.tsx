@@ -4,6 +4,7 @@ import { hostUsageSchema, type HostUsage } from '@open-mercato/cezar-api-client'
 
 import { getWorkspaceHostUsage } from './client'
 import { useHealth, workspaceQueryKeys } from './queries'
+import { effectiveHostView } from '@/lib/host-effective'
 import { useIsDesktop } from '@/lib/use-desktop'
 import { subscribeTopic } from './ws'
 
@@ -149,10 +150,14 @@ export function createHostUsageStore(): HostUsageStore {
         lastPoint !== undefined &&
         Date.parse(sample.sampledAt) - Date.parse(lastPoint.sampledAt) > HOST_HISTORY_GAP_MS
       const base = writerChanged || gap ? [] : previous.history
+      // The ring carries the EFFECTIVE percentage, the same number the card and the widget render:
+      // a line of host-wide utilization under an effective core count is the scope mix the spec
+      // forbids, and the two surfaces must never disagree about which series they are drawing.
+      const effectiveCpuPct = effectiveHostView(sample).cpuPct
       const history =
-        sample.cpuPct === undefined
+        effectiveCpuPct === undefined
           ? base
-          : [...base, { sampledAt: sample.sampledAt, receivedAt, cpuPct: sample.cpuPct }].slice(
+          : [...base, { sampledAt: sample.sampledAt, receivedAt, cpuPct: effectiveCpuPct }].slice(
               -HOST_HISTORY_LENGTH,
             )
       state = { latest: sample, lastFrameAt: receivedAt, history }

@@ -139,9 +139,11 @@ export function parseCpuQuotaCores(quotaText: string | undefined, periodUs: numb
 }
 
 /**
- * A `memory.max`/`memory.limit_in_bytes` value in bytes. Only the literal `max` (v2) and the v1
- * unlimited sentinels mean unlimited; a numeric `0` is a real zero limit and answers `0`, which
- * the caller drops because the schema cannot express it.
+ * A `memory.max`/`memory.limit_in_bytes` value in bytes, or `undefined` when it names no usable
+ * limit. Only the literal `max` (v2) and the v1 unlimited sentinels are "unlimited"; a numeric `0`
+ * is a real zero limit, and since a non-positive limit is not representable in the positive schema
+ * (and is degenerate for a running process) it answers `undefined` too - the same wire outcome as
+ * unlimited, reached by a different route.
  */
 export function parseMemoryLimitBytes(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
