@@ -224,7 +224,9 @@ export function MachineCard() {
                     data-slot="machine-card-load-cores"
                     className="rounded-md border border-border px-1.5 py-0.5 text-[11px] text-soft-foreground"
                   >
-                    {view.hostCpuCount ?? sample.cpuCount} cores
+                    {view.hasContainer && view.hostCpuCount !== undefined
+                      ? `host ${view.hostCpuCount} cores`
+                      : `${sample.cpuCount} cores`}
                   </span>
                 </span>
               </div>

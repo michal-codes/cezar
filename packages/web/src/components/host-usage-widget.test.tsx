@@ -71,8 +71,12 @@ class FakeSocket {
 }
 
 /** Pushes one sample into the store the way a writer would, so the widget renders real data. */
+let pushFrame: ((value: HostUsage) => void) | undefined
+
 function Seed({ samples }: { samples: HostUsage[] }) {
   const store = useHostUsageStore()
+  // Exposed so a test can deliver a LATER frame to the same store (the stale → live re-arm).
+  pushFrame = (value) => store?.push(value, Date.now(), 'root')
   for (const [index, value] of samples.entries()) {
     store?.push(value, Date.now() + index, 'root')
   }
@@ -174,7 +178,7 @@ describe('HostUsageWidget', () => {
 
   it('flips to `stale` after the re-armed timeout, and back on the next frame', async () => {
     vi.useFakeTimers()
-    const { rerender } = render(<HostUsageWidget />, {
+    render(<HostUsageWidget />, {
       wrapper: wrapper([sample({ cpuPct: 12, sampledAt: '2026-09-20T00:00:00.000Z' })]),
     })
     await act(async () => {
@@ -188,7 +192,15 @@ describe('HostUsageWidget', () => {
     })
     expect(screen.getByText('stale')).toBeTruthy()
 
-    rerender(<HostUsageWidget />)
+    // …and back: a new frame re-arms the timeout rather than leaving the row stale forever.
+    act(() => {
+      pushFrame?.(sample({ cpuPct: 33, sampledAt: '2026-09-20T00:00:10.000Z' }))
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(screen.getByText('33%')).toBeTruthy()
+    expect(screen.queryByText('stale')).toBeNull()
   })
 
   it('is unmounted below md, where the sidebar column is not even in flow', async () => {

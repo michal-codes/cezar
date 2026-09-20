@@ -237,7 +237,9 @@ describe('MachineCard — local cockpit, desktop', () => {
     expect(screen.getByText('2 CPU · 50%')).toBeTruthy()
     expect(screen.getByText('1.5 GB / 2.0 GB')).toBeTruthy()
     expect(screen.getByText('host 8 CPU · 32.0 GB RAM')).toBeTruthy()
-    expect(screen.getByText('8 cores')).toBeTruthy()
+    // The load chip pairs with the HOST core count once a container exists, and says so: the row
+    // above it is already the effective one.
+    expect(screen.getByText('host 8 cores')).toBeTruthy()
     expect(screen.getByText(/Effective values come from this process/)).toBeTruthy()
   })
 

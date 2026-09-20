@@ -27,8 +27,10 @@ import { subscribeTopic } from './ws'
  * module-level instance would leak one test's frames into the next, and there is exactly one per
  * `HostUsageProvider` (StrictMode's double render still yields one).
  *
- * Frames are validated at this one boundary - the point where untrusted bytes enter the store - so
- * a frame the schema rejects is dropped rather than rendered half-filled.
+ * A pushed frame is validated at this one boundary - the point where untrusted bytes enter the
+ * store - so a frame the schema rejects is dropped rather than rendered half-filled. The route
+ * answer needs no second parse: it arrives already unwrapped by the typed client, which is the
+ * same contract schema.
  */
 
 /** How long the warm-up read waits — a little over the server's 2 s sampling interval. */
@@ -134,19 +136,26 @@ export function createHostUsageStore(): HostUsageStore {
     get: () => state,
     push(sample, receivedAt, nextWriter) {
       const previous = state
+      // The writer change is decided BEFORE the dedupe below: a new writer whose first frame
+      // replays the sample the old writer already delivered is still a change of owner, and the
+      // spec's rule is that a writer change clears the line.
+      const writerChanged = writer !== undefined && writer !== nextWriter
+      writer = nextWriter
       // A replayed snapshot (re-subscribe, reconnect, a second writer's identical view) must not
       // add a second point for one server sample.
-      if (previous.latest?.sampledAt === sample.sampledAt) {
-        if (previous.latest === sample && previous.lastFrameAt === receivedAt) return
-        state = { ...previous, latest: sample, lastFrameAt: receivedAt }
-        for (const listener of listeners) listener()
+      const replay = previous.latest?.sampledAt === sample.sampledAt
+      if (
+        replay &&
+        previous.latest === sample &&
+        previous.lastFrameAt === receivedAt &&
+        !writerChanged
+      ) {
         return
       }
 
-      const writerChanged = writer !== undefined && writer !== nextWriter
-      writer = nextWriter
       const lastPoint = previous.history[previous.history.length - 1]
       const gap =
+        !replay &&
         lastPoint !== undefined &&
         Date.parse(sample.sampledAt) - Date.parse(lastPoint.sampledAt) > HOST_HISTORY_GAP_MS
       const base = writerChanged || gap ? [] : previous.history
@@ -154,12 +163,16 @@ export function createHostUsageStore(): HostUsageStore {
       // a line of host-wide utilization under an effective core count is the scope mix the spec
       // forbids, and the two surfaces must never disagree about which series they are drawing.
       const effectiveCpuPct = effectiveHostView(sample).cpuPct
-      const history =
-        effectiveCpuPct === undefined
-          ? base
-          : [...base, { sampledAt: sample.sampledAt, receivedAt, cpuPct: effectiveCpuPct }].slice(
-              -HOST_HISTORY_LENGTH,
-            )
+      // One server instant is one point in the KEPT history: after a writer change or a gap the
+      // arriving sample legitimately starts the new line, a plain replay never doubles it.
+      const lastKept = base[base.length - 1]
+      const appendPoint =
+        effectiveCpuPct !== undefined && lastKept?.sampledAt !== sample.sampledAt
+      const history = appendPoint
+        ? [...base, { sampledAt: sample.sampledAt, receivedAt, cpuPct: effectiveCpuPct }].slice(
+            -HOST_HISTORY_LENGTH,
+          )
+        : base
       state = { latest: sample, lastFrameAt: receivedAt, history }
       for (const listener of listeners) listener()
     },
