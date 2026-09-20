@@ -19,9 +19,11 @@ shared `maxParallel` slot frees — a fan-out can take every slot from ordinary 
 behavior adds one opt-in workspace setting, **`resources.dispatchMaxConcurrent`**: the engine
 admits a dispatched child **from the queue** only while fewer than N dispatch children hold a
 compute slot workspace-wide. It is an **admission** ceiling, not a *running* ceiling: a parked
-child returning to work (a delivered child report, the monitoring wake, an auto-resume after a
-usage limit) is never re-gated — the #347 exemption, carried verbatim, exactly as `maxParallel`
-already works — so the instantaneous running count may exceed N, deliberately. Ordinary tasks
+child woken back into its own session (a delivered child report, the monitoring wake) is never
+re-gated — the #347 exemption, carried verbatim, exactly as `maxParallel` already works — so the
+instantaneous running count may exceed N, deliberately. An auto-resume after a usage limit is the
+one return that IS re-gated: `fireAutoResume` hands it to the ordinary queued-continuation path
+(`run.ts:2318-2322`), so it obeys the cap like any other queued work. Ordinary tasks
 keep their normal capacity path. The default (`null`) is byte-for-byte today's
 behavior. It is configured in **Settings → Resources** (the browser surface), persisted in
 `~/.cezar/config.json`, enforced event-driven inside the existing `pump()` — no database, no new
@@ -191,8 +193,8 @@ section are updated.
 
 ## 📝 UI/UX
 
-- **Settings → Resources** gains one field under the existing resource group: "Max running
-  dispatched tasks", a number input (`1..16`, empty = no cap), saved with the existing Save
+- **Settings → Resources** gains one field under the existing resource group: "Max dispatched
+  tasks started at once", a number input (`1..16`, empty = no cap), saved with the existing Save
   button pattern of the section. Hint (worded for what ships — an admission ceiling, not a running
   one): "At most this many dispatched tasks will be **started** at a time; others wait in the
   queue. Ordinary tasks are not affected. Leave empty for no limit."
@@ -215,7 +217,8 @@ section are updated.
 | Cap higher than `maxParallel` | Effective concurrency is still `min(maxParallel, projectMax)`; the key never raises it. |
 | Cap lowered while children run | Running children are not preempted; only new admissions are gated. |
 | Child parked in `waiting` (monitor) | Not counted — it holds no turn and no slot (#347); `active` includes it, and `dispatchBusy()` subtracts `waiting`. |
-| **Parked dispatch child resumes** (child report, monitoring wake, auto-resume) while the cap is full | Counts again immediately; the cap is **not** re-checked and is transiently exceeded — the #347 precedent, stated in §Proposed Solution ¶2. Not a defect: gating resumes is the deadlock that exemption exists to prevent. |
+| **Parked dispatch child resumes** (child report, monitoring wake) while the cap is full | Counts again immediately; the cap is **not** re-checked and is transiently exceeded — the #347 precedent, stated in §Proposed Solution ¶2. Not a defect: gating resumes is the deadlock that exemption exists to prevent. |
+| **Auto-resume after a usage limit** while the cap is full | **Re-gated**, unlike the two cases above: `fireAutoResume` routes it through the ordinary queued-continuation path (`run.ts:2318-2322`), so the child waits in the queue until the cap has room. |
 | Nested dispatch, child blocking **synchronously** on its own child with the last slot held | The intended flow resolves it: the parent ends its turn instead of foreground-waiting, which parks it (`waiting.add` + `releaseSlot()`, `run.ts:2685`) and pumps the whole workspace, so the grandchild is admitted. The containment argument in §Risks holds **under that condition** and is stated there. |
 | A capped child with no slot in sight | Stays `queued`, with its position visible in the task list. Deliberately **not** re-checked on a timer, and unlike the usage-limit hold it needs no durable re-check record: the events that change the answer (a child settling, being cancelled or deleted, a `resources` write, a restart re-enqueueing it) are exactly the ones that already pump or rebuild the queue. |
 | Cross-project | `dispatchBusy()` sums every manager, so the ceiling is workspace-wide like `maxParallel`. |
