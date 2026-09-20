@@ -534,8 +534,8 @@ sparse, so it shows the instantaneous bar and no chart rather than plotting
 minutes as if they were seconds. A remount always re-reads the route (the host
 query overrides the workspace's five-minute `staleTime`), so a cached sample can
 never be stamped as fresh.
-printed as a zero. While a dispatch ceiling is configured (**Max running
-dispatched tasks**), that same payload also reports the dispatch admission state
+While a dispatch ceiling is configured (**Max dispatched tasks started at once**),
+that same payload also reports the dispatch admission state
 and the ceiling the gate was enforcing when the sample was taken (a cached route read can be up to
 the sampler's freshness window behind), which the card prints as
 `Dispatch admission: elevated · 2 of 4`.
