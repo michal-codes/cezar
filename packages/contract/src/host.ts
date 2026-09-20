@@ -19,7 +19,7 @@ import { z } from 'zod';
  * `.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`) a sandboxed process gets an additive
  * `container` object with its OWN cgroup's finite limits and usage, plus `hostCpuCount` for the
  * labelled host-context line. Both keys appear ONLY together and only when a real finite limit
- * exists — a usage-only cgroup (every plain host process) keeps the v1 payload byte-identical.
+ * exists - a usage-only cgroup (every plain host process) keeps the v1 payload byte-identical.
  * Nothing renders a limit without its value: a limit the probe could not read stays absent and the
  * card shows `—`, never the host figure in its place.
  */
