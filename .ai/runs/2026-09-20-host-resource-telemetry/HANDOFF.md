@@ -1,22 +1,22 @@
 # Handoff — 2026-09-20-host-resource-telemetry
 
-**Last updated:** 2026-09-20T00:55:00Z
+**Last updated:** 2026-09-20T01:10:00Z
 **Branch:** feat/host-resource-telemetry
-**PR:** https://github.com/open-mercato/cezar/pull/1036 (draft)
-**Current phase/step:** all 9 Steps done; final gate recorded; review pass + UI QA next
-**Last commit:** `test(server): health-topic pin counts health registrations, not the topic count`
+**PR:** https://github.com/open-mercato/cezar/pull/1036 (ready for review)
+**Current phase/step:** COMPLETE — all 10 Tasks rows done, gate + review + UI QA recorded
+**Last commit:** `fix(web,core): address the review — error state, platform gate, no raw logs`
 
 ## What just happened
-- Phase 2 landed (web module, card, docs) and the full gate ran: typecheck/test:unit/build/
-  test:package green; `npm test` matches `origin/main`'s pre-existing failure set exactly; the
-  e2e suite is flaky-red in this container on BOTH branches (verified).
+- Full gate green (modulo the `origin/main` pre-existing failure set); review pass found 3 minors
+  + 2 nits, all fixed in `6ac4abc0`; re-review approve; browser QA PASS with three screenshots.
 
 ## Next concrete action
-- `om-auto-review-pr 1036 --autofix`, then `om-auto-qa-pr 1036` (screenshots), then the summary
-  comment, the step-commit record commit and the ready flip.
+- none (run closed). Follow-ups for the owner: apply the intended label set (403 from this
+  credential), sign the CLA, and rebase on `main` after #1034 merges.
 
 ## Blockers / open questions
-- none
+- none. Environment limits recorded: upstream label/review writes are refused for this credential;
+  the e2e suite is flaky-red in this container on both branches.
 
 ## Environment caveats
 - Dev runtime runnable: yes (`.ai/scripts/test-env-up.sh`, ~10 s warm)

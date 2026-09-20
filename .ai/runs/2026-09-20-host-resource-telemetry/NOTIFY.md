@@ -28,3 +28,9 @@
   under `.ai/runs/2026-07-22-automatic-open-mercato-skills-updates/checkpoint-3-artifacts/`
   (`skills-update.e2e.ts`); the churn was restored here, but any e2e run can silently dirty a
   checkout.
+
+## 2026-09-20T01:10:00Z — run closed
+- Re-review: approve at `6ac4abc0`. UI QA (`om-auto-qa-pr`): PASS, three screenshots attached,
+  evidence-only (no labels possible from this credential).
+- Every Tasks row `done`; the `## Tasks` table now carries the truthful short SHA of each Step
+  commit. PR flipped to ready. Env stopped, worktree removed.

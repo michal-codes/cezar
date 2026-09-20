@@ -13,16 +13,16 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 
 | Phase | Step | Title | Exec | Status | Commit |
 |-------|------|-------|------|--------|--------|
-| 1 | 1.1 | Contract: `hostUsageSchema` + export, serialization test | inline | done | — |
-| 1 | 1.2 | `core/host-usage.ts`: read-through sampler with the staleness rule | inline | done | — |
-| 1 | 1.3 | Sampler unit tests (baseline, delta, staleness, start/stop, swap/load) | inline | done | — |
-| 1 | 1.4 | `GET /workspace/host-usage` route + parity/BC inventory entries | inline | done | — |
-| 1 | 1.5 | `host` WS topic + hub tests | inline | done | — |
-| 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | done | — |
-| 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | done | — |
-| 2 | 2.3 | Docs: `docs/reference.md` + `BACKWARD_COMPATIBILITY.md` §2 note | inline | done | — |
-| 2 | 2.4 | Gate fix: health-topic registration pin survives the second topic | inline | done | — |
-| 2 | 2.5-review-fix | Review fixes: drop raw gate logs, platform-gate the swap reader, card error state | inline | done | — |
+| 1 | 1.1 | Contract: `hostUsageSchema` + export, serialization test | inline | done | 2dabe956 |
+| 1 | 1.2 | `core/host-usage.ts`: read-through sampler with the staleness rule | inline | done | 972081b2 |
+| 1 | 1.3 | Sampler unit tests (baseline, delta, staleness, start/stop, swap/load) | inline | done | a4c3a636 |
+| 1 | 1.4 | `GET /workspace/host-usage` route + parity/BC inventory entries | inline | done | 703887c5 |
+| 1 | 1.5 | `host` WS topic + hub tests | inline | done | 5f4ba58f |
+| 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | done | c74abdfe |
+| 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | done | 37143423 |
+| 2 | 2.3 | Docs: `docs/reference.md` + `BACKWARD_COMPATIBILITY.md` §2 note | inline | done | 303408ca |
+| 2 | 2.4 | Gate fix: health-topic registration pin survives the second topic | inline | done | 6858a563 |
+| 2 | 2.5-review-fix | Review fixes: drop raw gate logs, platform-gate the swap reader, card error state | inline | done | 6ac4abc0 |
 
 ## Goal
 
