@@ -1,12 +1,13 @@
 # Live host resource telemetry — the Machine card
 
-> Slug: `host-resource-telemetry` · Status: **v2.1 — design, for specification review** · Brief:
+> Slug: `host-resource-telemetry` · Status: **v2.2 — design, for specification review** · Brief:
 > `.ai/specs/briefs/2026-09-20-host-resource-telemetry.md` · Precedents: the per-run sampler
 > (`#348`, `packages/cezar/src/core/process-usage.ts`) and the WS subscription bus
 > (`.ai/specs/2026-07-23-websocket-subscriptions.md`) · Review trail: units `906047e7`
 > (doctrine/UX) and `3baaa393` (technical), both verdict *changes*, folded into v2; the
 > specification review of PR #1035 (one major — route freshness/remote CPU — plus four smaller
-> items) is folded into this v2.1 ·
+> items) is folded into this v2.1, and the follow-up review (three majors: swap-field pairing,
+> receipt-time freshness, sparse-remote cadence — plus the first-frame delta rule) into v2.2 ·
 > Delivery: this document ships design-only; one implementation PR follows separately
 > (`Refs` this spec PR). **Sequencing:** the implementation lands after #1034
 > (dispatch admission cap) — both touch `resources-section.tsx` and the docs inventory — and
@@ -65,10 +66,14 @@ no new env var, no change to `health` or any existing payload.
    without a WS subscriber).
 4. **UI: the Machine card** at the top of Settings → Resources. The card's own effect subscribes
    to the topic and returns the unsubscribe, so leaving the view stops the sampler (0→1/1→0). It
-   shows CPU (value + bar + 60 s sparkline from 30 samples), RAM (used/total bar), swap when
-   present, load when present, and "updated Xs ago" measured client-side **from receipt time**,
-   recomputed on each frame or query result (no separate ticking timer). The value area is a
-   labelled **host-level** view (container/cgroup caveat documented).
+   shows CPU (value + bar + sparkline from 30 samples), RAM (used/total bar), swap when present,
+   load when present, and "updated Xs ago" derived from the sample's own `sampledAt`, so a cockpit
+   that stopped receiving counts up instead of freezing at `0 s` (review 5259788097, major 2). The
+   receipt stamp stays the TRANSPORT fact behind the `live`/`stale` state, never the age. The 60 s
+   span is a LOCAL statement: every point carries its `sampledAt`, and remote reconciles are sparse
+   (mount, reconnect, visibility), so a span label must be read from those stamps rather than
+   assumed at 2 s spacing (review, major 3). The value area is a labelled **host-level** view
+   (container/cgroup caveat documented).
 
 **Alternatives considered and rejected** (evidence in the brief):
 
@@ -100,13 +105,13 @@ export const HOST_SAMPLE_INTERVAL_MS = 2_000;
 export const HOST_SAMPLE_STALE_MS = 3 * HOST_SAMPLE_INTERVAL_MS; // 6 s
 export interface HostUsage {
   sampledAt: string;
-  cpuPct?: number;            // absent until a CPU baseline exists
+  cpuPct?: number;            // absent until a REAL delta window exists: >= half the 2 s cadence
   cpuCount: number;           // os.availableParallelism(), always >= 1
   memTotalBytes: number;
   memUsedBytes: number;
   memAvailableBytes: number;
-  swapTotalBytes?: number;    // Linux /proc/meminfo only
-  swapUsedBytes?: number;
+  swapTotalBytes?: number;    // Linux /proc/meminfo only. Produced as a PAIR: both or neither -
+  swapUsedBytes?: number;     //   the schema cannot express that, so read the two keys together.
   loadAvg?: { one: number; five: number; fifteen: number }; // absent on Windows
 }
 export function currentHostUsage(): HostUsage | undefined; // pure read of the last raw sample
@@ -156,7 +161,10 @@ export const hostUsageSchema = z.object({
   memTotalBytes: z.number().nonnegative(),
   memUsedBytes: z.number().nonnegative(),
   memAvailableBytes: z.number().nonnegative(),
-  swapTotalBytes: z.number().nonnegative().optional(),  // /proc/meminfo SwapTotal (Linux only)
+  // The swap pair is produced together or not at all, on Linux only. The flat optional shape
+  // cannot express that pairing, so a consumer must guard on BOTH keys (review 5259788097, major 1);
+  // nesting it like `loadAvg` is the safer shape and is deferred as a post-v1 breaking change.
+  swapTotalBytes: z.number().nonnegative().optional(),  // /proc/meminfo SwapTotal
   swapUsedBytes: z.number().nonnegative().optional(),   // SwapTotal − SwapFree
   loadAvg: z.object({ one: z.number(), five: z.number(), fifteen: z.number() }).optional(),
 });
@@ -190,8 +198,9 @@ workspace-only list, and the `BACKWARD_COMPATIBILITY.md` §2 inventory. `typed-b
 **Machine card (top of Settings → Resources, above "Max parallel tasks").**
 
 - Header: `Machine` + a live dot in local mode (or `last known` in remote) + `updated 2 s ago`
-  from a client receipt timestamp.
-- CPU: `38%` with a bar and a 60 s sparkline (30 samples, one point per 2 s tick); thresholds
+  derived from the sample's own `sampledAt`; the receipt stamp only decides `live`/`stale`.
+- CPU: `38%` with a bar and a sparkline (30 samples, one point per local ~2 s tick, each stamped
+  with its `sampledAt` - a remote ring is sparse by construction); thresholds
   neutral <60%, amber 60–85%, danger >85% using the real tokens (`--pending` fill,
   `text-pending-strong`) — never `text-amber-*`.
 - Memory: stacked bar used/available + `12.4 GB / 32 GB` using the same byte formatter as the task
@@ -205,11 +214,13 @@ workspace-only list, and the `BACKWARD_COMPATIBILITY.md` §2 inventory. `typed-b
   When a route answer carries no `cpuPct` (no fresh baseline), the CPU area stays in `sampling…`
   and the card fires its single warm-up fetch ~2.5 s later, so the reading that follows is a real
   ~2 s delta — an aged sample is never rendered as current, and the freshness label recomputes on
-  frames and query results only (no extra ticking timer).
+  frames and query results only (no extra ticking timer). Between those sparse results the label
+  counts up from `sampledAt`, so a remote card left open reads `updated 4 min ago`, never `0 s`.
 - Sparkline history is component state: the 60 s line starts over on each visit to this screen
   (an explicit v1 trade-off, noted rather than accidental).
 - Caveat line (small, muted): "Host totals — container/cgroup limits are not subtracted."
-- Accessibility: sparkline is `role="img"` with an aria-label; numeric values are text next to it;
+- Accessibility: sparkline is `role="img"` with an aria-label that states the span from the stored
+  timestamps, never an assumed 2 s spacing; numeric values are text next to it;
   no `aria-live` chatter.
 
 **No sidebar widget in v1.** The deferred widget is described in "Deferred" below; the card is
@@ -225,7 +236,7 @@ Settings → Resources screen on `origin/main` `4763447f`).
 | Scenario | Behavior |
 |----------|----------|
 | Nobody viewing the card | No subscription → no timer, no frames, zero cost. |
-| First subscribe frame | `start()` primes the baseline, `snapshot()` returns memory/load with `cpuPct` absent; the first CPU point lands after one ~2 s tick. |
+| First subscribe frame | `start()` primes the baseline, `snapshot()` returns memory/load with `cpuPct` absent; the first CPU point lands after one ~2 s tick. Pinned twice: the delta is emitted only when its window is >= half the cadence (`HOST_SAMPLE_MIN_DELTA_MS`), so a baseline primed by the same subscribe can never produce a reading, and the core test drives the hub's real `start()`-then-`snapshot()` order rather than `snapshot()` alone (review BLOCKER on the frame that used to read 50-100 %). |
 | Route hit with no fresh baseline (remote, no local viewer) | Memory/load come back; `cpuPct` is absent (never computed from an unbounded window) and the card's single warm-up fetch lands a genuine ~2 s delta ~2.5 s later. |
 | Route hit after a long gap (stale cache) | The aged sample is **not** replayed as current: the staleness rule returns memory/load only, and the warm-up fetch re-primes then measures. |
 | Staleness suppresses the first topic frame | The client keeps its pre-frame `sampling…` state; the first 2 s tick publishes the next sample; no error frame, no error state. |
@@ -236,7 +247,9 @@ Settings → Resources screen on `origin/main` `4763447f`).
 | Two tabs on the card | The client ref-counts listeners per topic: one publisher, one subscribe frame, two readers. |
 | Remote mode | No WebSocket; route snapshot + reconcile; `last known` label. |
 | Server restart | No persistence; the next subscription gets a fresh sample after one tick. |
-| Clock skew | Freshness is client receipt time, not a comparison with `sampledAt`. |
+| Clock skew | The displayed age is `now - sampledAt` (server clock) while `live`/`stale` comes from the client receipt stamp. A skewed server therefore shows a skewed age - visibly wrong rather than silently frozen at `0 s`, which is the trade this spec chose (review 5259788097, major 2). |
+| Swap fields arriving unpaired (foreign producer, hand-edited payload) | A consumer must render `—` for the missing half and never `Swap / 8.0 GB`: the pair is read together. The sampler always emits both or neither; the schema cannot express the pairing (review, major 1). |
+| Remote ring spanning minutes | Points are stamped with `sampledAt`; the label reports the stored span. "Last 60 s" is a LOCAL claim only - remote reconciles are sparse, so a time-based label is wrong there (review, major 3). |
 | Unsubscribe leak | The card's effect returns the unsubscribe; a test pins topic stop on unmount. |
 
 ## 📝 Risks & Impact Review
@@ -262,13 +275,13 @@ reviewer can override any single one before the implementation PR starts.
 | # | Question | Applied answer | Rationale |
 |---|----------|----------------|-----------|
 | A1 | Metric set | CPU %, memory, swap (when present), load (when present), `cpuCount`, `sampledAt`. | Answers "how is the machine doing" with portable reads. |
-| A2 | CPU shape | Aggregate 0–100, omitted before a baseline. | Per-core is unreadable at a glance; a fake 0% would be dishonest. |
+| A2 | CPU shape | Aggregate 0–100, omitted until a REAL delta window exists (>= half the cadence), never merely "before a baseline". | Per-core is unreadable at a glance; a fake 0% - or a 100 % from a 3 ms window - would be dishonest. |
 | A3 | CPU count source | `os.availableParallelism()`. | `os.cpus()` can be empty where `/proc` is unavailable; availableParallelism is ≥ 1 and cgroup-quota aware. |
 | A4 | Transport | WS topic (local, per-view) + workspace route (remote snapshot/reconcile). | The WS spec's pattern; no interval polling. |
 | A5 | UI surface | Machine card only; sidebar widget deferred. | Both reviews: the widget would keep a publisher alive for an invisible element. |
 | A6 | Containers | Host-level totals, labelled; cgroup parsing deferred. | Honest and portable; cgroups are platform-specific. |
 | A7 | Persistence | None; server latest + card's 30 samples. | A live gauge needs no history on disk. |
-| A8 | Freshness | Client receipt time; "updated Xs ago". | Avoids server-clock skew. |
+| A8 | Freshness | Age from the sample's own `sampledAt`; the receipt stamp only drives `live`/`stale`. | A receipt-time age freezes at `0 s` on sparse remote reconciles, which is worse than a visible skew (review major 2). |
 | A9 | Access | Topic trusted-only; route normally guarded. | No reason to expose host data to foreign local pages. |
 | A10 | v2 candidates | Sidebar glance widget, disk free for worktrees, per-core view, cgroup-aware numbers. | Explicitly deferred so v1 stays small. |
 
@@ -299,11 +312,13 @@ Every step leaves the app working and is covered by a test.
    load, failure-soft sample, `currentHostUsage()`, `sampleHostUsage()` as a staleness-ruled pure
    read/prime (`HOST_SAMPLE_STALE_MS`), `onHostUsage` ref-counted start/stop with an `unref()`ed
    timer.
-3. Unit-test the sampler: baseline priming (first tick `cpuPct` absent), delta normalization,
-   zero-delta omission, swap absent/unreadable, Windows load omitted, start/stop symmetry, no timer
-   after the last unsubscribe, that `sampleHostUsage()` never mutates the baseline, and the
-   staleness rule (fresh sample passed through; aged sample → memory/load prime with `cpuPct`
-   absent).
+3. Unit-test the sampler: baseline priming (first tick `cpuPct` absent), the minimum delta window
+   (a baseline primed by the same subscribe - the hub's `start()`-then-`snapshot()` order - never
+   yields a `cpuPct`, and a second immediate read re-baselines instead of reading), delta
+   normalization, zero-delta omission, swap absent/unreadable, Windows load omitted, start/stop
+   symmetry, no timer after the last unsubscribe, that `sampleHostUsage()` never mutates the
+   baseline, and the staleness rule (fresh sample passed through; aged sample → memory/load prime
+   with `cpuPct` absent).
 4. Add `GET /workspace/host-usage` to the workspace chained family; extend contract-parity and the
    workspace-only `route-parity` list; add the §2 inventory entry; assert the typed client can call
    it (no `typed-bodies` entry — no input).
