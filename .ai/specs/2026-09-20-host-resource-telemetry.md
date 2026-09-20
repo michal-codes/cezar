@@ -1,10 +1,12 @@
 # Live host resource telemetry — the Machine card
 
-> Slug: `host-resource-telemetry` · Status: **v2 — design, for specification review** · Brief:
+> Slug: `host-resource-telemetry` · Status: **v2.1 — design, for specification review** · Brief:
 > `.ai/specs/briefs/2026-09-20-host-resource-telemetry.md` · Precedents: the per-run sampler
 > (`#348`, `packages/cezar/src/core/process-usage.ts`) and the WS subscription bus
 > (`.ai/specs/2026-07-23-websocket-subscriptions.md`) · Review trail: units `906047e7`
-> (doctrine/UX) and `3baaa393` (technical), both verdict *changes*, both folded into this v2 ·
+> (doctrine/UX) and `3baaa393` (technical), both verdict *changes*, folded into v2; the
+> specification review of PR #1035 (one major — route freshness/remote CPU — plus four smaller
+> items) is folded into this v2.1 ·
 > Delivery: this document ships design-only; one implementation PR follows separately
 > (`Refs` this spec PR). **Sequencing:** the implementation lands after #1034
 > (dispatch admission cap) — both touch `resources-section.tsx` and the docs inventory — and
@@ -40,22 +42,32 @@ no new env var, no change to `health` or any existing payload.
    after one interval) and stops on the last. It computes `cpuPct` from `os.cpus()` deltas
    (normalized 0–100, omitted until a baseline exists), `cpuCount` from
    `os.availableParallelism()`, memory from `os.totalmem()`/`os.freemem()`, swap by parsing
-   `/proc/meminfo` (Linux only; absent elsewhere), and `loadAvg` from `os.loadavg()` (absent on
-   Windows). Every field is best-effort; `sample()` never throws.
+   `/proc/meminfo` (Linux only; absent elsewhere; `swapUsedBytes = SwapTotal − SwapFree`), and
+   `loadAvg` from `os.loadavg()` (absent on Windows). Every field is best-effort; `sample()`
+   never throws.
 2. **WS topic `host`** registered in `createApp` behind `deps.socketHub?`, with the default
-   trusted-only access. `snapshot()` is a **pure read of the last sample** (or a memory/load-only
-   prime when none exists yet) — never a fresh CPU computation, because the hub calls `start()`
-   before `snapshot()` (`ws.ts:161-174`). `start(publish)` primes the baseline, starts the timer and
-   publishes each 2 s tick; the returned stop clears it. The topic publishes every tick while
-   subscribed: the payload is a continuously varying gauge and `sampledAt` changes every tick, so a
-   whole-payload change guard would be inert.
+   trusted-only access. `snapshot()` is a **pure read** — never a fresh CPU computation, because
+   the hub calls `start()` before `snapshot()` (`ws.ts:161-174`) — and it is **staleness-ruled**:
+   the cached sample only while it is fresher than `HOST_SAMPLE_STALE_MS = 3 ×
+   HOST_SAMPLE_INTERVAL_MS` (6 s), otherwise a memory/load-only prime with `cpuPct` absent, so a
+   sample replayed after a long gap can never read as current. `start(publish)` primes the
+   baseline, starts the timer and publishes each 2 s tick; the returned stop clears it. The topic
+   publishes every tick while subscribed: the payload is a continuously varying gauge and
+   `sampledAt` changes every tick, so a whole-payload change guard would be inert.
 3. **Workspace route** `GET /api/v1/workspace/host-usage` (single-mount, never project-scoped)
-   returns the same cached sample. It is the remote snapshot and the reconcile target; it answers
-   200 with all required fields, never 503.
+   answers with the same staleness-ruled read (`sampleHostUsage()`): the cached sample only while
+   it is fresher than `HOST_SAMPLE_STALE_MS`, otherwise a memory/load-only prime with `cpuPct`
+   absent. It is the remote snapshot and the reconcile target; it answers 200 with all required
+   fields, never 503. A remote card that receives an answer **without** `cpuPct` follows it with
+   exactly one warm-up fetch ~2.5 s later (on mount and after each visibility/reconnect
+   reconcile), so `cpuPct` becomes a genuine ~2 s delta instead of an average over the gap since
+   the last read — without it, the route path alone can never produce `cpuPct` (no timer runs
+   without a WS subscriber).
 4. **UI: the Machine card** at the top of Settings → Resources. The card's own effect subscribes
    to the topic and returns the unsubscribe, so leaving the view stops the sampler (0→1/1→0). It
    shows CPU (value + bar + 60 s sparkline from 30 samples), RAM (used/total bar), swap when
-   present, load when present, and "updated Xs ago" measured client-side. The value area is a
+   present, load when present, and "updated Xs ago" measured client-side **from receipt time**,
+   recomputed on each frame or query result (no separate ticking timer). The value area is a
    labelled **host-level** view (container/cgroup caveat documented).
 
 **Alternatives considered and rejected** (evidence in the brief):
@@ -65,6 +77,7 @@ no new env var, no change to `health` or any existing payload.
 | Sidebar widget + root subscription in v1 | The sidebar is hidden below `md` and the drawer is normally closed, so "always visible" is false; the sampler would run for an invisible widget. Deferred to v2. |
 | Remote `refetchInterval: 5_000` | Contradicts the WS spec's remote rule (HTTP bootstrap + SSE reconnect/visibility reconciliation); the card uses the existing reconcile seam instead. |
 | `snapshot()` that computes a fresh sample | Races the baseline the hub's `start()` just primed (`ws.ts:161-174`) → NaN/0% on the first subscribe frame. |
+| A byte-for-byte cached route read (v2) | Without a WS subscriber no timer ever runs, so `cpuPct` would be absent forever remotely; with an old cache it would be replayed as fresh. Superseded by the staleness rule + one bounded warm-up fetch. |
 | cgroup-aware memory/CPU in v1 | Platform-specific parsing; v1 labels host totals honestly instead. |
 | Extending `GET /api/health` | CORS-open discovery payload with a 5 s cache; host metrics must not widen it. |
 | Persisting samples / a chart library | The card needs 30 in-memory samples; SVG + existing tokens suffice. |
@@ -84,6 +97,7 @@ flowchart LR
 
 ```ts
 export const HOST_SAMPLE_INTERVAL_MS = 2_000;
+export const HOST_SAMPLE_STALE_MS = 3 * HOST_SAMPLE_INTERVAL_MS; // 6 s
 export interface HostUsage {
   sampledAt: string;
   cpuPct?: number;            // absent until a CPU baseline exists
@@ -95,15 +109,18 @@ export interface HostUsage {
   swapUsedBytes?: number;
   loadAvg?: { one: number; five: number; fifteen: number }; // absent on Windows
 }
-export function currentHostUsage(): HostUsage | undefined; // pure read
-export function sampleHostUsage(): HostUsage;              // pure read, or memory/load-only prime
+export function currentHostUsage(): HostUsage | undefined; // pure read of the last raw sample
+export function sampleHostUsage(): HostUsage;              // staleness-ruled read: cached sample
+                                                           // while fresh (< 6 s), else memory/load
+                                                           // prime with `cpuPct` absent
 export function onHostUsage(listener: (u: HostUsage) => void): () => void; // 0→1 start / 1→0 stop
 ```
 
 The timer is `unref()`ed like the process sampler. `swap` parsing tolerates a missing/unreadable
 `/proc/meminfo`; `loadAvg` is omitted when `process.platform === 'win32'` or the values are
-unavailable, not zeroed. The stale-guard for `snapshot()`/route is simply "last sample, whatever
-its age" — the client renders the age; no second cache is introduced.
+unavailable, not zeroed. The staleness rule is the whole guard: `sampleHostUsage()` (topic
+snapshot **and** route) never hands out a CPU reading older than `HOST_SAMPLE_STALE_MS`, and it
+never mutates the timer's baseline — no second cache, no second timer is introduced.
 
 **Route & topic wiring.** The route joins the workspace-level chained family next to
 `/workspace/config`; the topic registers exactly like `health`:
@@ -121,9 +138,12 @@ deps.socketHub?.registerTopic('host', {
 local mode subscribes via `subscribeTopic('host', …)` inside an effect that returns the
 unsubscribe and folds each frame into the query cache; remote mode never opens a socket and
 fetches the route on mount, with the existing `reconcile()` seam
-(`global-events.tsx:313-337`) gaining a `hostUsage` key so visibility/reconnect refresh it. The
-30-sample history is component state in the card (not a module-level global), appended on each
-frame/query update. No other component touches the socket.
+(`global-events.tsx:313-337`) gaining a `hostUsage` key so visibility/reconnect refresh it. When
+a remote answer arrives without `cpuPct`, the card schedules **one** warm-up fetch ~2.5 s later
+(`setTimeout`, cleared on unmount — not an interval, and never more than one pending); the same
+rule applies after each reconcile-triggered fetch. The 30-sample history is component state in
+the card (not a module-level global), appended on each frame/query update, so it restarts when
+the card unmounts — an explicit v1 trade-off. No other component touches the socket.
 
 ## 📝 Data Model
 
@@ -136,8 +156,8 @@ export const hostUsageSchema = z.object({
   memTotalBytes: z.number().nonnegative(),
   memUsedBytes: z.number().nonnegative(),
   memAvailableBytes: z.number().nonnegative(),
-  swapTotalBytes: z.number().nonnegative().optional(),
-  swapUsedBytes: z.number().nonnegative().optional(),
+  swapTotalBytes: z.number().nonnegative().optional(),  // /proc/meminfo SwapTotal (Linux only)
+  swapUsedBytes: z.number().nonnegative().optional(),   // SwapTotal − SwapFree
   loadAvg: z.object({ one: z.number(), five: z.number(), fifteen: z.number() }).optional(),
 });
 ```
@@ -182,6 +202,12 @@ workspace-only list, and the `BACKWARD_COMPATIBILITY.md` §2 inventory. `typed-b
   arrives, then the sparkline starts.
 - Remote: values render with the `last known` label; a route fetch on mount and the
   visibility/reconnect reconcile keep them current; while visible nothing polls on an interval.
+  When a route answer carries no `cpuPct` (no fresh baseline), the CPU area stays in `sampling…`
+  and the card fires its single warm-up fetch ~2.5 s later, so the reading that follows is a real
+  ~2 s delta — an aged sample is never rendered as current, and the freshness label recomputes on
+  frames and query results only (no extra ticking timer).
+- Sparkline history is component state: the 60 s line starts over on each visit to this screen
+  (an explicit v1 trade-off, noted rather than accidental).
 - Caveat line (small, muted): "Host totals — container/cgroup limits are not subtracted."
 - Accessibility: sparkline is `role="img"` with an aria-label; numeric values are text next to it;
   no `aria-live` chatter.
@@ -200,6 +226,9 @@ Settings → Resources screen on `origin/main` `4763447f`).
 |----------|----------|
 | Nobody viewing the card | No subscription → no timer, no frames, zero cost. |
 | First subscribe frame | `start()` primes the baseline, `snapshot()` returns memory/load with `cpuPct` absent; the first CPU point lands after one ~2 s tick. |
+| Route hit with no fresh baseline (remote, no local viewer) | Memory/load come back; `cpuPct` is absent (never computed from an unbounded window) and the card's single warm-up fetch lands a genuine ~2 s delta ~2.5 s later. |
+| Route hit after a long gap (stale cache) | The aged sample is **not** replayed as current: the staleness rule returns memory/load only, and the warm-up fetch re-primes then measures. |
+| Staleness suppresses the first topic frame | The client keeps its pre-frame `sampling…` state; the first 2 s tick publishes the next sample; no error frame, no error state. |
 | `/proc/meminfo` unreadable | Swap fields omitted; memory still comes from `os`; nothing throws. |
 | `os.cpus()` empty (no `/proc`) | `cpuCount` still ≥ 1 from `os.availableParallelism()`; `cpuPct` omitted each tick rather than faked. |
 | Windows | `loadAvg` absent → the load row is hidden; CPU/memory work normally. |
@@ -216,6 +245,8 @@ Settings → Resources screen on `origin/main` `4763447f`).
   lives under the normal same-origin/loopback guard; no CORS widening, no `health` change.
 - **Cost.** Zero timers without a subscriber; while the card is open, two cheap reads per 2 s
   (`os.cpus()` and one small `/proc` read). No dependency, no persistence, no DB, no env var.
+  Remote costs at most two route reads per mount and per reconcile (the warm-up fetch), never a
+  loop.
 - **Compatibility.** Additive: one new workspace route (§2 inventory), one new topic, new contract
   schemas; no existing payload changes. `.env.example` untouched.
 - **Accuracy honesty.** Host-level totals labelled as such; first-tick CPU is `sampling…`, not 0%;
@@ -264,26 +295,31 @@ Every step leaves the app working and is covered by a test.
 1. Add `hostUsageSchema` and its inferred type to the contract; test optional-field
    serialization both directions.
 2. Implement `host-usage.ts`: injectable CPU snapshot source for delta math, memory from `os`,
-   `/proc/meminfo` swap parsing, `availableParallelism`, platform-gated load, failure-soft sample,
-   `currentHostUsage()`, `sampleHostUsage()` as a pure read/prime, `onHostUsage` ref-counted
-   start/stop with an `unref()`ed timer.
+   `/proc/meminfo` swap parsing (`SwapTotal − SwapFree`), `availableParallelism`, platform-gated
+   load, failure-soft sample, `currentHostUsage()`, `sampleHostUsage()` as a staleness-ruled pure
+   read/prime (`HOST_SAMPLE_STALE_MS`), `onHostUsage` ref-counted start/stop with an `unref()`ed
+   timer.
 3. Unit-test the sampler: baseline priming (first tick `cpuPct` absent), delta normalization,
    zero-delta omission, swap absent/unreadable, Windows load omitted, start/stop symmetry, no timer
-   after the last unsubscribe, and that `sampleHostUsage()` never mutates the baseline.
+   after the last unsubscribe, that `sampleHostUsage()` never mutates the baseline, and the
+   staleness rule (fresh sample passed through; aged sample → memory/load prime with `cpuPct`
+   absent).
 4. Add `GET /workspace/host-usage` to the workspace chained family; extend contract-parity and the
    workspace-only `route-parity` list; add the §2 inventory entry; assert the typed client can call
    it (no `typed-bodies` entry — no input).
-5. Register the `host` topic; test snapshot-before-first-tick (no `cpuPct`), snapshot purity,
-   0→1 start / 1→0 stop, per-tick publishing, and that an untrusted connection is refused.
+5. Register the `host` topic; test snapshot-before-first-tick (no `cpuPct`), snapshot purity and
+   the staleness rule, 0→1 start / 1→0 stop, per-tick publishing, and that an untrusted
+   connection is refused.
 6. Add the web `host-usage` module: query key, cache folding, `useHostUsage()`, the card-scoped
-   subscription (local) and remote route snapshot; add `hostUsage` to the existing reconcile seam;
-   test subscribe-on-mount/unsubscribe-on-unmount, no interval in remote, and no socket in remote.
+   subscription (local), the remote route snapshot + single warm-up fetch; add `hostUsage` to the
+   existing reconcile seam; test subscribe-on-mount/unsubscribe-on-unmount, the warm-up fired
+   exactly once and cleared on unmount, no interval in remote, and no socket in remote.
 7. Build the Machine card: CPU bar + sparkline (30 samples), RAM bar, swap/load rows, freshness
    label, host-level caveat, threshold tokens, accessibility; test live, sampling, remote and
    missing-metric states.
-8. Update `docs/reference.md` (Resources paragraph: live host totals + container caveat) and
-   `BACKWARD_COMPATIBILITY.md` §2; run the full validation gate (`npm run typecheck`, `npm test`,
-   `npm run test:unit`, `npm run build`, `npm run test:package`).
+8. Update `docs/reference.md` (Resources paragraph: live host totals, the remote warm-up fetch,
+   the container caveat) and `BACKWARD_COMPATIBILITY.md` §2; run the full validation gate
+   (`npm run typecheck`, `npm test`, `npm run test:unit`, `npm run build`, `npm run test:package`).
 
 ## 📚 Evidence
 
