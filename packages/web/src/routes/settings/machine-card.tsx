@@ -32,7 +32,7 @@ const clampPct = (value: number): number => Math.min(100, Math.max(0, value))
 export function MachineCard() {
   useHostUsageSubscription()
   const transport = useHostTransport()
-  const { data: sample } = useHostUsage()
+  const { data: sample, isError } = useHostUsage()
 
   const [history, setHistory] = useState<number[]>([])
   const [receivedAt, setReceivedAt] = useState<number | null>(null)
@@ -90,9 +90,15 @@ export function MachineCard() {
           data-slot="machine-card-freshness"
           className="ml-auto shrink-0 text-[11px] tabular-nums text-soft-foreground"
         >
-          {ageSeconds === undefined ? 'waiting for the first sample…' : `updated ${ageSeconds} s ago`}
+          {ageSeconds === undefined ? 'waiting…' : `updated ${ageSeconds} s ago`}
         </span>
       </header>
+
+      {isError && sample === undefined ? (
+        <p data-slot="machine-card-error" className="mt-3 text-[12.5px] text-soft-foreground">
+          Host totals are unavailable right now.
+        </p>
+      ) : null}
 
       <div className="mt-3 grid gap-3">
         <div data-slot="machine-card-cpu" className="grid grid-cols-[86px_1fr] items-start gap-3">

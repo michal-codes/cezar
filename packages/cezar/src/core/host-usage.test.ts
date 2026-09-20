@@ -196,7 +196,6 @@ describe('host sampler', () => {
     const windows = createHostSampler({
       cpuTimes: probe.source,
       platform: 'win32',
-      readMeminfo: () => undefined,
       now,
     }).sampleHostUsage();
     expect(windows.loadAvg).toBeUndefined();
@@ -204,7 +203,6 @@ describe('host sampler', () => {
     const linux = createHostSampler({
       cpuTimes: probe.source,
       platform: 'linux',
-      readMeminfo: () => undefined,
       now,
     }).sampleHostUsage();
     expect(linux.loadAvg).toEqual({
@@ -212,6 +210,14 @@ describe('host sampler', () => {
       five: expect.any(Number),
       fifteen: expect.any(Number),
     });
+    // The DEFAULT swap reader is platform-gated too. On a host with swap configured this is the
+    // differential that proves it (Windows-label sample: no swap; Linux-label sample: swap); on a
+    // swapless host — like a CI container — both are legitimately absent and only the invariant
+    // below can be asserted.
+    expect(windows.swapTotalBytes).toBeUndefined();
+    if (linux.swapTotalBytes !== undefined) {
+      expect(linux.swapTotalBytes).toBeGreaterThan(0);
+    }
   });
 
   it('runs one timer for the first listener, publishes each tick, and stops on the last unsubscribe', () => {

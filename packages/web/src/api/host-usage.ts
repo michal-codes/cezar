@@ -50,6 +50,8 @@ const delay = (ms: number, signal: AbortSignal | undefined): Promise<void> =>
 /**
  * The remote read pair. The second read exists only to turn "no CPU baseline yet" into a real
  * ~2 s delta; when the first answer already carries `cpuPct` it is the whole read.
+ *
+ * `@internal` — exported for the abort test; the app's read path is `useHostUsage()`.
  */
 export async function readWorkspaceHostUsage(
   signal?: AbortSignal,

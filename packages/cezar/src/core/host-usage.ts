@@ -86,6 +86,16 @@ function defaultReadMeminfo(): string | undefined {
   }
 }
 
+/**
+ * The platform gate for the DEFAULT swap reader. `platform` is injectable, so the default has to
+ * honour it too: a sampler told it runs on Windows must not answer with Linux's `/proc/meminfo`
+ * swap while correctly omitting `loadAvg` — a sample that contradicts its own platform is worse
+ * than a missing field.
+ */
+function readMeminfoFor(platform: NodeJS.Platform): () => string | undefined {
+  return platform === 'linux' ? defaultReadMeminfo : () => undefined;
+}
+
 /** `/proc/meminfo` expresses sizes in kB; swap used is `SwapTotal − SwapFree`. */
 function parseSwap(meminfo: string | undefined): { totalBytes: number; usedBytes: number } | undefined {
   if (meminfo === undefined) return undefined;
@@ -112,7 +122,7 @@ function computeCpuPct(previous: HostCpuTimes, next: HostCpuTimes): number | und
 export function createHostSampler(options: HostSamplerOptions = {}): HostSampler {
   const cpuTimesSource = options.cpuTimes ?? defaultCpuTimes;
   const platform = options.platform ?? process.platform;
-  const readMeminfo = options.readMeminfo ?? defaultReadMeminfo;
+  const readMeminfo = options.readMeminfo ?? readMeminfoFor(platform);
   const now = options.now ?? Date.now;
 
   let lastSample: HostUsage | undefined;

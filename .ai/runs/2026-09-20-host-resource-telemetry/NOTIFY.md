@@ -19,3 +19,12 @@
 - Gate found and Step 2.4 fixed a real pin drift (`health-topic.test.ts`, second topic).
 - e2e suite: red in this container on BOTH branches (4-failure flakiness reproduced on `main`);
   recorded as environment-level, with the change's surface verified by the browser QA pass.
+
+## 2026-09-20T01:00:00Z — review pass (`om-auto-review-pr 1036 --autofix`)
+- First review verdict: request changes (0 blocker, 0 major, 3 minor, 2 nits) — committed raw gate
+  logs in the PR, the injected `platform` not gating the default swap reader, and no card error
+  state. Step 2.5 lands all fixes; re-review follows.
+- Observation for the root (outside this order): `.ai/scripts/e2e.sh` specs rewrite TRACKED files
+  under `.ai/runs/2026-07-22-automatic-open-mercato-skills-updates/checkpoint-3-artifacts/`
+  (`skills-update.e2e.ts`); the churn was restored here, but any e2e run can silently dirty a
+  checkout.

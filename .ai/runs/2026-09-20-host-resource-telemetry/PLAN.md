@@ -22,6 +22,7 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 | 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | done | — |
 | 2 | 2.3 | Docs: `docs/reference.md` + `BACKWARD_COMPATIBILITY.md` §2 note | inline | done | — |
 | 2 | 2.4 | Gate fix: health-topic registration pin survives the second topic | inline | done | — |
+| 2 | 2.5-review-fix | Review fixes: drop raw gate logs, platform-gate the swap reader, card error state | inline | done | — |
 
 ## Goal
 
@@ -119,6 +120,13 @@ fetch, the container/cgroup caveat.
 exactly ONE topic (`toEqual(['health'])`); with `host` as the app's second topic that assertion
 had to state its real claim — health is registered exactly once, and `host` is registered too.
 The health behavior it guards (single registration, `loopbackReadable: true`) is unchanged.
+
+2.5 **Review fixes** (`om-auto-review-pr`, findings MINOR-1/2/3 + NIT-1/2): the raw gate/e2e logs
+are dropped from the run folder (the summaries keep the numbers and every claim is
+reproducible); `createHostSampler`'s injected `platform` now gates the DEFAULT swap reader, not
+just `loadAvg`; the card renders `Host totals are unavailable right now.` when the route rejects
+(with a test); the freshness placeholder is shortened; the read-pair helper is marked
+`@internal`.
 
 ## Verification
 

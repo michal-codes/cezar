@@ -184,4 +184,25 @@ describe('MachineCard — remote cockpit', () => {
     await waitFor(() => expect(screen.getByText('8%')).toBeTruthy(), { timeout: 5_000 })
     expect(reads).toBe(2)
   })
+
+  it('admits failure instead of waiting forever when the route rejects', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/api/v1/health')) {
+          return json({ ...HEALTH, capabilities: { ...HEALTH.capabilities, localHandoff: false } })
+        }
+        return new Response(JSON.stringify({ error: 'boom' }), {
+          status: 500,
+          headers: { 'content-type': 'application/json' },
+        })
+      }),
+    )
+    render(<MachineCard />, { wrapper: wrapper() })
+
+    await waitFor(() => expect(screen.getByText('Host totals are unavailable right now.')).toBeTruthy())
+    // The card still explains itself rather than going blank.
+    expect(screen.getByText(/Host totals —/)).toBeTruthy()
+  })
 })
