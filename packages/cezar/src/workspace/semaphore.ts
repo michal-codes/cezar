@@ -47,9 +47,11 @@ export interface WorkspaceResourceLimits {
   /** Per-task process-tree memory ceiling in MiB; null = no limit. */
   memoryLimitMb: number | null;
   /**
-   * Ceiling on concurrently running dispatch children (spec
-   * 2026-09-20-dispatch-admission-scheduler); `null`/`0` = no cap. Optional so an older `load`
-   * stub keeps working — an absent key reads as "no cap", i.e. today's behavior.
+   * ADMISSION ceiling on dispatch children (spec 2026-09-20-dispatch-admission-scheduler): at
+   * most this many are STARTED from the queue at a time, workspace-wide; a parked child returning
+   * to work is never re-gated (#347), so the running count may exceed it. `null`/`0` = no cap.
+   * Optional so an older `load` stub keeps working — an absent key reads as "no cap", i.e. today's
+   * behavior.
    */
   dispatchMaxConcurrent?: number | null;
   /**
@@ -214,9 +216,12 @@ export class WorkspaceSemaphore {
   }
 
   /**
-   * Cached ceiling on concurrently running dispatch children, or null for "no cap".
-   * Mirrors `maxParallel()`/`memoryLimitMb()`: answered from the in-memory snapshot, refreshed
-   * by `refresh()` (boot and every `PUT /workspace/config`), never re-read per pump.
+   * Cached ADMISSION ceiling on dispatch children, or null for "no cap" — what the queue gate
+   * compares `dispatchBusy()` against; a resume never consults it (#347). Answered from the
+   * in-memory snapshot like `maxParallel()`, refreshed by `refresh()` (boot and every
+   * `PUT /workspace/config`), never re-read per pump. The accessor collapses absent to `null`
+   * exactly the way `maxMonitoringSessions()`/`autoResumeOnUsageLimit()` do, because this field is
+   * optional and here `null` and absent mean the same thing.
    */
   dispatchMaxConcurrent(): number | null {
     return this.limits.dispatchMaxConcurrent ?? null;

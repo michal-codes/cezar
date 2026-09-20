@@ -47,8 +47,10 @@ export const workspaceConfigResponseSchema = z.object({
     /** Resume a run a provider usage limit stopped, once the limit resets. Default `true`. */
     autoResumeOnUsageLimit: z.boolean(),
     memoryLimitMb: z.number().nullable(),
-    /** Ceiling on concurrently running dispatch children; null = no cap (spec
-     *  2026-09-20-dispatch-admission-scheduler). Workspace-wide, like `maxParallel`. */
+    /** ADMISSION ceiling on dispatch children: at most this many are started from the queue at a
+     *  time, workspace-wide like `maxParallel`; null = no cap (spec
+     *  2026-09-20-dispatch-admission-scheduler). A parked child returning to work is never
+     *  re-gated (#347), so the running count may exceed it. */
     dispatchMaxConcurrent: z.number().nullable(),
     worktreeRetentionDefault: z.number(),
   }),
