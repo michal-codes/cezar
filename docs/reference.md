@@ -534,6 +534,10 @@ sparse, so it shows the instantaneous bar and no chart rather than plotting
 minutes as if they were seconds. A remount always re-reads the route (the host
 query overrides the workspace's five-minute `staleTime`), so a cached sample can
 never be stamped as fresh.
+printed as a zero. While a dispatch ceiling is configured (**Max running
+dispatched tasks**), that same payload also reports the dispatch admission state
+and the ceiling the gate enforces right now, which the card prints as
+`Dispatch admission: elevated · 2 of 4`.
 
 **Which numbers are effective.** The plain process reads **host totals**. When
 cezar runs inside a cgroup with a real limit - a Docker `--cpus`/`--cpuset-cpus`,
