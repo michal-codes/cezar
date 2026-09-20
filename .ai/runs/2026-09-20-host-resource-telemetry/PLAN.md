@@ -19,7 +19,7 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 | 1 | 1.4 | `GET /workspace/host-usage` route + parity/BC inventory entries | inline | done | — |
 | 1 | 1.5 | `host` WS topic + hub tests | inline | done | — |
 | 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | done | — |
-| 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | todo | — |
+| 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | done | — |
 | 2 | 2.3 | Docs: `docs/reference.md` + `BACKWARD_COMPATIBILITY.md` §2 note | inline | todo | — |
 
 ## Goal
@@ -103,7 +103,9 @@ unmount). `global-events.tsx` gains `workspaceQueryKeys.hostUsage` in its reconc
 subscribe-on-mount/unsubscribe-on-unmount, warm-up fired exactly once and cleared, no socket and
 no interval in remote.
 
-2.2 **Machine card.** In `resources-section.tsx`, above "Max parallel tasks": CPU value + bar +
+2.2 **Machine card.** Rendered above "Max parallel tasks" (its own `machine-card.tsx` component,
+imported by `resources-section.tsx` — keeps that file readable and shrinks the #1034 conflict
+surface): CPU value + bar +
 60 s sparkline (30 component-state samples), RAM used/total bar via `formatMem`, swap/load rows
 only when present, `updated Xs ago` from receipt time, host-level caveat, `sampling…` before the
 first `cpuPct`, tokens `--pending` / `text-pending-strong`, sparkline `role="img"` with an

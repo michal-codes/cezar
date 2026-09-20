@@ -60,8 +60,13 @@ export async function readWorkspaceHostUsage(
   return getWorkspaceHostUsage({ signal })
 }
 
-/** Which transport this cockpit has: `undefined` until health (the bootstrap) has answered. */
-function useHostTransport(): 'local' | 'remote' | undefined {
+/**
+ * Which transport this cockpit has: `undefined` until health (the authenticated bootstrap) has
+ * answered. The card uses it for its `live` / `last known` label; the data hooks use it to pick
+ * push or fetch. Gating on health is deliberate — a local cockpit must not open a socket before
+ * the deployment mode is known (the same rule `useHealthSubscription` follows).
+ */
+export function useHostTransport(): 'local' | 'remote' | undefined {
   const health = useHealth().data
   if (health === undefined) return undefined
   return health.capabilities?.localHandoff === true ? 'local' : 'remote'
