@@ -20,8 +20,11 @@ the process's own cgroup (v2 first, v1 fallback), walks ancestors for the tighte
 and emits an optional `container` object **only when a real limit exists** (a finite CPU quota, a
 cpuset affinity set smaller than the host core count, or a memory limit) - usage-only hosts keep
 the byte-identical v1 payload, and the additive `hostCpuCount` rides only together with
-`container`. The Machine card and a desktop sidebar widget render effective numbers with host
-totals as labelled context. A per-app external store feeds both; the v1 card keeps its
+`container`. The Machine card renders the effective numbers **labelled**, with host totals kept
+as context. The sidebar glance renders the same effective CPU/RAM pair and its
+sparkline, but it carries **no effective/host marker**: with only a memory limit it shows the
+host cpu % beside effective RAM, and the card is where the labels live (review major). A per-app
+external store feeds both; the v1 card keeps its
 view-scoped subscription (with an `enabled` gate) as the `<md` fallback, and the root
 subscription (local && desktop) feeds the widget. Adaptive admission stays out of scope; its
 chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`memory.max`,
@@ -137,7 +140,8 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
    re-armed timeout at `lastFrameAt + 10 s` (`lastFrameAt` = the client receipt stamp kept with
    the latest sample, a TRANSPORT fact), cleared on unmount; the rendered age derives from the
    sample's own `sampledAt`, so a cockpit that stopped receiving counts up instead of freezing at
-   `updated 0 s ago`. No counts; load/swap stay host-labelled.
+   `updated 0 s ago`. No counts, no effective/host marker; the swap row keeps v1's bare label and
+   the load chip pairs with `hostCpuCount` only when a container is present.
 6. **Adaptive admission — deferred; chain and hard ceiling stated once:**
 
    ```
@@ -198,7 +202,8 @@ cpuset CPU list only when its count is below the host core count, `container.cpu
 finite CPU limit exists, quota or affinity (`Δusage_us / Δwall_us / effectiveCores × 100`,
 clamped, zero/negative wall ⇒ omit), `memLimitBytes` only when finite and `< host total`,
 `memUsedBytes` only when `memLimitBytes` exists and cache-excluded when
-`inactive_file`/`total_inactive_file` is readable (else omit). Emit `container` only if a finite
+`inactive_file`/`total_inactive_file` is readable - otherwise the raw `memory.current`, still
+paired to the limit, never a dropped number. Emit `container` only if a finite
 limit exists (quota, affinity or memory) and `hostCpuCount` only together with it. Host fields
 unchanged.
 
@@ -257,12 +262,12 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
   (`14.2 / 16 GB`) or, for a cpuset-only pin, `cpuset 4 CPU · 100%`, plus a muted
   `host 64 CPU · 755 GB` context line using `hostCpuCount`.
 - Without a finite limit: v1 numbers and layout, but the caveat becomes host-mode copy
-  ("Host totals - no cgroup limit detected for this process"), replacing the stale
+  ("Host totals - no cgroup limit tighter than the host detected for this process"), replacing the stale
   "container/cgroup limits are not subtracted" wording (F9).
 - Limit known but its container value missing ⇒ `—` for that value, never a host fallback.
 - Load chip, one rule: without a container it pairs with `cpuCount` (exactly v1); with a
-  container it pairs with `hostCpuCount`; either way it is labelled host, and swap stays
-  host-labelled.
+  container it pairs with `hostCpuCount` and is labelled `host`; without one it is v1's bare
+  `N cores` chip. Swap keeps v1's bare row label.
 
 **Sidebar widget (desktop ≥ md).**
 
@@ -426,8 +431,8 @@ Every step leaves the app working and is covered by a test.
 
 ## 📚 Evidence
 
-- v1 spec: `.ai/specs/2026-09-20-host-resource-telemetry.md`, PR #1035 (head `fded0afc`); its
-  implementation is PR #1036 (head `0537b32e`).
+- v1 spec: `.ai/specs/2026-09-20-host-resource-telemetry.md`, PR #1035 (head `8e0080b5` at the
+  time of this revision); its implementation is PR #1036 (head `08285c15`).
 - Reviews: `461df7d3` (card fallback, justification, clock, store, footer/width), `d3d0e2ca`
   (same mechanics + store/clock/footer slot/harness), `366cf417` (limit-vs-usage, cpuPct
   denominator, transport, BC §2, min-chain/hostCpuCount, mount semantics), `9a043744`
