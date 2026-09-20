@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { hostUsageSchema } from '@open-mercato/cezar-contract';
+import { hostUsageSchema, type HostUsage } from '@open-mercato/cezar-contract';
 import { HOST_SAMPLE_INTERVAL_MS, hostUsageSampler } from '../core/host-usage.ts';
 import { RunStore } from '../runs/store.ts';
 import type { RunManager } from '../workflows/run.ts';
@@ -60,6 +60,38 @@ describe('host topic + sampler (live-server path)', () => {
     const topic = topics.get('host');
     if (!topic) throw new Error('no host topic registered');
     return { app, topic };
+  };
+
+  /**
+   * A sampler whose frames the test owns. CI machines have no cgroup limit, so the container
+   * branches of the wire contract have to be driven by a fixture rather than by the machine.
+   */
+  const buildWithSample = (sample: HostUsage) => {
+    const { hub, topics } = stubHub();
+    const app = createApp({
+      repoRoot,
+      store,
+      manager: {} as RunManager,
+      version: '0.0.0-test',
+      socketHub: hub,
+      hostSampler: {
+        currentHostUsage: () => sample,
+        sampleHostUsage: () => sample,
+        onHostUsage: () => () => undefined,
+        dispose: () => undefined,
+      },
+    });
+    const topic = topics.get('host');
+    if (!topic) throw new Error('no host topic registered');
+    return { app, topic };
+  };
+
+  const baseSample = {
+    sampledAt: '2026-09-20T00:00:00.000Z',
+    cpuCount: 8,
+    memTotalBytes: 16 * 1024 ** 3,
+    memUsedBytes: 4 * 1024 ** 3,
+    memAvailableBytes: 12 * 1024 ** 3,
   };
 
   it('registers the host topic trusted-only, beside health', () => {
@@ -124,5 +156,33 @@ describe('host topic + sampler (live-server path)', () => {
       expect(Object.keys(viaRoute)).toContain(key);
       expect(Object.keys(viaSocket)).toContain(key);
     }
+  });
+
+  it('carries a container frame over both transports, with hostCpuCount beside it', async () => {
+    const sample = {
+      ...baseSample,
+      container: { source: 'cgroup-v2' as const, cpuQuotaCores: 2, memLimitBytes: 2 * 1024 ** 3 },
+      hostCpuCount: 8,
+    };
+    const { app, topic } = buildWithSample(sample);
+
+    const viaSocket = await topic.publisher.snapshot();
+    expect(hostUsageSchema.safeParse(viaSocket).success).toBe(true);
+    expect(viaSocket).toMatchObject({
+      container: { source: 'cgroup-v2', cpuQuotaCores: 2 },
+      hostCpuCount: 8,
+    });
+
+    const res = await app.request('/api/v1/workspace/host-usage', {
+      headers: { host: '127.0.0.1:4321' },
+    });
+    expect(await res.json()).toEqual(sample);
+  });
+
+  it('sends no container keys at all on a usage-only host', async () => {
+    const { topic } = buildWithSample({ ...baseSample });
+    const frame = (await topic.publisher.snapshot()) as Record<string, unknown>;
+    expect('container' in frame).toBe(false);
+    expect('hostCpuCount' in frame).toBe(false);
   });
 });

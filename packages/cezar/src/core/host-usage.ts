@@ -1,6 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { availableParallelism, cpus, freemem, loadavg, totalmem } from 'node:os';
-import type { HostUsage } from '@open-mercato/cezar-contract';
+import type { HostUsage, HostUsageContainer } from '@open-mercato/cezar-contract';
+
+import {
+  createCgroupProbe,
+  hostCoreCount,
+  type CgroupFacts,
+  type CgroupFileReader,
+  type CgroupProbe,
+} from './cgroup-probe.ts';
 
 /**
  * Live host resource telemetry — the Machine card in Settings → Resources (spec
@@ -19,6 +27,13 @@ import type { HostUsage } from '@open-mercato/cezar-contract';
  * 2. **Every read is best-effort.** Memory comes from `os`, swap from `/proc/meminfo` (the one
  *    value Node does not expose; Linux only), load from `os.loadavg()` (absent on Windows where
  *    it reports zeros). A missing fact is OMITTED, never zeroed, and nothing here throws.
+ * 3. **Effective capacity, one scope at a time** (spec
+ *    `.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`). Beside the host totals the sampler
+ *    asks the cgroup probe for the PROCESS's own limits and emits an additive `container` object
+ *    ONLY when a finite limit exists (CPU quota, cpuset pin, memory limit) - a usage-only cgroup
+ *    keeps the v1 payload byte-identical, and `hostCpuCount` rides only with `container`. Nothing
+ *    is mixed: `container.cpuPct` is the cgroup's own delta against effective cores, and a limit
+ *    whose value is unreadable is omitted rather than replaced by the host figure.
  *
  * Cost: one `os.cpus()`-equivalent read per sample. Without a subscriber the timer never starts,
  * so an idle workspace pays nothing; the read-through path costs one read per route hit.
@@ -47,8 +62,102 @@ export interface HostSamplerOptions {
   platform?: NodeJS.Platform;
   /** Injectable for tests; defaults to reading `/proc/meminfo` on Linux. */
   readMeminfo?: () => string | undefined;
+  /** Injectable for tests; defaults to reading `/proc/self/cgroup` and the cgroup files. */
+  readCgroupFile?: CgroupFileReader;
+  /** Injectable for tests; defaults to `createCgroupProbe({ readFile: readCgroupFile })`. */
+  cgroupProbe?: CgroupProbe;
+  /** Injectable for tests; defaults to `os.cpus().length`, the host core count. */
+  hostCoreCount?: () => number;
   /** Injectable for tests; defaults to `Date.now`. */
   now?: () => number;
+}
+
+/** The previous cgroup usage read, paired with its wall-clock instant for the delta. */
+interface CgroupUsageSnapshot {
+  cpuUsageUs: number;
+  at: number;
+}
+
+/**
+ * The one effective-capacity composition (spec §"One composition, no scope mixing"), in the one
+ * place that has both scopes at hand. Returns `{}` - no `container`, no `hostCpuCount` - unless a
+ * finite limit exists, which is what keeps the host-mode payload byte-identical to v1.
+ *
+ * Exported for its own matrix test: quota-only, cpuset-only, memory-only, both, a quota wider than
+ * the host and a limit-without-value all have to behave, and none of them may borrow a host number.
+ */
+export function composeHostContainer(input: {
+  facts: CgroupFacts;
+  cpuCount: number;
+  hostCpuCount: number;
+  memTotalBytes: number;
+  previousUsage?: CgroupUsageSnapshot;
+  now: number;
+}): { container?: HostUsageContainer; hostCpuCount?: number } {
+  const { facts, cpuCount, hostCpuCount, memTotalBytes, previousUsage, now } = input;
+
+  const cpuQuotaCores =
+    facts.cpuQuotaCores !== undefined && facts.cpuQuotaCores > 0 ? facts.cpuQuotaCores : undefined;
+  // A cpuset is a limit only when it is SMALLER than the host: an effective list covering every
+  // core is the unrestricted case, and a wider list must never inflate capacity.
+  const cpuAffinityCores =
+    facts.cpusetCores !== undefined && facts.cpusetCores > 0 && facts.cpusetCores < hostCpuCount
+      ? facts.cpusetCores
+      : undefined;
+  const hasCpuLimit = cpuQuotaCores !== undefined || cpuAffinityCores !== undefined;
+  const memLimitBytes =
+    facts.memLimitBytes !== undefined &&
+    facts.memLimitBytes > 0 &&
+    facts.memLimitBytes < memTotalBytes
+      ? facts.memLimitBytes
+      : undefined;
+  if (!hasCpuLimit && memLimitBytes === undefined) return {};
+
+  // `os.availableParallelism()` already folds a `taskset` mask (and the cgroup quota on recent
+  // libuv), so folding it into the min cannot overstate capacity - it can only lower it.
+  const effectiveCores = hasCpuLimit
+    ? Math.min(
+        cpuCount,
+        hostCpuCount > 0 ? hostCpuCount : Number.POSITIVE_INFINITY,
+        cpuQuotaCores ?? Number.POSITIVE_INFINITY,
+        cpuAffinityCores ?? Number.POSITIVE_INFINITY,
+      )
+    : undefined;
+
+  let cpuPct: number | undefined;
+  if (
+    hasCpuLimit &&
+    effectiveCores !== undefined &&
+    effectiveCores > 0 &&
+    facts.cpuUsageUs !== undefined &&
+    previousUsage !== undefined
+  ) {
+    const usageDeltaUs = facts.cpuUsageUs - previousUsage.cpuUsageUs;
+    const wallMs = now - previousUsage.at;
+    // A counter reset (negative delta), a zero/negative wall, or a gap longer than the sampler's
+    // own freshness bound all mean "no honest window": the field is omitted, never faked.
+    if (usageDeltaUs >= 0 && wallMs > 0 && wallMs <= HOST_SAMPLE_STALE_MS) {
+      const coresUsed = usageDeltaUs / 1000 / wallMs;
+      cpuPct = Math.min(100, Math.max(0, Math.round((coresUsed / effectiveCores) * 1000) / 10));
+    }
+  }
+
+  // `memUsedBytes` exists only inside a memory-limit container: nothing reads an unpaired value,
+  // and pairing it with the host total is the scope mix this whole design avoids.
+  const memUsedBytes =
+    memLimitBytes !== undefined && facts.memUsedBytes !== undefined ? facts.memUsedBytes : undefined;
+
+  return {
+    container: {
+      source: facts.source,
+      ...(cpuQuotaCores === undefined ? {} : { cpuQuotaCores }),
+      ...(cpuAffinityCores === undefined ? {} : { cpuAffinityCores }),
+      ...(memLimitBytes === undefined ? {} : { memLimitBytes }),
+      ...(memUsedBytes === undefined ? {} : { memUsedBytes }),
+      ...(cpuPct === undefined ? {} : { cpuPct }),
+    },
+    ...(hostCpuCount > 0 ? { hostCpuCount } : {}),
+  };
 }
 
 export interface HostSampler {
@@ -123,12 +232,20 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
   const cpuTimesSource = options.cpuTimes ?? defaultCpuTimes;
   const platform = options.platform ?? process.platform;
   const readMeminfo = options.readMeminfo ?? readMeminfoFor(platform);
+  const probe =
+    options.cgroupProbe ??
+    createCgroupProbe({
+      ...(options.readCgroupFile === undefined ? {} : { readFile: options.readCgroupFile }),
+      platform,
+    });
+  const hostCores = options.hostCoreCount ?? hostCoreCount;
   const now = options.now ?? Date.now;
 
   let lastSample: HostUsage | undefined;
   let lastSampleAt = 0;
   let previousCpu: HostCpuTimes | undefined;
   let previousCpuAt = 0;
+  let previousCgroupUsage: CgroupUsageSnapshot | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   const listeners = new Set<(usage: HostUsage) => void>();
 
@@ -139,6 +256,16 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
     const swap = parseSwap(readMeminfo());
     // Windows reports `[0, 0, 0]` — absent on the wire, hidden by the card, never a fake row.
     const load = platform === 'win32' ? undefined : loadavg();
+    const facts = probe();
+    const effective = composeHostContainer({
+      facts: facts ?? { source: 'cgroup-v2' },
+      cpuCount: availableParallelism(),
+      hostCpuCount: hostCores(),
+      memTotalBytes,
+      ...(previousCgroupUsage === undefined ? {} : { previousUsage: previousCgroupUsage }),
+      now: at,
+    });
+    if (facts?.cpuUsageUs !== undefined) previousCgroupUsage = { cpuUsageUs: facts.cpuUsageUs, at };
     return {
       sampledAt: new Date(at).toISOString(),
       ...(cpuPct === undefined ? {} : { cpuPct }),
@@ -152,6 +279,8 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
       ...(load === undefined
         ? {}
         : { loadAvg: { one: load[0] ?? 0, five: load[1] ?? 0, fifteen: load[2] ?? 0 } }),
+      ...(effective.container === undefined ? {} : { container: effective.container }),
+      ...(effective.hostCpuCount === undefined ? {} : { hostCpuCount: effective.hostCpuCount }),
     };
   };
 
@@ -219,6 +348,7 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
       lastSampleAt = 0;
       previousCpu = undefined;
       previousCpuAt = 0;
+      previousCgroupUsage = undefined;
     },
   };
 }

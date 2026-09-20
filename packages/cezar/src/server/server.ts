@@ -49,7 +49,7 @@ import {
 } from '@open-mercato/cezar-contract';
 import { dispatchInputSchema, dispatchIntentSchema, dispatchReportSchema } from '@open-mercato/cezar-contract';
 import { detectEnvironment } from '../core/backend-detect.ts';
-import { onHostUsage, sampleHostUsage } from '../core/host-usage.ts';
+import { hostUsageSampler, type HostSampler } from '../core/host-usage.ts';
 import { RUNNER_IDS } from '../core/agent-runner.ts';
 import type { ContentBlock } from '../core/agent-runner.ts';
 import { AGENT_MODELS_LOCKED_ERROR, agentModelsLocked } from '../core/agent-model-policy.ts';
@@ -283,6 +283,10 @@ export interface ServerDeps {
    *  to the HTTP server it binds. Optional so legacy callers/tests change
    *  nothing: no hub, no topics, and the HTTP surface is byte-identical. */
   socketHub?: SocketHub;
+  /** The host-telemetry sampler behind the `host` topic and the `/workspace/host-usage` route.
+   *  Defaults to the process-wide singleton; injectable so tests can drive a frame shape (a
+   *  container object, for instance) that CI machines do not have. */
+  hostSampler?: HostSampler;
   /** Re-arm the workspace automation timer after definition mutations. */
   automationsChanged?: () => void;
 }
@@ -1692,9 +1696,10 @@ export function createApp(deps: ServerDeps) {
   // idle workspace pays nothing — and trusted-only by the DEFAULT options, deliberately: unlike
   // health this is not a discovery payload, so a foreign local page admitted by the loopback
   // fallback must not be able to read which machine it is sitting on.
+  const hostSampler = deps.hostSampler ?? hostUsageSampler;
   deps.socketHub?.registerTopic('host', {
-    snapshot: async () => sampleHostUsage(),
-    start: (publish) => onHostUsage(publish),
+    snapshot: async () => hostSampler.sampleHostUsage(),
+    start: (publish) => hostSampler.onHostUsage(publish),
   });
   /**
    * Warm the whole of cezar's agent knowledge — the three discovered defaults AND every extra
@@ -2964,7 +2969,7 @@ export function createApp(deps: ServerDeps) {
     // WebSocket, so this is its snapshot + reconcile target. Same staleness-ruled sampler read as
     // the topic — never a second compute path — and `cpuPct` is absent until a bounded delta
     // window exists (the card renders `sampling…` and follows up once ~2.5 s later).
-    .get('/workspace/host-usage', async (c) => c.json(sampleHostUsage()))
+    .get('/workspace/host-usage', async (c) => c.json(hostSampler.sampleHostUsage()))
 
     .put('/workspace/config', jsonZodValidator(() => workspaceConfigUpdateSchema), async (c) => {
       const parsed = { data: c.req.valid('json') };
