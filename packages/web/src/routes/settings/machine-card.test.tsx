@@ -223,7 +223,7 @@ describe('MachineCard — local cockpit, desktop', () => {
     await waitFor(() =>
       expect(screen.getByText(/No cgroup information available for this process/)).toBeTruthy(),
     )
-    expect(screen.queryByText(/no cgroup limit detected/)).toBeNull()
+    expect(screen.queryByText(/no cgroup limit/)).toBeNull()
     // The numbers themselves stay the host's, and the row is labelled as host - not as effective.
     expect(screen.queryByText('CPU (effective)')).toBeNull()
   })

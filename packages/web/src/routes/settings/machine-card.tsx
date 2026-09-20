@@ -252,7 +252,7 @@ export function MachineCard() {
           ? 'Effective values come from this process\u2019s own cgroup; host totals are labelled.'
           : view?.cgroupUnknown === true
             ? 'No cgroup information available for this process - host totals only.'
-            : 'Host totals - no cgroup limit detected for this process.'}
+            : 'Host totals - no cgroup limit tighter than the host detected for this process.'}
       </p>
     </section>
   )
