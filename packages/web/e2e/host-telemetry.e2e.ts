@@ -80,15 +80,16 @@ describe('host telemetry across the md breakpoint', () => {
     } | null
 
     expect(info).not.toBeNull()
-    expect(info?.inSidebar).toBe(true)
-    expect(info?.inFooterRow).toBe(true)
+    if (info === null) throw new Error('the sidebar glance is not on the page')
+    expect(info.inSidebar).toBe(true)
+    expect(info.inFooterRow).toBe(true)
     // The boot project's scope prefix is normalised away by the router for its own pages, so the
     // link is asserted by target rather than by spelling, and then exercised for real below.
-    expect(info?.href?.endsWith('/settings/resources')).toBe(true)
-    expect(info?.sidebarWidth).toBe(DEFAULT_SIDEBAR_WIDTH)
+    expect(info.href?.endsWith('/settings/resources')).toBe(true)
+    expect(info.sidebarWidth).toBe(DEFAULT_SIDEBAR_WIDTH)
     // The row never renders a bare unitless value: it is a percentage, `sampling…`, `stale` or `—`.
-    expect(info?.cpu === null ? '' : info.cpu).toMatch(/^(sampling…|stale|—|\d+%)$/)
-    expect(info?.mem === null ? '' : info.mem).toMatch(/(GB|MB|kB)/)
+    expect(info.cpu === null ? '' : info.cpu).toMatch(/^(sampling…|stale|—|\d+%)$/)
+    expect(info.mem === null ? '' : info.mem).toMatch(/(GB|MB|kB)/)
 
     // A sparkline needs two frames, i.e. ~4 s of a held `host` topic: this is the end-to-end
     // proof that the root writer — not the card — is feeding the store on this viewport.
