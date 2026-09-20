@@ -173,6 +173,45 @@ describe('cgroup v2 probe', () => {
     expect(probe()?.cpusetCores).toBe(8);
   });
 
+  it('finds a cpuset pin that lives on an ANCESTOR, where the leaf has no cpuset files at all', () => {
+    // Review minor: the leaf's `cpuset.cpus.effective` folds its ancestors, but a leaf whose cgroup
+    // does not enable the cpuset controller exposes NO such file - and the pin on the ancestor was
+    // then missed entirely, reporting the full host core count for a pinned process.
+    const probe = createCgroupProbe({
+      readFile: fileReader({
+        '/proc/self/cgroup': '0::/system.slice/cezar.service\n',
+        '/proc/self/mountinfo': V2_MOUNTINFO,
+        '/sys/fs/cgroup/cpu.max': 'max 100000\n',
+        '/sys/fs/cgroup/memory.max': 'max\n',
+        '/sys/fs/cgroup/system.slice/cpu.max': 'max 100000\n',
+        '/sys/fs/cgroup/system.slice/memory.max': 'max\n',
+        // The pin sits here, two levels above the leaf.
+        '/sys/fs/cgroup/system.slice/cpuset.cpus.effective': '4,6\n',
+        '/sys/fs/cgroup/system.slice/cezar.service/cpu.max': 'max 100000\n',
+        '/sys/fs/cgroup/system.slice/cezar.service/memory.max': 'max\n',
+      }),
+      platform: 'linux',
+    });
+
+    expect(probe()?.cpusetCores).toBe(2);
+  });
+
+  it('keeps the tightest cpuset when several levels expose one', () => {
+    const probe = createCgroupProbe({
+      readFile: fileReader({
+        '/proc/self/cgroup': '0::/a/b\n',
+        '/proc/self/mountinfo': V2_MOUNTINFO,
+        '/sys/fs/cgroup/a/b/cpu.max': 'max 100000\n',
+        '/sys/fs/cgroup/a/b/memory.max': 'max\n',
+        '/sys/fs/cgroup/a/cpuset.cpus.effective': '0-3\n',
+        '/sys/fs/cgroup/a/b/cpuset.cpus.effective': '0-1\n',
+      }),
+      platform: 'linux',
+    });
+
+    expect(probe()?.cpusetCores).toBe(2);
+  });
+
   it('answers nothing when /proc is unreadable or the platform is not Linux', () => {
     expect(createCgroupProbe({ readFile: () => undefined, platform: 'linux' })()).toBeUndefined();
     expect(createCgroupProbe({ readFile: fileReader({}), platform: 'darwin' })()).toBeUndefined();

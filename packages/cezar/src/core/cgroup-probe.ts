@@ -271,12 +271,29 @@ function probeV2(
   const inactiveFile = parseKeyedCounter(readFile(`${leafDir}/memory.stat`), 'inactive_file');
   const memUsedBytes =
     memCurrent === undefined ? undefined : Math.max(0, memCurrent - (inactiveFile ?? 0));
-  const cpusetCores = countCpuList(
+  // The cpuset walks the SAME chain as the limits (review minor): the leaf's `effective` file
+  // already folds its ancestors, but a leaf whose cgroup has the cpuset controller disabled has
+  // no such file at all, and an ancestor's pin would then be missed entirely - the exact miss the
+  // quota walk exists to prevent. The tightest readable value wins; a wider one never inflates.
+  let cpusetCores = countCpuList(
     readCpusetList(
       readFile(`${leafDir}/cpuset.cpus.effective`),
       readFile(`${leafDir}/cpuset.cpus`),
     ),
   );
+  for (const dir of chain) {
+    if (dir === leafDir) continue;
+    cpusetCores = minFinite(
+      cpusetCores ?? Number.POSITIVE_INFINITY,
+      countCpuList(
+        readCpusetList(
+          readFile(`${dir}/cpuset.cpus.effective`),
+          readFile(`${dir}/cpuset.cpus`),
+        ),
+      ),
+    );
+  }
+  if (!Number.isFinite(cpusetCores)) cpusetCores = undefined;
 
   return {
     source: 'cgroup-v2',
@@ -301,8 +318,12 @@ function probeV1(
   const controllerMount = (controller: string): { mountPoint: string; path: string } | undefined => {
     const row = rows.find((candidate) => candidate.controllers.includes(controller));
     if (!row) return undefined;
-    const mount = mounts.find((candidate) =>
-      candidate.superOptions.split(',').includes(controller),
+    const mount = mounts.find(
+      // A v1 controller mount, not any filesystem whose option list happens to contain the name
+      // (review nit): the resolution now matches its own docstring.
+      (candidate) =>
+        candidate.fileSystem === 'cgroup' &&
+        candidate.superOptions.split(',').includes(controller),
     );
     if (!mount) return undefined;
     return { mountPoint: mount.mountPoint.replace(/\/+$/, '') || '/', path: row.path };
@@ -320,7 +341,13 @@ function probeV1(
   let memLimitBytes: number | undefined;
   if (cpu) {
     for (const dir of ancestorChain(joinCgroupPath(cpu.mountPoint, cpu.path), cpu.mountPoint)) {
-      const periodUs = Number(readFile(`${dir}/cpu.cfs_period_us`)?.trim() ?? '');
+      // An unreadable period must answer `undefined`, not `Number('') === 0`: a readable quota
+      // beside an unreadable period would otherwise yield NO limit at all, the unsafe direction
+      // (the process would report more capacity than it has). `undefined` lets
+      // `parseCpuQuotaCores` fall back to the kernel default of 100000 µs, exactly as the v2
+      // branch does.
+      const rawPeriod = readFile(`${dir}/cpu.cfs_period_us`)?.trim();
+      const periodUs = rawPeriod ? Number(rawPeriod) : undefined;
       const quotaText = readFile(`${dir}/cpu.cfs_quota_us`);
       cpuQuotaCores = minFinite(
         cpuQuotaCores,

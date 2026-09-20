@@ -526,7 +526,11 @@ context (`host 64 CPU · 755 GB`). A usage-only cgroup emits no `container` at
 all, so a normal host reads exactly as it always did. A limit whose value cannot
 be read shows `—`; the host figure is never substituted for it. When one is
 present, cpu/memory labels say `(effective)` and the load chip pairs with the host
-core count.
+core count. One case is deliberately NOT rendered as "no limit": when the probe
+cannot read the process's cgroup at all (a masked `/proc`, no cgroupfs mounted)
+the payload carries `cgroupProbe: 'unavailable'` and the card says **no cgroup
+information available** — the process may well be capped, and host totals are not
+evidence that it is not.
 
 **When the sampler runs.** Below `md` the card's own subscription is the demand
 (sampling lasts while the card is on screen, exactly as before). On a local

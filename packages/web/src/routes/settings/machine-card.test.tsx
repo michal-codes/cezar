@@ -209,6 +209,25 @@ describe('MachineCard — local cockpit, desktop', () => {
     expect(screen.getByText('4 cores')).toBeTruthy()
   })
 
+  it('says the cgroup is unavailable instead of claiming there is no limit (review MAJOR)', async () => {
+    serve(HEALTH)
+    render(<MachineCard />, { wrapper: wrapper() })
+    const socket = await subscribedSocket()
+
+    // The probe could not read /proc or the mount table: the process may well be capped, so the
+    // card must say the information is missing rather than present host totals as "no limit".
+    act(() => {
+      socket.deliver('host', sample({ cgroupProbe: 'unavailable' }))
+    })
+
+    await waitFor(() =>
+      expect(screen.getByText(/No cgroup information available for this process/)).toBeTruthy(),
+    )
+    expect(screen.queryByText(/no cgroup limit detected/)).toBeNull()
+    // The numbers themselves stay the host's, and the row is labelled as host - not as effective.
+    expect(screen.queryByText('CPU (effective)')).toBeNull()
+  })
+
   it('renders the effective numbers under a cgroup limit, with the host totals as context', async () => {
     serve(HEALTH)
     render(<MachineCard />, { wrapper: wrapper() })

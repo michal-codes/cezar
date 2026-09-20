@@ -35,8 +35,13 @@ import {
  *    is mixed: `container.cpuPct` is the cgroup's own delta against effective cores, and a limit
  *    whose value is unreadable is omitted rather than replaced by the host figure.
  *
- * Cost: one `os.cpus()`-equivalent read per sample. Without a subscriber the timer never starts,
- * so an idle workspace pays nothing; the read-through path costs one read per route hit.
+ * Cost, stated accurately (review minor): one `os.cpus()`-equivalent read plus a handful of small
+ * `/proc` and cgroup reads per sample. With no subscriber the timer never starts, so a workspace
+ * with no cockpit open pays nothing; the read-through path costs one read per route hit. But the
+ * main deployment DOES hold a subscription: since the sidebar glance landed, a local desktop
+ * cockpit's root writer (`packages/web/src/api/host-usage.tsx`) holds the `host` topic for the
+ * whole session, so the 2 s timer runs as long as any tab is open there - only below `md` and in
+ * remote mode is sampling demand-scoped to a mounted card.
  */
 
 export const HOST_SAMPLE_INTERVAL_MS = 2_000;
@@ -87,14 +92,22 @@ interface CgroupUsageSnapshot {
  * the host and a limit-without-value all have to behave, and none of them may borrow a host number.
  */
 export function composeHostContainer(input: {
-  facts: CgroupFacts;
+  facts: CgroupFacts | undefined;
   cpuCount: number;
   hostCpuCount: number;
   memTotalBytes: number;
   previousUsage?: CgroupUsageSnapshot;
   now: number;
-}): { container?: HostUsageContainer; hostCpuCount?: number } {
+}): { container?: HostUsageContainer; hostCpuCount?: number; cgroupProbe?: 'unavailable' } {
   const { facts, cpuCount, hostCpuCount, memTotalBytes, previousUsage, now } = input;
+
+  // "The probe could not read anything" and "the probe read everything and found no limit" are two
+  // different facts, and the payload used to collapse them into the same absence (review MAJOR).
+  // A hard-capped process that cannot read its own cgroup therefore rendered as an unconstrained
+  // host at full capacity - the inverse of the rule that an unreadable limit must never borrow a
+  // host number. The discriminator is emitted ONLY for the unreadable case, so a readable
+  // usage-only host still ships the byte-identical v1 payload.
+  if (facts === undefined) return { cgroupProbe: 'unavailable' };
 
   const cpuQuotaCores =
     facts.cpuQuotaCores !== undefined && facts.cpuQuotaCores > 0 ? facts.cpuQuotaCores : undefined;
@@ -113,8 +126,9 @@ export function composeHostContainer(input: {
       : undefined;
   if (!hasCpuLimit && memLimitBytes === undefined) return {};
 
-  // `os.availableParallelism()` already folds a `taskset` mask (and the cgroup quota on recent
-  // libuv), so folding it into the min cannot overstate capacity - it can only lower it.
+  // `os.availableParallelism()` folds a `taskset`-style affinity mask (uv_available_parallelism
+  // reads the affinity mask; it does NOT read cgroup quotas - review nit), so folding it into the
+  // min can only lower capacity, never overstate it.
   const effectiveCores = hasCpuLimit
     ? Math.min(
         cpuCount,
@@ -258,7 +272,7 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
     const load = platform === 'win32' ? undefined : loadavg();
     const facts = probe();
     const effective = composeHostContainer({
-      facts: facts ?? { source: 'cgroup-v2' },
+      facts,
       cpuCount: availableParallelism(),
       hostCpuCount: hostCores(),
       memTotalBytes,
@@ -281,6 +295,7 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
         : { loadAvg: { one: load[0] ?? 0, five: load[1] ?? 0, fifteen: load[2] ?? 0 } }),
       ...(effective.container === undefined ? {} : { container: effective.container }),
       ...(effective.hostCpuCount === undefined ? {} : { hostCpuCount: effective.hostCpuCount }),
+      ...(effective.cgroupProbe === undefined ? {} : { cgroupProbe: effective.cgroupProbe }),
     };
   };
 
@@ -326,13 +341,18 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
     onHostUsage(listener) {
       listeners.add(listener);
       if (listeners.size === 1) {
-        // Prime the baseline on 0→1 so the first tick two seconds later is a real delta; the
-        // snapshot the hub takes right after `start()` therefore answers without `cpuPct`.
+        // Prime BOTH baselines on 0→1 - host CPU times and the cgroup usage read - so the first
+        // tick two seconds later is a real delta on both series. The snapshot the hub takes right
+        // after `start()` therefore answers without `cpuPct` and without `container.cpuPct`, as a
+        // property of the sampler rather than of the hub's call order (review nit: the cgroup
+        // baseline used to be primed only by the snapshot read that happens to follow `start()`).
         const times = cpuTimesSource();
         if (times !== undefined) {
           previousCpu = times;
           previousCpuAt = now();
         }
+        const facts = probe();
+        if (facts?.cpuUsageUs !== undefined) previousCgroupUsage = { cpuUsageUs: facts.cpuUsageUs, at: now() };
         timer = setInterval(() => {
           const sample = takeSample(true);
           for (const current of [...listeners]) current(sample);

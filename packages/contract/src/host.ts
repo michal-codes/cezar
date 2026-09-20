@@ -59,5 +59,14 @@ export const hostUsageSchema = z.object({
   container: hostUsageContainerSchema.optional(),
   /** `os.cpus().length`, emitted only together with `container` and omitted when 0. */
   hostCpuCount: z.number().int().positive().optional(),
+  /**
+   * Why there is no `container`, when the answer is "unknown" rather than "none":
+   * `'unavailable'` means the probe could not read `/proc/self/cgroup` or the mount table at all
+   * (a hardened container, a masked `/proc`), so this process's capacity is NOT known to be the
+   * host's. Absent means the probe read fine and found no finite limit - which is also what every
+   * pre-container payload says, deliberately, so a plain host stays byte-identical to v1.
+   * (`'unconstrained'` is reserved for a future producer that wants to say it explicitly.)
+   */
+  cgroupProbe: z.enum(['unavailable', 'unconstrained']).optional(),
 });
 export type HostUsage = z.infer<typeof hostUsageSchema>;

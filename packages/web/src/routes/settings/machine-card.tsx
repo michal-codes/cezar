@@ -250,7 +250,9 @@ export function MachineCard() {
       >
         {view?.hasContainer === true
           ? 'Effective values come from this process\u2019s own cgroup; host totals are labelled.'
-          : 'Host totals - no cgroup limit detected for this process.'}
+          : view?.cgroupUnknown === true
+            ? 'No cgroup information available for this process - host totals only.'
+            : 'Host totals - no cgroup limit detected for this process.'}
       </p>
     </section>
   )
