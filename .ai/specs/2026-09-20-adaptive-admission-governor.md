@@ -40,14 +40,14 @@ The v2.3 pin (`.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`) is six te
 SUPPLIES one of them and leaves the other five exactly where they already are, which is what makes it
 a small change:
 
-```
-effective = min(adaptive ceiling, DISPATCH_MAX_IN_FLIGHT (4), intent.inFlight,
-                maxParallel, projectMaxParallel, dispatchMaxConcurrent)
-              ^ this spec                 ^ request-time check in run.ts (~1990)
-                                          ^ capacity() in run.ts (~1381)
-                                                              ^ workspace semaphore
-                                                   ^ the user's ceiling - the one we reduce
-```
+| Term in the `min(...)` | Who enforces it | Does this governor touch it? |
+| --- | --- | --- |
+| `adaptive ceiling` | **this spec** - the shared workspace semaphore's admission ceiling | yes, it IS the term |
+| `DISPATCH_MAX_IN_FLIGHT` (4) | the request-time check in `run.ts` (~1990) | no |
+| `intent.inFlight` | the same request-time check (per-parent intent) | no |
+| `maxParallel` | `capacity()` in `run.ts` (~1381) | no |
+| `projectMaxParallel` | `capacity()` (per-project override) | no |
+| `dispatchMaxConcurrent` | the workspace semaphore (#1034) - the user's ceiling | reduced, never raised |
 
 - `configured` is the user's `dispatchMaxConcurrent`; the governor lowers it, never raises it, and
   never touches the other terms.
@@ -105,6 +105,7 @@ narrowest cgroup is what keeps a busy sibling from throttling this workspace, an
 | `elevated → critical` | 2 consecutive `critical` samples, or an `oom_kill` | hold window RESTARTS from the escalation (the machine is worse now) |
 | `critical → elevated → normal` | 6 consecutive calm samples per step | `since` updated per step; at `normal` the hold window clears |
 | any → `normal` at the hold expiry | clock bound reached and the current sample is calm | the reduction lifts immediately, streaks ignored |
+| any → same or lower non-normal level at the hold expiry | clock bound reached while the current sample is STILL `elevated`/`critical` | the level moves straight to what the sample says (no calm streak is waited for) and the hold window RESTARTS - a governor must never force-lift into real pressure. This is the case that would otherwise read as "no-op or frozen"; the implementation's choice is deliberately "re-evaluate and re-arm" (`admission-governor.ts`, the `holdExpired` branch) |
 | any → same level | a calm reading while reduced, or pressure while normal | streak counters advance; nothing observable changes |
 | unreadable | any read failure | level unchanged, no streak advanced (fail-open, no false lift and no false pressure) |
 
