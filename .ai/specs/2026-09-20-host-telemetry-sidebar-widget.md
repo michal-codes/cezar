@@ -6,8 +6,10 @@
 > `461df7d3` + `d3d0e2ca` (widget subscription/store/UI), `366cf417` + `9a043744` (v2.1
 > architecture and OS-level cgroup defects) — every Critical/High/Medium is folded here ·
 > final verification `f450c6b4` residuals F1-F12 folded as v2.3 (quota + cpuset affinity +
-> pressure pin) · Delivery: after #1036 merges, as Phase 1 (server + card) and Phase 2 (widget),
-> one or two PRs.
+> pressure pin) · Delivery: stacked on #1036's head while it is open (the implementation PR body
+> says `Stacked on #1036 (head 0537b32e); merge #1036 first, then rebase/merge main`), as Phase 1
+> (server + card) and Phase 2 (widget), one or two PRs · v2.3 re-review residuals R1-R3 folded
+> (stacked-delivery wording, cpuset example count, ambient-cpuset note).
 
 ## 📝 TLDR
 
@@ -43,7 +45,12 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
   narrow `cpuset.cpus.effective` leave `cpu.max=max` and `memory.max=max`, so a probe that only
   reads quota and memory reports the full host capacity for a sandbox pinned to one or two cores.
   A `taskset`-style per-process mask is invisible in the cpuset files, but
-  `os.availableParallelism()` already folds it into `cpuCount`.
+  `os.availableParallelism()` already folds it into `cpuCount`. The comparison's "host core count"
+  is `/proc/stat`-derived (`os.cpus().length`), so a `/proc`-masked sandbox makes it the AMBIENT
+  count, not the physical one (a live dev host reports 8 of 24 and its leaf cgroup carries no
+  cpuset files): the probe reads the cpuset only at the process's own cgroup, and the ancestor
+  walk deliberately does not extend to cpuset - extending it would report every sandboxed dev
+  host as a limit.
 - **The glance is missing, and v1's card subscription is load-bearing.** The card is visible only
   on Settings → Resources and its per-view subscription is the **only** local transport
   (`useHostUsage()` never fetches in local mode); below `md` it must stay.
@@ -60,7 +67,7 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
      `memory.current`, `memory.stat` (`inactive_file` for cache exclusion), `cpu.stat`
      (`usage_usec`). Also read the cpuset controller's `cpuset.cpus.effective` (fallback
      `cpuset.cpus` when the effective file is absent or empty): a CPU list/ranges (`0-2,4-6,8` =
-     6 cores) whose count is below the host core count is a finite CPU limit even when
+     7 cores) whose count is below the host core count is a finite CPU limit even when
      `cpu.max = max` (the `docker --cpuset-cpus` case); a wider or equal set is not a limit.
    - v1 fallback: resolve per-controller mounts from mountinfo (`cpu,cpuacct`, `memory`,
      `cpuset`), `cpu.cfs_quota_us`/`cfs_period_us` (**quota ≤ 0 / `-1` = unlimited**),
@@ -294,8 +301,10 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
   optional decision, not a requirement.
 - **Compatibility.** Additive contract fields + docs on the existing §2 bullet; no route/topic
   changes; Phase 2 is independently revertible.
-- **Landing.** #1034 → #1036 → this; conflicts in `resources-section.tsx`, `docs/reference.md`,
-  `BACKWARD_COMPATIBILITY.md`; Phase 2 may be a separate PR to shrink the review surface.
+- **Landing.** #1034 → #1036 → this; while #1036 is open the implementation branch is stacked on
+  its head `0537b32e` and the PR body carries that line (step 0); conflicts in
+  `resources-section.tsx`, `docs/reference.md`, `BACKWARD_COMPATIBILITY.md`; Phase 2 may be a
+  separate PR to shrink the review surface.
 
 ## ✅ Resolved assumptions (draft, for lead verification)
 
@@ -338,8 +347,11 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
 
 Every step leaves the app working and is covered by a test.
 
-0. **Rebase on the merged #1036** (and #1034); re-derive the hooks/store/card from the merged
-   head; note the collisions (`resources-section.tsx`, `docs/reference.md`, BC §2).
+0. **Start from #1036's current head** (and #1034 once merged): while #1036 is still open the
+   implementation branch is created from its head `0537b32e` and the PR body says
+   `Stacked on #1036 (head 0537b32e); merge #1036 first, then rebase/merge main`; once #1036 has
+   merged, re-base on the merged head instead. Re-derive the hooks/store/card from that head;
+   note the collisions (`resources-section.tsx`, `docs/reference.md`, BC §2).
 1. Add the `readCgroupFile`/`cgroupProbe` seam and the probe: v2 `/proc/self/cgroup` + mountinfo,
    ancestor-min limits, own usage/stat; v1 per-controller mounts; CPU quota ≤ 0 = unlimited,
    memory `-1`/huge sentinel = unlimited, numeric `0` = degenerate zero limit; plus
