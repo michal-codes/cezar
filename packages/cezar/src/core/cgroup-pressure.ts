@@ -16,9 +16,13 @@ import {
  * `.ai/specs/2026-09-20-adaptive-admission-governor.md`, implementation plan step 1).
  *
  * The display sampler answers "how much capacity do I have"; this answers "how close to the wall am
- * I". Both read the SAME cgroup, and this one is deliberately raw: `memory.current` against
- * `memory.max`, `memory.events` counters, and PSI. It never reads the cache-excluded used value the
- * card renders - F12 pins that the display value is a rendering artifact, not a control signal.
+ * I". Both read the SAME cgroup, and the control path reads it directly rather than consulting the
+ * rendered value: `memory.current` against `memory.max`, `memory.events` counters, and PSI. F12
+ * pins that the display value is a rendering artifact, not a control signal. The one piece of
+ * arithmetic the two share is page cache: the kernel charges it to the cgroup and reclaims
+ * `inactive_file` instead of stalling, so the ratio subtracts it. A container that has simply read
+ * a lot of files is not under pressure, and treating it as such would cut the ceiling for 10
+ * minutes on a calm machine.
  *
  * Rules, all of which exist because a governor that fails closed is worse than none:
  *
@@ -30,6 +34,10 @@ import {
  *    mistake a machine that booted with `oom_kill: 3` for pressure happening now).
  * 3. **Never throws.** Unreadable files answer `undefined`, which the governor reads as "no
  *    pressure".
+ * 4. **The leaf is resolved once.** Resolving it means reading and parsing `/proc/self/mountinfo`,
+ *    and admission runs on the scheduler's hot path, so the answer is memoized per source. An
+ *    unreadable `/proc` is deliberately NOT memoized: a hardened container that becomes readable
+ *    later still starts seeing its cgroup.
  */
 
 export interface PressureSample {
@@ -108,10 +116,14 @@ export function createCgroupPressureSource(options: PressureSourceOptions = {}):
   if (platform !== 'linux') return () => undefined;
 
   let previous: { high?: number; oomKill?: number } | undefined;
+  let resolved: { v2?: string; v1Memory?: string } | undefined;
 
   return () => {
     try {
-      const dirs = resolveLeafDirs(readFile);
+      const dirs = resolved ?? resolveLeafDirs(readFile);
+      if (resolved === undefined && (dirs.v2 !== undefined || dirs.v1Memory !== undefined)) {
+        resolved = dirs;
+      }
       const sample: PressureSample = {};
       let sawAnything = false;
 
@@ -119,7 +131,13 @@ export function createCgroupPressureSource(options: PressureSourceOptions = {}):
         const current = parseCgroupNumber(readFile(`${dirs.v2}/memory.current`));
         const limit = parseMemoryLimitBytes(readFile(`${dirs.v2}/memory.max`));
         if (current !== undefined && limit !== undefined && limit > 0) {
-          sample.memoryUsedRatio = current / limit;
+          // Reclaimable page cache only - `active_file` is not free, and a missing `memory.stat`
+          // falls back to the raw usage rather than to no row at all.
+          const inactiveFile = parseKeyedCounter(
+            readFile(`${dirs.v2}/memory.stat`),
+            'inactive_file',
+          );
+          sample.memoryUsedRatio = Math.max(0, current - (inactiveFile ?? 0)) / limit;
           sawAnything = true;
         }
         const events = readFile(`${dirs.v2}/memory.events`);
@@ -153,7 +171,11 @@ export function createCgroupPressureSource(options: PressureSourceOptions = {}):
         const usage = parseCgroupNumber(readFile(`${dirs.v1Memory}/memory.usage_in_bytes`));
         const limit = parseMemoryLimitBytes(readFile(`${dirs.v1Memory}/memory.limit_in_bytes`));
         if (usage !== undefined && limit !== undefined && limit > 0) {
-          sample.memoryUsedRatio = usage / limit;
+          const inactiveFile = parseKeyedCounter(
+            readFile(`${dirs.v1Memory}/memory.stat`),
+            'total_inactive_file',
+          );
+          sample.memoryUsedRatio = Math.max(0, usage - (inactiveFile ?? 0)) / limit;
           sawAnything = true;
         }
       }

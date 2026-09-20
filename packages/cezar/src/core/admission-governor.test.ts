@@ -216,6 +216,26 @@ describe('createAdmissionGovernor', () => {
     expect(h.governor.since()).toBeUndefined();
   });
 
+  it('steps critical down to the level the machine is still at, never straight to normal', () => {
+    const h = harness();
+    expect(h.step({ oomKillDelta: 1 })).toBe('critical'); // immediate, t=1000
+    for (let lower = 1; lower <= 5; lower += 1) {
+      expect(h.step({ memoryUsedRatio: 0.9 }), `still-elevated sample ${lower}`).toBe('critical');
+    }
+
+    // The sixth merely-lower sample lands on `elevated` - still under pressure, still halved -
+    // rather than restoring the full configured ceiling on a machine that never went calm.
+    expect(h.step({ memoryUsedRatio: 0.9 })).toBe('elevated');
+    expect(h.governor.effectiveCeiling(4)).toBe(2);
+
+    // And the calm exit from there is unchanged: six calm samples restore the ceiling.
+    for (let calm = 1; calm <= 5; calm += 1) {
+      expect(h.step({}), `calm sample ${calm}`).toBe('elevated');
+    }
+    expect(h.step({})).toBe('normal');
+    expect(h.governor.effectiveCeiling(4)).toBe(4);
+  });
+
   it('samples at most once per intervalMs', () => {
     const h = harness({ intervalMs: 1_000 });
     h.source.current = { memoryUsedRatio: 0.9 };

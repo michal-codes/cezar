@@ -178,7 +178,10 @@ export function createAdmissionGovernor(options: AdmissionGovernorOptions): Admi
     }
     upStreak = 0;
     downStreak += 1;
-    if (downStreak >= exitStreak) apply('normal', at);
+    // Step down to where the machine actually is, never past it: `critical` leaving needs six
+    // merely-lower samples to reach `elevated`, not to restore the full ceiling outright. The
+    // bounded-hold exit above already does this.
+    if (downStreak >= exitStreak) apply(target, at);
   };
 
   return {
@@ -201,4 +204,3 @@ export function createAdmissionGovernor(options: AdmissionGovernorOptions): Admi
     },
   };
 }
-
