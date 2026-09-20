@@ -1,8 +1,9 @@
 # Effective host telemetry + the sidebar glance — container-aware v2
 
-> Slug: `host-telemetry-sidebar-widget` · Status: **draft v2.3, for lead verification** · Brief:
+> Slug: `host-telemetry-sidebar-widget` · Status: **draft v2.4, for lead verification** · Brief:
 > `.ai/specs/briefs/2026-09-20-host-telemetry-sidebar-widget.md` · Builds on
-> `.ai/specs/2026-09-20-host-resource-telemetry.md` (PR #1036, OPEN) · Review trail: units
+> `.ai/specs/2026-09-20-host-resource-telemetry.md` (PR #1035, OPEN - the v1 SPEC FILE lands
+> there, not in #1036, which implements it) · Review trail: units
 > `461df7d3` + `d3d0e2ca` (widget subscription/store/UI), `366cf417` + `9a043744` (v2.1
 > architecture and OS-level cgroup defects) — every Critical/High/Medium is folded here ·
 > final verification `f450c6b4` residuals F1-F12 folded as v2.3 (quota + cpuset affinity +
@@ -75,8 +76,11 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
      numeric `0` is a zero limit as above), `memory.usage_in_bytes` + `total_inactive_file`,
      `cpuacct.usage` (**nanoseconds**, see the Sampler), and the cpuset controller's
      `cpuset.effective_cpus` (fallback `cpuset.cpus`).
-   - Non-Linux or unreadable files ⇒ no container object, v1 host payload byte-identical. The
-     probe is injectable (`readCgroupFile`/`cgroupProbe` seam) and never throws.
+   - Non-Linux ⇒ no container object, v1 host payload byte-identical. An unreadable `/proc` is a
+     DIFFERENT fact and must stay distinguishable on the wire: a process that IS capped but cannot
+     read its own cgroup answers `cgroupProbe: 'unavailable'`, so it is never rendered as an
+     unconstrained host at full capacity (the ambiguity #1042's review 5259784047 raised as a
+     major). The probe is injectable (`readCgroupFile`/`cgroupProbe` seam) and never throws.
 2. **`container` only for a finite LIMIT, with `hostCpuCount` gated on it.**
    ```ts
    container: z.object({
@@ -88,9 +92,13 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
      cpuPct: z.number().min(0).max(100).optional(),      // finite CPU limit only
    }).optional(),
    hostCpuCount: z.number().int().positive().optional(), // only with container; omit when 0
+   cgroupProbe: z.enum(['unavailable', 'unconstrained']).optional(), // top level, not inside container
    ```
-   Usage-only (no finite limit) ⇒ no `container` key **and no `hostCpuCount`**: the field exists
-   only for the effective/host context line, so the host-mode payload stays byte-identical to v1.
+   Usage-only (no finite limit, VERIFIED readable) ⇒ no `container` key **and no `hostCpuCount`**:
+   the field exists only for the effective/host context line, so that payload stays byte-identical
+   to v1. `cgroupProbe` is the one additive key an unreadable cgroup does emit, and its absence
+   still means "read fine, no finite limit" - `'unconstrained'` is reserved for a future producer
+   that wants to say so explicitly.
    `memUsedBytes` is emitted only when `memLimitBytes` is (nothing reads an unpaired used value,
    and it is a future scope-mixing hazard). Host fields unchanged; conditional spreading keeps
    `undefined` off the wire.
@@ -125,9 +133,11 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
    listeners anyway).
 5. **Sidebar widget (desktop ≥ md).** An `AppShellProps` slot wired by `AppShellContainer`
    (AppShell stays QueryClient-free): effective CPU % + sparkline + compact RAM, link to
-   Settings → Resources, **conditionally unmounted** below `md` and in remote. Age/`stale` uses a
+   Settings → Resources, **conditionally unmounted** below `md` and in remote. `stale` uses a
    re-armed timeout at `lastFrameAt + 10 s` (`lastFrameAt` = the client receipt stamp kept with
-   the latest sample), cleared on unmount. No counts; load/swap stay host-labelled.
+   the latest sample, a TRANSPORT fact), cleared on unmount; the rendered age derives from the
+   sample's own `sampledAt`, so a cockpit that stopped receiving counts up instead of freezing at
+   `updated 0 s ago`. No counts; load/swap stay host-labelled.
 6. **Adaptive admission — deferred; chain and hard ceiling stated once:**
 
    ```
@@ -217,11 +227,18 @@ sidebar; the wrapper returns null before the hook-bearing widget mounts below `m
 
 ## 📝 Data Model
 
-Server: optional `container` + `hostCpuCount` (above); no persistence. Client: the per-app store
-keeps `latest: HostUsage | undefined`, `lastFrameAt` (the **client receipt timestamp**, stored
-with each sample, never the server `sampledAt`), and
-`history: { sampledAt: string; receivedAt: number; cpuPct: number }[]` (30 points ≈ 60 s,
-deduped, cleared on writer change/gap).
+Server: optional `container` + `hostCpuCount` + `cgroupProbe` (above); no persistence. Client:
+the per-app store keeps `latest: HostUsage | undefined`, `lastFrameAt` (the **client receipt
+stamp**, a transport fact: it is what the re-armed `+10 s` stale timeout and the local `live`
+label are decided from, and it definitely cannot stand in for the sample's age), and
+`history: { sampledAt: string; receivedAt: number; cpuPct: number }[]` (30 points, up to ~60 s at
+the local cadence, deduped by `sampledAt`, cleared on writer change or a gap of more than four
+cadences). Every rendered age - the card's `updated N s ago` and the widget's count-up - derives
+from the sample's own `sampledAt`, never from `lastFrameAt`: a clock-skewed server or a sparse
+remote reconcile must not be able to freeze the readout at a fresh-looking `0 s`, which is the
+major #1035's review (5259788097) found in the predecessor store. The shared ring is
+cadence-agnostic: a point records both stamps, and a consumer that describes the span must read
+the `sampledAt` values rather than assume a fixed spacing (remote reconciles are sparse).
 
 ## 📝 API Contracts
 
@@ -253,7 +270,8 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
   effective CPU % + sparkline + compact RAM bar/text, whole row a link to Settings → Resources.
 - States: `sampling…` before the first CPU point; `stale` after `lastFrameAt + 10 s` (`lastFrameAt`
   is the client receipt stamp stored with the latest sample; re-armed timeout, test at >15 s);
-  `—` for an absent metric; unmounted below `md` and in remote.
+  `—` for an absent metric; unmounted below `md` and in remote. The age shown beside those states
+  is `now - sampledAt`, so it counts up while nothing arrives.
 - Tokens unchanged (`--pending` fill/`text-pending-strong`, danger >85 %); sparkline `role="img"`;
   compact RAM formatting (`14.2/16 GB`).
 
@@ -275,7 +293,9 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
 | Unlimited quota with multi-core usage | No `container.cpuPct`; no >100 % frame; the host `cpuPct` stays the host figure. |
 | Finite memory limit, usage unreadable | `memUsedBytes` omitted; card shows the limit and `—`; no host-used-vs-container-total. |
 | Cache-heavy container | Used is `current − inactive_file` (v2) / `usage − total_inactive_file` (v1); labelled. |
-| Non-Linux / unreadable cgroup files | No container object; v1 host behavior. |
+| Non-Linux | No container object; v1 host behavior. |
+| Capped process whose cgroup is unreadable (hardened container, no `/proc`) | NOT the same as "no limit": `cgroupProbe: 'unavailable'` on the payload, the card says "No cgroup information available for this process - host totals only.", and no host number is ever presented as the process's effective capacity. |
+| Sparse remote reconcile, no frame for minutes | `updated N s ago` counts up from the sample's own `sampledAt`; the readout never freezes at `0 s`, and `stale` still flips from the transport stamp (`lastFrameAt + 10 s`). |
 | Local window < md | Root writer off (`useIsDesktop()` false); the card's v1 view-scoped hook with `enabled: !useIsDesktop()` is the writer; widget unmounted. |
 | Remote mode | No WS; widget unmounted; route snapshots fold into the store via `useHostUsageRoute()`. |
 | StrictMode remount | Frames `subscribe, unsubscribe, subscribe` expected; one socket, one live listener. |
@@ -301,7 +321,8 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
   optional decision, not a requirement.
 - **Compatibility.** Additive contract fields + docs on the existing §2 bullet; no route/topic
   changes; Phase 2 is independently revertible.
-- **Landing.** #1034 → #1036 → this; while #1036 is open the implementation branch is stacked on
+- **Landing.** The spec files first (#1033, #1035 - the latter carries the v1 file this doc builds
+  on), then #1034 → #1036 → this; while #1036 is open the implementation branch is stacked on
   its head `0537b32e` and the PR body carries that line (step 0); conflicts in
   `resources-section.tsx`, `docs/reference.md`, `BACKWARD_COMPATIBILITY.md`; Phase 2 may be a
   separate PR to shrink the review surface.
@@ -316,8 +337,8 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
 | A4 | CPU % | Container delta with any finite CPU limit (quota or cpuset), denominator `effectiveCores`, clamped; else `—`. | Prevents >100 % frames, a quota-vs-host denominator error and host-relative % beside effective cores (F3/F4/F11). |
 | A5 | Memory | Cache-excluded when derivable, else `—`; `memUsedBytes` only with `memLimitBytes`; host only without a limit. | Keeps the bar honest under page cache and keeps the payload free of unpaired values (F6). |
 | A6 | Client transport | Per-app store; root writer local && desktop; card `<md` fallback gated `enabled: !useIsDesktop()`; remote folds through `useHostUsageRoute()`. | Reviews' C1/H2; one active writer, enforced rather than assumed (F5/F10). |
-| A7 | Widget | Desktop-only slot, conditional unmount, CPU + sparkline + RAM, no counts, stale timeout from the client receipt stamp. | Fits 236 px; no hidden fetches; the staleness clock is defined (F7). |
-| A8 | Contract/docs | Additive `container` + `hostCpuCount` (the latter only together with `container`) on the existing §2 host-usage bullet, with the four stale limits-not-subtracted sentences rewritten in the same commit. | bc-route-inventory stays valid; §3 is state files; host-mode payloads stay byte-identical (F2/F9). |
+| A7 | Widget | Desktop-only slot, conditional unmount, CPU + sparkline + RAM, no counts, `stale` timeout from the client receipt stamp while the rendered AGE comes from the sample's own `sampledAt`. | Fits 236 px; no hidden fetches; the staleness clock and the age source are both named (F7), so a stopped feed counts up rather than freezing. |
+| A8 | Contract/docs | Additive `container` + `hostCpuCount` (the latter only together with `container`) plus the top-level `cgroupProbe` discriminator on the existing §2 host-usage bullet, with the four stale limits-not-subtracted sentences rewritten in the same commit. | bc-route-inventory stays valid; §3 is state files; a verified-unconstrained host stays byte-identical to v1 while an UNREADABLE cgroup stays distinguishable from it (F2/F9). |
 | A9 | Adaptive | Chain + hard-ceiling `min(...)` once; static cap never removed; stale = no reduction; no preemption defined; pressure taken from raw `memory.current`/`memory.max`, `memory.events` and PSI (F12). | The owner's safety model; display values and control signals are separate quantities. |
 | A10 | Delivery | Phase 1 server+card, Phase 2 widget; one spec, possibly two PRs, after #1036. | Scope cohesion; smaller review surface. |
 
@@ -328,10 +349,17 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
   workspace-wide state in the shared semaphore are that spec's decisions; it consumes this v2's
   effective values and the pinned `min(...)`.
 - **Adaptive pressure signal (F12 pin)** - the adaptive spec must **not** use the cache-excluded
-  display value as its memory-pressure signal. It reads `memory.current` / `memory.max` raw, plus
-  `memory.events` (`oom`, `oom_kill`, `high`) and PSI (`memory.pressure`, `cpu.pressure`), and
-  keeps `memory.high` (throttle) distinct from `memory.max` (hard limit): the display value and
-  the control signal are different quantities.
+  value the card RENDERS as its memory-pressure signal. It reads the cgroup files directly
+  (`memory.current` / `memory.max`, `memory.events` (`oom`, `oom_kill`, `high`) and PSI
+  (`memory.pressure`, `cpu.pressure`)) and keeps `memory.high` (throttle) distinct from
+  `memory.max` (hard limit): the display value and the control signal are different quantities.
+  Reading the files directly does not mean ignoring the kernel's reclaim model: the ratio
+  subtracts reclaimable page cache (`inactive_file` / `total_inactive_file`), because a container
+  that has merely read a lot of files sits at 95-99 % of `memory.max` with no pressure at all and
+  would otherwise be reduced for up to the max-hold window (#1044's review, M1).
+- **Swap field pairing** - `swapTotalBytes?`/`swapUsedBytes?` stay independently optional on v1's
+  wire shape in this pass (a nested optional like `loadAvg`'s is the safer shape, and #1035's
+  review asks for it there); tightening it here would change a v1 payload this spec does not own.
 - K8s annotations beyond cgroup files, disk/network/per-core, mobile/remote widget parity,
   historical charts.
 
@@ -398,7 +426,8 @@ Every step leaves the app working and is covered by a test.
 
 ## 📚 Evidence
 
-- v1: `.ai/specs/2026-09-20-host-resource-telemetry.md`, PR #1036 (head `0537b32e`).
+- v1 spec: `.ai/specs/2026-09-20-host-resource-telemetry.md`, PR #1035 (head `fded0afc`); its
+  implementation is PR #1036 (head `0537b32e`).
 - Reviews: `461df7d3` (card fallback, justification, clock, store, footer/width), `d3d0e2ca`
   (same mechanics + store/clock/footer slot/harness), `366cf417` (limit-vs-usage, cpuPct
   denominator, transport, BC §2, min-chain/hostCpuCount, mount semantics), `9a043744`
