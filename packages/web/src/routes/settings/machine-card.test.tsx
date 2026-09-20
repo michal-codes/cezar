@@ -357,19 +357,22 @@ describe('MachineCard — local cockpit, desktop', () => {
     expect(screen.queryByText(/Dispatch admission/)).toBeNull()
   })
 
-  it('hides the line for a snapshot with no ceiling pair to print', async () => {
+  it('drops a snapshot whose ceiling pair is incomplete instead of rendering half a line', async () => {
     serve(HEALTH)
     render(<MachineCard />, { wrapper: wrapper() })
     const socket = await subscribedSocket()
 
+    // `configured` and `effective` ship together inside the `admission` object, or the key is
+    // absent. A producer that sends half of the pair is rejected at the store boundary (the one
+    // place untrusted frames enter), so the card keeps `sampling…` rather than printing
+    // `Dispatch admission: normal ·  of `.
     act(() => {
-      socket.deliver(
-        'host',
-        sample({ cpuPct: 27, sampledAt: '2026-09-20T00:00:02.000Z', admission: { state: 'normal' } }),
-      )
+      socket.deliver('host', {
+        ...sample({ cpuPct: 27, sampledAt: '2026-09-20T00:00:02.000Z' }),
+        admission: { state: 'normal' },
+      })
     })
-    await waitFor(() => expect(screen.getByText('27%')).toBeTruthy())
-    // Never `Dispatch admission: normal ·  of ` - a row without its numbers is not rendered.
+    await waitFor(() => expect(screen.getByText('sampling…')).toBeTruthy())
     expect(document.querySelector('[data-slot="machine-card-admission"]')).toBeNull()
   })
 })

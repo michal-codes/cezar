@@ -174,6 +174,14 @@ export interface WorkspaceSemaphoreOptions {
    * cgroup; production reads the process's own cgroup through the default below.
    */
   governor?: AdmissionGovernor;
+  /**
+   * Whether this instance registers as the telemetry readout's admission provider. Defaults to
+   * true for the shared workspace semaphore; a per-manager FALLBACK (`RunManager` constructed
+   * without an injected semaphore) passes false. The registration slot is last-writer-wins, so a
+   * fallback with no ceiling configured would otherwise blank the readout of the real semaphore
+   * that is actively reducing the ceiling (review minor M4).
+   */
+  registersAdmissionStatus?: boolean;
 }
 
 export class WorkspaceSemaphore {
@@ -191,10 +199,12 @@ export class WorkspaceSemaphore {
     this.load = options.load ?? loadResourceLimits;
     this.limits = { ...DEFAULT_LIMITS, ...options.initial };
     this.governor = options.governor ?? createAdmissionGovernor({ sample: createCgroupPressureSource() });
-    // The telemetry side reads the governor's snapshot from HERE (spec A7): the semaphore owns the
-    // governor and registers the one provider, the sampler only reports. The arrow never points
-    // back - a display-side value must not be able to decide admission.
-    setAdmissionStatusProvider(() => this.admissionStatus());
+    if (options.registersAdmissionStatus !== false) {
+      // The telemetry side reads the governor's snapshot from HERE (spec A7): the semaphore owns
+      // the governor and registers the one provider, the sampler only reports. The arrow never
+      // points back - a display-side value must not be able to decide admission.
+      setAdmissionStatusProvider(() => this.admissionStatus());
+    }
   }
 
   /** Join the shared counter. Returns the unregister handle — the manager's
