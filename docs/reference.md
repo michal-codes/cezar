@@ -49,10 +49,12 @@ Five moves that make the cockpit worth the browser tab:
   dispatched tasks started at once** (`dispatchMaxConcurrent`, default *no limit*) admits a
   dispatched child **from the queue** only while fewer than N dispatch children
   hold a slot workspace-wide. It is an admission ceiling rather than a running
-  one: a parked child returning to work (a child report, the monitoring wake, an
-  auto-resume) is never re-gated — the same #347 exemption `maxParallel` carries —
-  so the running count may transiently exceed N. Ordinary tasks keep their normal
-  share of `maxParallel` and a capped child simply waits in the queue, and lowering
+  one: a parked child woken back into its own session (a delivered child report,
+  the monitoring wake) is never re-gated — the same #347 exemption `maxParallel`
+  carries — so the running count may transiently exceed N. An auto-resume after a
+  usage limit is the exception: it goes through the ordinary queued-continuation
+  path, so it obeys the cap like any other queued work. Ordinary tasks keep their
+  normal share of `maxParallel` and a capped child simply waits in the queue, and lowering
   the value never stops a child that is already running.
 - 🧠 **Memory-aware runs.** Each run's whole process tree is sampled (~2 s) for CPU
   and RSS, and its **peak memory** is recorded and shown in the task table. Set an

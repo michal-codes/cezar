@@ -122,9 +122,12 @@ const resourcesSchema = z
     /**
      * ADMISSION ceiling on dispatch children (`dispatch.parentRunId` present), workspace-wide like
      * `maxParallel` (spec 2026-09-20-dispatch-admission-scheduler): at most this many are STARTED
-     * from the queue at a time. A parked child returning to work (a child report, the monitoring
-     * wake, an auto-resume) is never re-gated — the #347 exemption `maxParallel` carries — so the
-     * instantaneous running count may exceed it. `null` and `0` both mean "no cap" — the shipped
+     * from the queue at a time. A parked child woken back into its own session — a delivered child
+     * report, the monitoring wake — is never re-gated: it re-enters the counted set with no cap
+     * check (the #347 exemption `maxParallel` carries), so the instantaneous running count may
+     * exceed it. An auto-resume after a usage limit is NOT in that list: `fireAutoResume` hands it
+     * to the ordinary queued-continuation path, so it obeys the cap like any other queued work.
+     * `null` and `0` both mean "no cap" — the shipped
      * default, i.e. today's behavior byte-for-byte. Ordinary tasks are unaffected: the predicate
      * lives per queued run, not in the shared capacity check, so a capped child waits in the queue
      * while ordinary work keeps starting. Lowering it below the running count never preempts
