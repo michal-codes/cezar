@@ -7,7 +7,10 @@
 > (doctrine/UX) and `3baaa393` (technical), both verdict *changes*, folded into v2; the
 > specification review of PR #1035 (one major — route freshness/remote CPU — plus four smaller
 > items) is folded into this v2.1, and the follow-up review (three majors: swap-field pairing,
-> receipt-time freshness, sparse-remote cadence — plus the first-frame delta rule) into v2.2 ·
+> receipt-time freshness, sparse-remote cadence — plus the first-frame delta rule) into v2.2.
+> This pass aligns the remaining v1 wording with what implementation #1036 actually ships: a
+> local-only sparkline, an age line that ticks once a second from `sampledAt`, a swap row that
+> HIDES when either half of the pair is missing, and an aria-label stated as an `up to` bound ·
 > Delivery: this document ships design-only; one implementation PR follows separately
 > (`Refs` this spec PR). **Sequencing:** the implementation lands after #1034
 > (dispatch admission cap) — both touch `resources-section.tsx` and the docs inventory — and
@@ -147,8 +150,10 @@ fetches the route on mount, with the existing `reconcile()` seam
 a remote answer arrives without `cpuPct`, the card schedules **one** warm-up fetch ~2.5 s later
 (`setTimeout`, cleared on unmount — not an interval, and never more than one pending); the same
 rule applies after each reconcile-triggered fetch. The 30-sample history is component state in
-the card (not a module-level global), appended on each frame/query update, so it restarts when
-the card unmounts — an explicit v1 trade-off. No other component touches the socket.
+the card (not a module-level global), appended on each LOCAL frame only — a remote ring would
+plot sparse route answers on a 2 s-scaled line, so remote draws the bar and no chart — and it
+restarts when the card unmounts, an explicit v1 trade-off. The age line reads `sampledAt` and a
+1 s interval keeps it counting while the card is mounted. No other component touches the socket.
 
 ## 📝 Data Model
 
@@ -213,14 +218,17 @@ workspace-only list, and the `BACKWARD_COMPATIBILITY.md` §2 inventory. `typed-b
   visibility/reconnect reconcile keep them current; while visible nothing polls on an interval.
   When a route answer carries no `cpuPct` (no fresh baseline), the CPU area stays in `sampling…`
   and the card fires its single warm-up fetch ~2.5 s later, so the reading that follows is a real
-  ~2 s delta — an aged sample is never rendered as current, and the freshness label recomputes on
-  frames and query results only (no extra ticking timer). Between those sparse results the label
-  counts up from `sampledAt`, so a remote card left open reads `updated 4 min ago`, never `0 s`.
+  ~2 s delta — an aged sample is never rendered as current, and the freshness label is the age of
+  the sample's own `sampledAt`, ticking once a second while the card is mounted, so a remote card
+  left open reads `updated 4 min ago`, never a frozen `0 s` (review 5259788097, major 2).
 - Sparkline history is component state: the 60 s line starts over on each visit to this screen
-  (an explicit v1 trade-off, noted rather than accidental).
+  (an explicit v1 trade-off, noted rather than accidental), and it is **local-only** — a remote
+  cockpit's answers are sparse (mount, reconnect, visibility), so it shows the instantaneous bar
+  with no chart rather than plotting minutes on a line scaled to the 2 s cadence.
 - Caveat line (small, muted): "Host totals — container/cgroup limits are not subtracted."
-- Accessibility: sparkline is `role="img"` with an aria-label that states the span from the stored
-  timestamps, never an assumed 2 s spacing; numeric values are text next to it;
+- Accessibility: sparkline is `role="img"` with an aria-label that states the span as `up to` the
+  count of stored points ("CPU over the last up to N seconds") — an honest bound because the
+  chart is local-only and its points are one per ~2 s tick; numeric values are text next to it;
   no `aria-live` chatter.
 
 **No sidebar widget in v1.** The deferred widget is described in "Deferred" below; the card is
@@ -236,7 +244,7 @@ Settings → Resources screen on `origin/main` `4763447f`).
 | Scenario | Behavior |
 |----------|----------|
 | Nobody viewing the card | No subscription → no timer, no frames, zero cost. |
-| First subscribe frame | `start()` primes the baseline, `snapshot()` returns memory/load with `cpuPct` absent; the first CPU point lands after one ~2 s tick. Pinned twice: the delta is emitted only when its window is >= half the cadence (`HOST_SAMPLE_MIN_DELTA_MS`), so a baseline primed by the same subscribe can never produce a reading, and the core test drives the hub's real `start()`-then-`snapshot()` order rather than `snapshot()` alone (review BLOCKER on the frame that used to read 50-100 %). |
+| First subscribe frame | `start()` primes the baseline, `snapshot()` returns memory/load with `cpuPct` absent; the first CPU point lands after one ~2 s tick. Pinned twice: the delta is emitted only when its window is >= half the cadence (`HOST_SAMPLE_INTERVAL_MS / 2`), so a baseline primed by the same subscribe can never produce a reading, and the core test drives the hub's real `start()`-then-`snapshot()` order rather than `snapshot()` alone (review BLOCKER on the frame that used to read 50-100 %). |
 | Route hit with no fresh baseline (remote, no local viewer) | Memory/load come back; `cpuPct` is absent (never computed from an unbounded window) and the card's single warm-up fetch lands a genuine ~2 s delta ~2.5 s later. |
 | Route hit after a long gap (stale cache) | The aged sample is **not** replayed as current: the staleness rule returns memory/load only, and the warm-up fetch re-primes then measures. |
 | Staleness suppresses the first topic frame | The client keeps its pre-frame `sampling…` state; the first 2 s tick publishes the next sample; no error frame, no error state. |
@@ -248,7 +256,7 @@ Settings → Resources screen on `origin/main` `4763447f`).
 | Remote mode | No WebSocket; route snapshot + reconcile; `last known` label. |
 | Server restart | No persistence; the next subscription gets a fresh sample after one tick. |
 | Clock skew | The displayed age is `now - sampledAt` (server clock) while `live`/`stale` comes from the client receipt stamp. A skewed server therefore shows a skewed age - visibly wrong rather than silently frozen at `0 s`, which is the trade this spec chose (review 5259788097, major 2). |
-| Swap fields arriving unpaired (foreign producer, hand-edited payload) | A consumer must render `—` for the missing half and never `Swap / 8.0 GB`: the pair is read together. The sampler always emits both or neither; the schema cannot express the pairing (review, major 1). |
+| Swap fields arriving unpaired (foreign producer, hand-edited payload) | A consumer treats the pair as ONE row: the shipped card hides the swap row entirely when either half is missing, and a one-key payload must never print `Swap  / 8.0 GB`. The sampler always emits both or neither; the schema cannot express the pairing (review, major 1). |
 | Remote ring spanning minutes | Points are stamped with `sampledAt`; the label reports the stored span. "Last 60 s" is a LOCAL claim only - remote reconciles are sparse, so a time-based label is wrong there (review, major 3). |
 | Unsubscribe leak | The card's effect returns the unsubscribe; a test pins topic stop on unmount. |
 
