@@ -15,7 +15,7 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 |-------|------|-------|------|--------|--------|
 | 1 | 1.1 | Contract: `hostUsageSchema` + export, serialization test | inline | done | — |
 | 1 | 1.2 | `core/host-usage.ts`: read-through sampler with the staleness rule | inline | done | — |
-| 1 | 1.3 | Sampler unit tests (baseline, delta, staleness, start/stop, swap/load) | inline | todo | — |
+| 1 | 1.3 | Sampler unit tests (baseline, delta, staleness, start/stop, swap/load) | inline | done | — |
 | 1 | 1.4 | `GET /workspace/host-usage` route + parity/BC inventory entries | inline | todo | — |
 | 1 | 1.5 | `host` WS topic + hub tests | inline | todo | — |
 | 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | todo | — |
