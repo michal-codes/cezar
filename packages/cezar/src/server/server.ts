@@ -1687,6 +1687,15 @@ export function createApp(deps: ServerDeps) {
   // fills while the browser is still downloading the bundle, so its first
   // `GET /api/health` reads a warm value instead of the cold ~1 s compute.
   if (deps.socketHub) void refreshHealth();
+  // The Machine card's live channel (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`):
+  // demand-driven like every topic — the sampler's timer starts on 0→1 and stops on 1→0, so an
+  // idle workspace pays nothing — and trusted-only by the DEFAULT options, deliberately: unlike
+  // health this is not a discovery payload, so a foreign local page admitted by the loopback
+  // fallback must not be able to read which machine it is sitting on.
+  deps.socketHub?.registerTopic('host', {
+    snapshot: async () => sampleHostUsage(),
+    start: (publish) => onHostUsage(publish),
+  });
   /**
    * Warm the whole of cezar's agent knowledge — the three discovered defaults AND every extra
    * account — so no reader ever pays the first shell-out.
