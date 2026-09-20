@@ -389,6 +389,36 @@ describe('createHostUsageStore', () => {
     expect(store.get().latest).toBeUndefined()
     expect(store.get().lastFrameAt).toBeUndefined()
   })
+
+  it('rings the EFFECTIVE percentage, so the line under a number is the same quantity', () => {
+    const store = createHostUsageStore()
+    // A sandboxed sample: 31 % host-wide, 50 % of the two effective cores.
+    store.push(
+      sample({
+        cpuPct: 31,
+        sampledAt: '2026-09-20T00:00:00.000Z',
+        container: { source: 'cgroup-v2', cpuQuotaCores: 2, cpuPct: 50 },
+        hostCpuCount: 8,
+      }),
+      1_000,
+      'root',
+    )
+    expect(store.get().history.map((entry) => entry.cpuPct)).toEqual([50])
+
+    // A CPU limit whose own percentage is unreadable contributes no point at all: the surface
+    // renders `—`, and a line of host utilization would be the scope mix this rule exists to stop.
+    store.push(
+      sample({
+        cpuPct: 31,
+        sampledAt: '2026-09-20T00:00:02.000Z',
+        container: { source: 'cgroup-v2', cpuQuotaCores: 2 },
+        hostCpuCount: 8,
+      }),
+      3_000,
+      'root',
+    )
+    expect(store.get().history.map((entry) => entry.cpuPct)).toEqual([50])
+  })
 })
 
 describe('readWorkspaceHostUsage', () => {
