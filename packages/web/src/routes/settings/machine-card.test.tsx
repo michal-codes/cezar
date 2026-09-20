@@ -10,10 +10,10 @@ import { MachineCard } from './machine-card'
 
 /**
  * The Machine card (spec `.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`, §UI/UX): what it
- * renders in each state, and the states that must never lie — before the first CPU delta
+ * renders in each state, and the states that must never lie - before the first CPU delta
  * (`sampling…`, never a fake 0 %), on a host whose OS exposes no swap/load (rows hidden, never
  * zeroed), and under a cgroup limit (the effective number, or `—` when the limit's own value is
- * missing — never the host figure in its place).
+ * missing - never the host figure in its place).
  */
 
 const HEALTH = {

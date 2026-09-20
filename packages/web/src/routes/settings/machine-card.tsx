@@ -13,13 +13,13 @@ import { useIsDesktop } from '@/lib/use-desktop'
 import { cn } from '@/lib/utils'
 
 /**
- * The Machine card — live host totals, and the effective capacity of THIS process's cgroup when it
+ * The Machine card - live host totals, and the effective capacity of THIS process's cgroup when it
  * has one (spec `.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`).
  *
  * Its writers are viewport-scoped on purpose: below `md` this card is the only local reader, so its
  * own subscription (gated `enabled: !useIsDesktop()`) is the server sampler's 0→1 / 1→0, exactly as
  * in v1; on desktop the root subscription owns the topic for the session and the widget reads the
- * same store. A remote cockpit never opens a socket — `useHostUsageRoute()` reads
+ * same store. A remote cockpit never opens a socket - `useHostUsageRoute()` reads
  * `GET /api/v1/workspace/host-usage` and folds each answer (with its one warm-up read) into the
  * store, and the header says `last known`.
  *

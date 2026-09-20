@@ -509,7 +509,7 @@ first time cezar boots there, and ignored afterwards.
 the same numbers as a one-row **glance** (CPU, its 60 s sparkline, compact RAM)
 that links here. Samples arrive every ~2 s: a local cockpit gets them pushed over
 the `host` WebSocket topic, a remote one reads `GET /api/v1/workspace/host-usage`
-on mount, on a reconnect and when the tab becomes visible again — and follows a
+on mount, on a reconnect and when the tab becomes visible again - and follows a
 first answer that carries no CPU figure with exactly **one** warm-up read ~2.5 s
 later. That gap is honest, not a bug: CPU utilization is a delta between two
 samples, so the first read after an idle period has no window to measure and the
@@ -518,8 +518,8 @@ does not expose (swap outside Linux, load on Windows) is omitted rather than
 printed as a zero.
 
 **Which numbers are effective.** The plain process reads **host totals**. When
-cezar runs inside a cgroup with a real limit — a Docker `--cpus`/`--cpuset-cpus`,
-a systemd scope, a sandbox — the same payload carries an optional `container`
+cezar runs inside a cgroup with a real limit - a Docker `--cpus`/`--cpuset-cpus`,
+a systemd scope, a sandbox - the same payload carries an optional `container`
 object with the process's OWN cgroup limits and usage, and the card and the
 glance show those as the effective values, labelled, with the host totals kept as
 context (`host 64 CPU · 755 GB`). A usage-only cgroup emits no `container` at
