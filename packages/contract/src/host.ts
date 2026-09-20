@@ -54,7 +54,8 @@ export const hostUsageAdmissionSchema = z.object({
   state: z.enum(['normal', 'elevated', 'critical']),
   /** The user's ceiling; absent alongside `effective` when no ceiling is set. */
   configured: z.number().int().positive().optional(),
-  /** What the admission gate enforces right now (`configured` or lower). */
+  /** What the admission gate was enforcing when this sample was taken (`configured` or lower).
+   *  A cached route read can lag the live gate by up to the sampler's freshness window. */
   effective: z.number().int().positive().optional(),
   /** ISO-8601 instant the current state began; absent while `normal`. */
   since: z.string().optional(),

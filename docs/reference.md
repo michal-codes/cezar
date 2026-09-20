@@ -523,7 +523,8 @@ readout shows `sampling…` instead of a number it cannot back. A metric the OS
 does not expose (swap outside Linux, load on Windows) is omitted rather than
 printed as a zero. While a dispatch ceiling is configured (**Max running
 dispatched tasks**), that same payload also reports the dispatch admission state
-and the ceiling the gate enforces right now, which the card prints as
+and the ceiling the gate was enforcing when the sample was taken (a cached route read can be up to
+the sampler's freshness window behind), which the card prints as
 `Dispatch admission: elevated · 2 of 4`.
 
 **Which numbers are effective.** The plain process reads **host totals**. When

@@ -17,7 +17,8 @@ export interface AdmissionStatus {
   state: AdmissionLevel;
   /** The user's ceiling. */
   configured: number;
-  /** What the admission gate enforces right now (`configured` or lower). */
+  /** What the admission gate was enforcing when this sample was taken (`configured` or lower);
+   *  a cached route read can lag the live gate by up to the sampler's freshness window. */
   effective: number;
   /** ISO-8601 instant the current state began (absent while `normal`). */
   since?: string;
