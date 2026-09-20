@@ -505,25 +505,35 @@ root — live once in `~/.cezar/config.json`, alongside the
 in a repo's `.ai/cezar/config.json` is imported into the workspace file the
 first time cezar boots there, and ignored afterwards.
 
-**Settings → Resources** opens on a live **Machine** card: host CPU (value, bar
-and a 60 s sparkline), memory, swap and load, sampled every ~2 s **while a local
-cockpit holds the `host` topic** — which is exactly while this card is on screen,
-because the card's own subscription is what holds it. A local cockpit gets the
-samples pushed over that topic; a remote one never opens a socket and reads
-`GET /api/v1/workspace/host-usage` on mount,
-on a reconnect and when the tab becomes visible again — and follows a first
-answer that carries no CPU figure with exactly **one** warm-up read ~2.5 s later.
-That gap is honest, not a bug: CPU utilization is a delta between two samples, so
-the first read after an idle period has no window to measure and the card shows
-`sampling…` instead of a number it cannot back. The 60 s sparkline is local-only:
-a remote cockpit's updates are sparse, so it shows the instantaneous bar without a
-chart rather than plotting minutes as if they were seconds. `updated N s ago` is the
-age of the sample's own server timestamp and ticks every second while the card is
-mounted, so a cockpit that has stopped receiving data says so instead of freezing at
-a fresh-looking value. The values are **host totals** —
-container and cgroup limits are not subtracted — and a metric the OS does not
-expose (swap outside Linux, load on Windows) is omitted rather than printed as a
-zero.
+**Settings → Resources** opens on a live **Machine** card, and the sidebar carries
+the same numbers as a one-row **glance** (CPU, its 60 s sparkline, compact RAM)
+that links here. Samples arrive every ~2 s: a local cockpit gets them pushed over
+the `host` WebSocket topic, a remote one reads `GET /api/v1/workspace/host-usage`
+on mount, on a reconnect and when the tab becomes visible again — and follows a
+first answer that carries no CPU figure with exactly **one** warm-up read ~2.5 s
+later. That gap is honest, not a bug: CPU utilization is a delta between two
+samples, so the first read after an idle period has no window to measure and the
+readout shows `sampling…` instead of a number it cannot back. A metric the OS
+does not expose (swap outside Linux, load on Windows) is omitted rather than
+printed as a zero.
+
+**Which numbers are effective.** The plain process reads **host totals**. When
+cezar runs inside a cgroup with a real limit — a Docker `--cpus`/`--cpuset-cpus`,
+a systemd scope, a sandbox — the same payload carries an optional `container`
+object with the process's OWN cgroup limits and usage, and the card and the
+glance show those as the effective values, labelled, with the host totals kept as
+context (`host 64 CPU · 755 GB`). A usage-only cgroup emits no `container` at
+all, so a normal host reads exactly as it always did. A limit whose value cannot
+be read shows `—`; the host figure is never substituted for it. When one is
+present, cpu/memory labels say `(effective)` and the load chip pairs with the host
+core count.
+
+**When the sampler runs.** Below `md` the card's own subscription is the demand
+(sampling lasts while the card is on screen, exactly as before). On a local
+desktop the topic is held for the session, because the sidebar glance is always
+there; the sidebar's machine row carries the staleness clock (`stale` after ~10 s
+without a frame). A remote cockpit never opens a socket and keeps reading the
+route.
 
 ### Editing the agents' own config (Settings → Agent config)
 
