@@ -46,7 +46,7 @@ Five moves that make the cockpit worth the browser tab:
   everything still `queued` is re-enqueued in order. It's the orchestration layer
   that turns "one agent at a time" into a backlog that drains itself. Tasks that
   dispatch other tasks can be bounded separately: **Settings → Resources → Max
-  running dispatched tasks** (`dispatchMaxConcurrent`, default *no limit*) admits a
+  dispatched tasks started at once** (`dispatchMaxConcurrent`, default *no limit*) admits a
   dispatched child **from the queue** only while fewer than N dispatch children
   hold a slot workspace-wide. It is an admission ceiling rather than a running
   one: a parked child returning to work (a child report, the monitoring wake, an

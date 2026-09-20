@@ -120,12 +120,15 @@ const resourcesSchema = z
      *  literal `"memoryLimitMb": null` in the spec's Data Model). */
     memoryLimitMb: z.number().int().min(0).max(1_048_576).nullable().default(null).catch(null),
     /**
-     * Ceiling on concurrently RUNNING dispatch children (`dispatch.parentRunId` present),
-     * workspace-wide like `maxParallel` (spec 2026-09-20-dispatch-admission-scheduler). `null`
-     * and `0` both mean "no cap" — the shipped default, i.e. today's behavior byte-for-byte.
-     * Ordinary tasks are unaffected: the predicate lives per queued run, not in the shared
-     * capacity check, so a capped child waits in the queue while ordinary work keeps starting.
-     * Lowering it below the running count never preempts anything — it gates new admissions.
+     * ADMISSION ceiling on dispatch children (`dispatch.parentRunId` present), workspace-wide like
+     * `maxParallel` (spec 2026-09-20-dispatch-admission-scheduler): at most this many are STARTED
+     * from the queue at a time. A parked child returning to work (a child report, the monitoring
+     * wake, an auto-resume) is never re-gated — the #347 exemption `maxParallel` carries — so the
+     * instantaneous running count may exceed it. `null` and `0` both mean "no cap" — the shipped
+     * default, i.e. today's behavior byte-for-byte. Ordinary tasks are unaffected: the predicate
+     * lives per queued run, not in the shared capacity check, so a capped child waits in the queue
+     * while ordinary work keeps starting. Lowering it below the running count never preempts
+     * anything — it gates new admissions only.
      */
     dispatchMaxConcurrent: z.number().int().min(0).max(16).nullable().default(null).catch(null),
     /** Default worktree retention for projects that don't override it. */

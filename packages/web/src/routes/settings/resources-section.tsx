@@ -124,7 +124,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
           toast(
             dispatchNum === 0
               ? 'Dispatched-task limit cleared'
-              : `At most ${dispatchNum} dispatched task${dispatchNum === 1 ? '' : 's'} will run at once`,
+              : `At most ${dispatchNum} dispatched task${dispatchNum === 1 ? '' : 's'} will be started at a time`,
           ),
       },
     )
@@ -192,7 +192,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
       </SettingsField>
 
       <SettingsField
-        title="Max running dispatched tasks"
+        title="Max dispatched tasks started at once"
         hint="At most this many dispatched tasks will be started at a time; others wait in the queue. Ordinary tasks are not affected. Leave empty for no limit."
       >
         <div className="flex items-center gap-2">
@@ -201,7 +201,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
             inputMode="numeric"
             min={DISPATCH_MIN}
             max={DISPATCH_MAX}
-            aria-label="Max running dispatched tasks"
+            aria-label="Max dispatched tasks started at once"
             data-slot="resources-dispatch-max-concurrent"
             value={dispatchCap}
             disabled={save.isPending}
