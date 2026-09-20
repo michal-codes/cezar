@@ -521,7 +521,10 @@ later. That gap is honest, not a bug: CPU utilization is a delta between two
 samples, so the first read after an idle period has no window to measure and the
 readout shows `sampling…` instead of a number it cannot back. A metric the OS
 does not expose (swap outside Linux, load on Windows) is omitted rather than
-printed as a zero.
+printed as a zero. While a dispatch ceiling is configured (**Max running
+dispatched tasks**), that same payload also reports the dispatch admission state
+and the ceiling the gate enforces right now, which the card prints as
+`Dispatch admission: elevated · 2 of 4`.
 
 **Which numbers are effective.** The plain process reads **host totals**. When
 cezar runs inside a cgroup with a real limit - a Docker `--cpus`/`--cpuset-cpus`,
