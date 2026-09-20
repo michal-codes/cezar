@@ -21,6 +21,7 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 | 2 | 2.1 | Web `api/host-usage.ts`: query key, cache, subscription, remote warm-up | inline | done | — |
 | 2 | 2.2 | Machine card UI (CPU bar + sparkline, RAM bar, swap/load, freshness) | inline | done | — |
 | 2 | 2.3 | Docs: `docs/reference.md` + `BACKWARD_COMPATIBILITY.md` §2 note | inline | done | — |
+| 2 | 2.4 | Gate fix: health-topic registration pin survives the second topic | inline | done | — |
 
 ## Goal
 
@@ -113,6 +114,11 @@ aria-label. Tests: live rendering, first-tick state, remote `last known`, missin
 
 2.3 **Docs.** `docs/reference.md` Resources paragraph: live host totals, the remote warm-up
 fetch, the container/cgroup caveat.
+
+2.4 **Gate fix (found by the full gate).** `health-topic.test.ts` asserted the app registers
+exactly ONE topic (`toEqual(['health'])`); with `host` as the app's second topic that assertion
+had to state its real claim — health is registered exactly once, and `host` is registered too.
+The health behavior it guards (single registration, `loopbackReadable: true`) is unchanged.
 
 ## Verification
 
