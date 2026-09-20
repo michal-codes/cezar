@@ -9,11 +9,11 @@ touches `packages/web/src/routes/settings/resources-section.tsx`, `docs/referenc
 
 ## Tasks
 
-> Authoritative status table. `Status` is one of `todo` or `done`. On landing a Step, flip `Status` to `done` and fill the `Commit` column with the short SHA. The first row whose `Status` is not `done` is the resume point for `om-auto-continue-pr-loop`. Step ids and `Exec` cells are immutable once the plan is committed — per-Step commits touch only `Status` and `Commit`.
+> Authoritative status table. `Status` is one of `todo` or `done`. On landing a Step, flip `Status` to `done` (same commit as the Step's code) and fill the `Commit` column with the short SHA. The first row whose `Status` is not `done` is the resume point for `om-auto-continue-pr-loop`. Step ids and `Exec` cells are immutable once the plan is committed — per-Step commits touch only `Status` and `Commit`. One deliberate deviation from the loop contract: a Step's own SHA cannot be written inside the Step's own commit (self-reference), so the `Commit` cells are filled by a single trailing `docs(runs): record step commits` commit at run end; `Status` is still flipped 1:1 with the Step's commit, which is what resumption parses.
 
 | Phase | Step | Title | Exec | Status | Commit |
 |-------|------|-------|------|--------|--------|
-| 1 | 1.1 | Contract: `hostUsageSchema` + export, serialization test | inline | todo | — |
+| 1 | 1.1 | Contract: `hostUsageSchema` + export, serialization test | inline | done | — |
 | 1 | 1.2 | `core/host-usage.ts`: read-through sampler with the staleness rule | inline | todo | — |
 | 1 | 1.3 | Sampler unit tests (baseline, delta, staleness, start/stop, swap/load) | inline | todo | — |
 | 1 | 1.4 | `GET /workspace/host-usage` route + parity/BC inventory entries | inline | todo | — |
