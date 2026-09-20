@@ -1,18 +1,19 @@
 # Handoff — 2026-09-20-host-resource-telemetry
 
-**Last updated:** 2026-09-20T00:17:00Z
+**Last updated:** 2026-09-20T00:55:00Z
 **Branch:** feat/host-resource-telemetry
 **PR:** https://github.com/open-mercato/cezar/pull/1036 (draft)
-**Current phase/step:** Phase 1 complete (checkpoint 1); next is Phase 2 Step 2.1
-**Last commit:** `feat(server): host WS topic behind the demand-driven subscription bus`
+**Current phase/step:** all 9 Steps done; final gate recorded; review pass + UI QA next
+**Last commit:** `test(server): health-topic pin counts health registrations, not the topic count`
 
 ## What just happened
-- Steps 1.1–1.5 landed: contract schema, sampler, sampler tests, the workspace route (parity +
-  §2 inventory) and the `host` topic. Checkpoint 1: 87 targeted tests + `typecheck:server` green.
+- Phase 2 landed (web module, card, docs) and the full gate ran: typecheck/test:unit/build/
+  test:package green; `npm test` matches `origin/main`'s pre-existing failure set exactly; the
+  e2e suite is flaky-red in this container on BOTH branches (verified).
 
 ## Next concrete action
-- Step 2.1: `packages/web/src/api/host-usage.ts` — query key, cache folding, the card-scoped
-  subscription, the remote fetch + single warm-up, and the reconcile key in `global-events.tsx`.
+- `om-auto-review-pr 1036 --autofix`, then `om-auto-qa-pr 1036` (screenshots), then the summary
+  comment, the step-commit record commit and the ready flip.
 
 ## Blockers / open questions
 - none

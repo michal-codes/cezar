@@ -1,0 +1,102 @@
+
+ RUN  v4.1.10 /home/deploy/cezar/projects/cezar/.ai/cezar/worktrees/034bb584-7796-407d-8e7b-d7b2293c944e/.ai/tmp/om-auto-create-pr/host-resource-telemetry/packages/web/e2e
+
+ ❯ |e2e| repo-git.e2e.ts (5 tests | 2 failed) 55140ms
+     × /git renders the header from live git state and an honest Changes segment 26098ms
+     × opens one commit’s structured diff (a non-merge commit, found honestly) 26045ms
+ ❯ |e2e| queued-stack.e2e.ts (5 tests | 2 failed) 29703ms
+     × removes the stacked message 11ms
+     × keeps the amendment when the run finally starts, and goes read-only 26720ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |e2e| queued-stack.e2e.ts > a queued run’s prompt is amendable (#472) > removes the stacked message
+Error: cezar e2e: agent-browser click [aria-label="Remove message"] failed
+ ❯ AgentBrowser.run agent-browser.ts:141:13
+    139|       })
+    140|     } catch (cause) {
+    141|       throw new Error(`cezar e2e: agent-browser ${args.join(' ')} fail…
+       |             ^
+    142|     }
+    143|     const parsed = JSON.parse(stdout) as { success: boolean; data?: un…
+ ❯ AgentBrowser.click agent-browser.ts:250:10
+ ❯ queued-stack.e2e.ts:199:13
+
+Caused by: Error: Command failed: /home/deploy/.cache/agent-tools/agent-browser/agent-browser-linux-x64 --session e2e-queued-stack-642316 click [aria-label="Remove message"] --json
+ ❯ AgentBrowser.run agent-browser.ts:134:16
+ ❯ AgentBrowser.click agent-browser.ts:250:10
+ ❯ queued-stack.e2e.ts:199:13
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { status: 1, signal: null, output: [ null, '{"success":false,"data":null,"error":"Element not found: [aria-label=\"Remove message\"]. Verify the selector, role, or name is correct and the element exists in the DOM."}\n', '' ], pid: 642729, stdout: '{"success":false,"data":null,"error":"Element not found: [aria-label=\"Remove message\"]. Verify the selector, role, or name is correct and the element exists in the DOM."}\n', stderr: '' }
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+
+ FAIL  |e2e| queued-stack.e2e.ts > a queued run’s prompt is amendable (#472) > keeps the amendment when the run finally starts, and goes read-only
+AssertionError: expected [ …(2) ] to deeply equal [ 'STACKEDFINAL check the docs too' ]
+
+- Expected
++ Received
+
+  [
++   "also update the changelog and the README",
+    "STACKEDFINAL check the docs too",
+  ]
+
+ ❯ queued-stack.e2e.ts:231:55
+    229|     const record = await getRun(baseUrl, queuedId)
+    230|     expect(record.task).toBe('mock:done the original prompt')
+    231|     expect(record.queuedMessages?.map((m) => m.text)).toEqual(['STACKE…
+       |                                                       ^
+    232|
+    233|     // The thread still shows one bubble per authored message, and the…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+
+ FAIL  |e2e| repo-git.e2e.ts > the repo view against the live dry-run server > /git renders the header from live git state and an honest Changes segment
+Error: cezar e2e: agent-browser wait --fn document.querySelectorAll('[data-slot="diff-file"]').length === 7 failed
+ ❯ AgentBrowser.run agent-browser.ts:141:13
+    139|       })
+    140|     } catch (cause) {
+    141|       throw new Error(`cezar e2e: agent-browser ${args.join(' ')} fail…
+       |             ^
+    142|     }
+    143|     const parsed = JSON.parse(stdout) as { success: boolean; data?: un…
+ ❯ AgentBrowser.waitForFunction agent-browser.ts:193:10
+ ❯ repo-git.e2e.ts:80:15
+
+Caused by: Error: Command failed: /home/deploy/.cache/agent-tools/agent-browser/agent-browser-linux-x64 --session e2e-repo-git-640672 wait --fn document.querySelectorAll('[data-slot="diff-file"]').length === 7 --json
+ ❯ AgentBrowser.run agent-browser.ts:134:16
+ ❯ AgentBrowser.waitForFunction agent-browser.ts:193:10
+ ❯ repo-git.e2e.ts:80:15
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { status: 1, signal: null, output: [ null, '{"success":false,"data":null,"error":"Wait timed out after 25000ms"}\n', '' ], pid: 640984, stdout: '{"success":false,"data":null,"error":"Wait timed out after 25000ms"}\n', stderr: '' }
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯
+
+ FAIL  |e2e| repo-git.e2e.ts > the repo view against the live dry-run server > opens one commit’s structured diff (a non-merge commit, found honestly)
+Error: cezar e2e: agent-browser wait --fn document.querySelectorAll('[data-slot="diff-file"]').length === 4 failed
+ ❯ AgentBrowser.run agent-browser.ts:141:13
+    139|       })
+    140|     } catch (cause) {
+    141|       throw new Error(`cezar e2e: agent-browser ${args.join(' ')} fail…
+       |             ^
+    142|     }
+    143|     const parsed = JSON.parse(stdout) as { success: boolean; data?: un…
+ ❯ AgentBrowser.waitForFunction agent-browser.ts:193:10
+ ❯ repo-git.e2e.ts:127:13
+
+Caused by: Error: Command failed: /home/deploy/.cache/agent-tools/agent-browser/agent-browser-linux-x64 --session e2e-repo-git-640672 wait --fn document.querySelectorAll('[data-slot="diff-file"]').length === 4 --json
+ ❯ AgentBrowser.run agent-browser.ts:134:16
+ ❯ AgentBrowser.waitForFunction agent-browser.ts:193:10
+ ❯ repo-git.e2e.ts:127:13
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { status: 1, signal: null, output: [ null, '{"success":false,"data":null,"error":"Wait timed out after 25000ms"}\n', '' ], pid: 641743, stdout: '{"success":false,"data":null,"error":"Wait timed out after 25000ms"}\n', stderr: '' }
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯
+
+
+ Test Files  2 failed | 2 passed (4)
+      Tests  4 failed | 15 passed (19)
+   Start at  02:52:14
+   Duration  101.19s (transform 53ms, setup 0ms, import 92ms, tests 100.73s, environment 0ms)
+

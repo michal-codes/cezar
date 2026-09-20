@@ -12,3 +12,10 @@
 - Steps 1.1–1.5 done; targeted validation 87 tests + `typecheck:server`/`typecheck:contract` green.
 - UI pass skipped with reason: server-only Steps, no screen changed yet.
 - PR #1036 is open as a draft and claimed by comment (label/assignee writes are refused, 403).
+
+## 2026-09-20T00:55:00Z — checkpoint 2 / spec completion
+- Steps 2.1–2.4 done. Full gate recorded in `final-gate-checks.md`: typecheck, test:unit, build,
+  test:package green; `npm test` failure set byte-identical to `origin/main` (Node v26 pre-existing).
+- Gate found and Step 2.4 fixed a real pin drift (`health-topic.test.ts`, second topic).
+- e2e suite: red in this container on BOTH branches (4-failure flakiness reproduced on `main`);
+  recorded as environment-level, with the change's surface verified by the browser QA pass.
