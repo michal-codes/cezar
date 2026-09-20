@@ -5,19 +5,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HostUsage } from '@open-mercato/cezar-api-client'
 import {
+  createHostUsageStore,
+  HostUsageProvider,
+  HOST_HISTORY_GAP_MS,
   HOST_USAGE_WARMUP_MS,
   readWorkspaceHostUsage,
+  useHostHistory,
+  useHostLastFrameAt,
+  useHostSubscription,
   useHostUsage,
+  useHostUsageRoute,
   useHostUsageSubscription,
 } from './host-usage'
 import { createQueryClient } from './query-client'
-import { workspaceQueryKeys } from './queries'
 
 /**
- * The Machine card's transport rules (spec `.ai/specs/2026-09-20-host-resource-telemetry.md`):
- * a local cockpit reads pushed `host` frames and never fetches; a remote one reads the route and
- * follows an answer without `cpuPct` with EXACTLY ONE warm-up read — never an interval, and no
- * socket at all.
+ * The Machine card's and the widget's data layer (spec
+ * `.ai/specs/2026-09-20-host-telemetry-sidebar-widget.md`): a local cockpit reads pushed `host`
+ * frames into the per-app store and never fetches; a remote one reads the route and follows an
+ * answer without `cpuPct` with EXACTLY ONE warm-up read — never an interval, and no socket at all.
+ * Exactly one writer is live per viewport, and the store dedupes, gaps and resets honestly.
  */
 
 const fetchMock = vi.fn<typeof fetch>()
@@ -104,7 +111,11 @@ class FakeSocket {
 function wrapper() {
   const client = createQueryClient()
   return function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    return (
+      <QueryClientProvider client={client}>
+        <HostUsageProvider>{children}</HostUsageProvider>
+      </QueryClientProvider>
+    )
   }
 }
 
@@ -114,10 +125,50 @@ function routeCalls(): number {
     String(input).includes('/api/v1/workspace/host-usage')).length
 }
 
+/**
+ * The cockpit's socket is `api/ws.ts`'s module-level singleton, so it OUTLIVES a test: the next
+ * subscribe reuses the same instance when it is still open and builds a new one when it closed.
+ * These helpers make assertions honest either way - `FakeSocket.instances` is never reset, and a
+ * test looks at the delta it created plus the frames the live socket sent from its own baseline.
+ */
+let socketBaseline = 0
+
+function socketsCreatedThisTest(): FakeSocket[] {
+  return FakeSocket.instances.slice(socketBaseline)
+}
+
+function liveSocket(): FakeSocket {
+  const socket = FakeSocket.instances[FakeSocket.instances.length - 1]
+  if (!socket) throw new Error('no socket has been opened yet')
+  return socket
+}
+
+/** Flush whatever the shared socket still owes: opening it is what releases queued frames. */
+async function subscribedTo(topic: string, from: number): Promise<void> {
+  const socket = liveSocket()
+  if (socket.readyState === 0) act(() => socket.open())
+  await waitFor(() =>
+    expect(
+      socket.frames().slice(from).some((frame) => frame.type === 'subscribe' && frame.topic === topic),
+    ).toBe(true),
+  )
+}
+
+/** Desktop (`md` and up) is the default here; the phone cases stub this to `false`. */
+function stubViewport(desktop: boolean): void {
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: desktop,
+    media: query,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  }))
+}
+
 beforeEach(() => {
-  FakeSocket.instances = []
+  socketBaseline = FakeSocket.instances.length
   vi.stubGlobal('fetch', fetchMock)
   vi.stubGlobal('WebSocket', FakeSocket)
+  stubViewport(true)
 })
 
 afterEach(() => {
@@ -127,18 +178,21 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-describe('useHostUsage — remote transport', () => {
-  it('reads the route once when the answer already carries cpuPct', async () => {
+describe('useHostUsageRoute — remote transport', () => {
+  it('reads the route once when the answer already carries cpuPct, and folds it into the store', async () => {
     fetchMock.mockImplementation(async (input) => {
       const url = String(input)
       if (url.includes('/api/v1/health')) return json(HEALTH_REMOTE)
       return json(sample({ cpuPct: 38.4 }))
     })
 
-    const { result } = renderHook(() => useHostUsage(), { wrapper: wrapper() })
-    await waitFor(() => expect(result.current.data?.cpuPct).toBe(38.4))
+    const { result } = renderHook(() => ({ route: useHostUsageRoute(), store: useHostUsage() }), {
+      wrapper: wrapper(),
+    })
+    await waitFor(() => expect(result.current.route.data?.cpuPct).toBe(38.4))
+    await waitFor(() => expect(result.current.store?.cpuPct).toBe(38.4))
     expect(routeCalls()).toBe(1)
-    expect(FakeSocket.instances).toHaveLength(0);
+    expect(socketsCreatedThisTest()).toHaveLength(0)
   })
 
   it('follows an answer without cpuPct with exactly one warm-up read, then stops', async () => {
@@ -151,18 +205,21 @@ describe('useHostUsage — remote transport', () => {
       return json(reads === 1 ? sample() : sample({ cpuPct: 12.5 }))
     })
 
-    const { result } = renderHook(() => useHostUsage(), { wrapper: wrapper() })
+    const { result } = renderHook(() => ({ route: useHostUsageRoute(), store: useHostUsage() }), {
+      wrapper: wrapper(),
+    })
     await act(async () => {
       await vi.advanceTimersByTimeAsync(50)
     })
     expect(routeCalls()).toBe(1)
-    expect(result.current.data?.cpuPct).toBeUndefined()
+    expect(result.current.route.data?.cpuPct).toBeUndefined()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(HOST_USAGE_WARMUP_MS + 50)
     })
     expect(routeCalls()).toBe(2)
-    expect(result.current.data?.cpuPct).toBe(12.5)
+    expect(result.current.route.data?.cpuPct).toBe(12.5)
+    expect(result.current.store?.cpuPct).toBe(12.5)
 
     // Nothing schedules a third read: the warm-up is bounded, not an interval.
     await act(async () => {
@@ -171,7 +228,7 @@ describe('useHostUsage — remote transport', () => {
     expect(routeCalls()).toBe(2)
   })
 
-  it('opens no socket and subscribes to nothing in remote mode', async () => {
+  it('opens no socket and reads nothing in remote mode', async () => {
     fetchMock.mockImplementation(async (input) => {
       const url = String(input)
       if (url.includes('/api/v1/health')) return json(HEALTH_REMOTE)
@@ -182,13 +239,13 @@ describe('useHostUsage — remote transport', () => {
     await act(async () => {
       await Promise.resolve()
     })
-    expect(FakeSocket.instances).toHaveLength(0)
+    expect(socketsCreatedThisTest()).toHaveLength(0)
     expect(routeCalls()).toBe(0)
   })
 })
 
-describe('useHostUsage — local transport', () => {
-  it('never fetches, subscribes in the caller’s view, and folds pushed frames into the cache', async () => {
+describe('useHostUsageSubscription — local transport', () => {
+  it('never fetches, subscribes in the caller’s view, and folds pushed frames into the store', async () => {
     fetchMock.mockImplementation(async (input) => {
       const url = String(input)
       if (url.includes('/api/v1/health')) return json(HEALTH_LOCAL)
@@ -197,38 +254,140 @@ describe('useHostUsage — local transport', () => {
 
     const { result, unmount } = renderHook(
       () => {
-        useHostUsageSubscription()
-        return useHostUsage()
+        // The card's own view effect IS the writer below `md`: it calls this hook with
+        // `enabled: !useIsDesktop()`, which is what a phone layout mounts.
+        useHostUsageSubscription({ enabled: true })
+        return {
+          sample: useHostUsage(),
+          history: useHostHistory(),
+          lastFrameAt: useHostLastFrameAt(),
+        }
       },
       { wrapper: wrapper() },
     )
     await waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(0))
-    act(() => {
-      FakeSocket.instances[0]?.open()
-    })
-    await waitFor(() =>
-      expect(FakeSocket.instances[0]?.frames().some((frame) => frame.topic === 'host')).toBe(true),
-    )
+    const socket = liveSocket()
+    const frameBaseline = socket.frames().length
+    await subscribedTo('host', frameBaseline)
     expect(routeCalls()).toBe(0)
 
     act(() => {
-      FakeSocket.instances[0]?.deliver('host', sample({ cpuPct: 61.2, sampledAt: '2026-09-20T00:00:02.000Z' }))
+      socket.deliver(
+        'host',
+        sample({ cpuPct: 61.2, sampledAt: '2026-09-20T00:00:02.000Z' }),
+      )
     })
-    await waitFor(() => expect(result.current.data?.cpuPct).toBe(61.2))
+    await waitFor(() => expect(result.current.sample?.cpuPct).toBe(61.2))
+    // The receipt stamp and the ring are the widget's clock and the card's sparkline.
+    expect(result.current.lastFrameAt).toEqual(expect.any(Number))
+    expect(result.current.history).toHaveLength(1)
 
     // A frame the schema rejects never reaches the card as a half-filled sample.
     act(() => {
-      FakeSocket.instances[0]?.deliver('host', { sampledAt: 'nope', cpuCount: 0 })
+      socket.deliver('host', { sampledAt: 'nope', cpuCount: 0 })
     })
-    expect(result.current.data?.cpuPct).toBe(61.2)
+    expect(result.current.sample?.cpuPct).toBe(61.2)
 
-    // Leaving the view is the 1→0: the unsubscribe goes out and no more frames are folded.
     unmount()
     await waitFor(() =>
       expect(
-        FakeSocket.instances[0]?.frames().some((frame) => frame.type === 'unsubscribe' && frame.topic === 'host'),
+        socket
+          .frames()
+          .slice(frameBaseline)
+          .some((frame) => frame.type === 'unsubscribe' && frame.topic === 'host'),
       ).toBe(true),
     )
+  })
+})
+
+describe('useHostSubscription — the root writer', () => {
+  const localOnly = async (input: RequestInfo | URL): Promise<Response> => {
+    const url = String(input)
+    if (url.includes('/api/v1/health')) return json(HEALTH_LOCAL)
+    throw new Error(`unexpected fetch in local mode: ${url}`)
+  }
+
+  it('stays off below md, where the card is the only demand', async () => {
+    fetchMock.mockImplementation(localOnly)
+    stubViewport(false)
+
+    renderHook(() => useHostSubscription(), { wrapper: wrapper() })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(socketsCreatedThisTest()).toHaveLength(0)
+  })
+
+  it('subscribes once on desktop and releases the topic on unmount (StrictMode-safe)', async () => {
+    fetchMock.mockImplementation(localOnly)
+
+    const { unmount } = renderHook(() => useHostSubscription(), { wrapper: wrapper() })
+    await waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(0))
+    const socket = liveSocket()
+    const frameBaseline = socket.frames().length
+    // ONE subscribe frame for ONE root writer: the bus ref-counts topics, so a second writer in
+    // the same viewport would show up here as a second frame.
+    await subscribedTo('host', frameBaseline)
+    expect(
+      socket
+        .frames()
+        .slice(frameBaseline)
+        .filter((frame) => frame.type === 'subscribe' && frame.topic === 'host'),
+    ).toHaveLength(1)
+    unmount()
+    await waitFor(() =>
+      expect(
+        socket
+          .frames()
+          .slice(frameBaseline)
+          .some((frame) => frame.type === 'unsubscribe' && frame.topic === 'host'),
+      ).toBe(true),
+    )
+  })
+})
+
+describe('createHostUsageStore', () => {
+  const point = (sampledAt: string): HostUsage => sample({ sampledAt, cpuPct: 10 })
+
+  it('keeps identity stable for a replayed sample and never doubles a point', () => {
+    const store = createHostUsageStore()
+    const first = point('2026-09-20T00:00:00.000Z')
+    store.push(first, 1_000, 'root')
+    const after = store.get()
+    store.push(first, 1_000, 'root')
+    expect(store.get()).toBe(after)
+    // A later receipt of the SAME server sample refreshes the clock without a second point.
+    store.push(first, 2_000, 'root')
+    expect(store.get().history).toHaveLength(1)
+    expect(store.get().lastFrameAt).toBe(2_000)
+  })
+
+  it('clears the ring on a writer change and on a gap', () => {
+    const store = createHostUsageStore()
+    store.push(point('2026-09-20T00:00:00.000Z'), 1_000, 'card')
+    store.push(point('2026-09-20T00:00:02.000Z'), 3_000, 'card')
+    expect(store.get().history).toHaveLength(2)
+
+    // The card unmounts and the root takes over: the line restarts rather than bridging writers.
+    store.push(point('2026-09-20T00:00:04.000Z'), 5_000, 'root')
+    expect(store.get().history).toHaveLength(1)
+
+    // A reconnection that skipped more than four frames is not a line either.
+    const next = new Date(
+      Date.parse('2026-09-20T00:00:04.000Z') + HOST_HISTORY_GAP_MS + 2_000,
+    ).toISOString()
+    store.push(point(next), 9_000, 'root')
+    expect(store.get().history).toHaveLength(1)
+  })
+
+  it('drops CPU-less samples from the ring and forgets everything on reset', () => {
+    const store = createHostUsageStore()
+    store.push(sample({ sampledAt: '2026-09-20T00:00:00.000Z' }), 1_000, 'root')
+    expect(store.get().latest).toBeDefined()
+    expect(store.get().history).toHaveLength(0)
+    store.reset()
+    expect(store.get().latest).toBeUndefined()
+    expect(store.get().lastFrameAt).toBeUndefined()
   })
 })
 
