@@ -50,9 +50,11 @@ export interface WorkspaceResourceLimits {
   /** Per-task process-tree memory ceiling in MiB; null = no limit. */
   memoryLimitMb: number | null;
   /**
-   * Ceiling on concurrently running dispatch children (spec
-   * 2026-09-20-dispatch-admission-scheduler); `null`/`0` = no cap. Optional so an older `load`
-   * stub keeps working — an absent key reads as "no cap", i.e. today's behavior.
+   * ADMISSION ceiling on dispatch children (spec 2026-09-20-dispatch-admission-scheduler): at
+   * most this many are STARTED from the queue at a time, workspace-wide; a parked child returning
+   * to work is never re-gated (#347), so the running count may exceed it. `null`/`0` = no cap.
+   * Optional so an older `load` stub keeps working — an absent key reads as "no cap", i.e. today's
+   * behavior.
    */
   dispatchMaxConcurrent?: number | null;
   /**

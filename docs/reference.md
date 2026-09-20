@@ -46,11 +46,16 @@ Five moves that make the cockpit worth the browser tab:
   everything still `queued` is re-enqueued in order. It's the orchestration layer
   that turns "one agent at a time" into a backlog that drains itself. Tasks that
   dispatch other tasks can be bounded separately: **Settings → Resources → Max
-  running dispatched tasks** (`dispatchMaxConcurrent`, default *no limit*) admits a
-  dispatched child only while fewer than N dispatch children are running
-  workspace-wide. Ordinary tasks keep their normal share of `maxParallel`, a capped
-  child simply waits in the queue, and lowering the value never stops a child that
-  is already running.
+  dispatched tasks started at once** (`dispatchMaxConcurrent`, default *no limit*) admits a
+  dispatched child **from the queue** only while fewer than N dispatch children
+  hold a slot workspace-wide. It is an admission ceiling rather than a running
+  one: a parked child woken back into its own session (a delivered child report,
+  the monitoring wake) is never re-gated — the same #347 exemption `maxParallel`
+  carries — so the running count may transiently exceed N. An auto-resume after a
+  usage limit is the exception: it goes through the ordinary queued-continuation
+  path, so it obeys the cap like any other queued work. Ordinary tasks keep their
+  normal share of `maxParallel` and a capped child simply waits in the queue, and lowering
+  the value never stops a child that is already running.
 - 🧠 **Memory-aware runs.** Each run's whole process tree is sampled (~2 s) for CPU
   and RSS, and its **peak memory** is recorded and shown in the task table. Set an
   optional per-task **memory ceiling** (`memoryLimitMb`) and a run that crosses it
@@ -521,8 +526,8 @@ later. That gap is honest, not a bug: CPU utilization is a delta between two
 samples, so the first read after an idle period has no window to measure and the
 readout shows `sampling…` instead of a number it cannot back. A metric the OS
 does not expose (swap outside Linux, load on Windows) is omitted rather than
-printed as a zero. While a dispatch ceiling is configured (**Max running
-dispatched tasks**), that same payload also reports the dispatch admission state
+printed as a zero. While a dispatch ceiling is configured (**Max dispatched tasks
+started at once**), that same payload also reports the dispatch admission state
 and the ceiling the gate was enforcing when the sample was taken (a cached route read can be up to
 the sampler's freshness window behind), which the card prints as
 `Dispatch admission: elevated · 2 of 4`.

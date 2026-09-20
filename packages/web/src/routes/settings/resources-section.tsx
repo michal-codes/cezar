@@ -16,8 +16,9 @@ import { SettingsField } from './settings-field'
  * Global settings → Resources: how hard the MACHINE works. `maxParallel` caps concurrent tasks
  * across every project (the workspace semaphore holds the rest); `memoryLimitMb` is the
  * per-task ceiling the engine enforces by pausing a task that crosses it and letting the queue
- * advance (#memory-guard); `dispatchMaxConcurrent` caps how many DISPATCH CHILDREN run at once
- * without touching ordinary tasks' share of `maxParallel` (spec
+ * advance (#memory-guard); `dispatchMaxConcurrent` is an ADMISSION ceiling — how many dispatch
+ * children are started from the queue at a time — without touching ordinary tasks' share of
+ * `maxParallel`; a parked child woken back into its session is never re-gated (spec
  * 2026-09-20-dispatch-admission-scheduler).
  *
  * All three are workspace-level since the multi-project split (spec §"Resource governance"):
@@ -125,7 +126,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
           toast(
             dispatchNum === 0
               ? 'Dispatched-task limit cleared'
-              : `At most ${dispatchNum} dispatched task${dispatchNum === 1 ? '' : 's'} will run at once`,
+              : `At most ${dispatchNum} dispatched task${dispatchNum === 1 ? '' : 's'} will be started at a time`,
           ),
       },
     )
@@ -198,8 +199,8 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
       </SettingsField>
 
       <SettingsField
-        title="Max running dispatched tasks"
-        hint="Dispatched children wait in the queue while this many are already running. Ordinary tasks are not affected. Leave empty for no limit."
+        title="Max dispatched tasks started at once"
+        hint="At most this many dispatched tasks will be started at a time; others wait in the queue. Ordinary tasks are not affected. Leave empty for no limit."
       >
         <div className="flex items-center gap-2">
           <input
@@ -207,7 +208,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
             inputMode="numeric"
             min={DISPATCH_MIN}
             max={DISPATCH_MAX}
-            aria-label="Max running dispatched tasks"
+            aria-label="Max dispatched tasks started at once"
             data-slot="resources-dispatch-max-concurrent"
             value={dispatchCap}
             disabled={save.isPending}
@@ -215,7 +216,6 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
             onChange={(event) => setDispatchCap(event.target.value)}
             className="block w-32 rounded-md border border-input bg-card px-3 py-1.5 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
           />
-          <span className="text-xs text-soft-foreground">at once</span>
           <Button
             type="button"
             variant="outline"
