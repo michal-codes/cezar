@@ -444,6 +444,47 @@ describe('workspace semaphore across RunManagers (step 2.5)', () => {
     a.store.updateRun(child.id, { status: 'cancelled' });
   });
 
+  it('a dispatch child resumed out of `waiting` starts immediately while the cap is full (admission, not running)', async () => {
+    // The invariant MAJOR-1 of the spec review asked to pin: the cap bounds ADMISSION from the
+    // queue, so a parked child returning to work is never re-gated and the running count may
+    // exceed it. A test written the other way (`runningChildren <= cap`) is green in a two-run
+    // fixture and false in any real two-level dispatch tree.
+    const semaphore = new WorkspaceSemaphore({
+      initial: { maxParallel: 4, dispatchMaxConcurrent: 1 },
+    });
+    const a = project('cez-wsem-dcresume-', semaphore);
+    const internals = a.manager as unknown as { dispatchBusy(): number };
+
+    // A dispatch child parks at the end of its turn (the mock agent) — no dispatch slot held.
+    const parked = a.manager.startRun(AGENT, { task: 'parked dispatch child', worktree: false });
+    a.store.updateRun(parked.id, { dispatch: { rootRunId: 'root', parentRunId: 'root' } });
+    await waitFor(
+      () => a.store.getRun(parked.id)?.status === 'waiting',
+      'the dispatch child to park at `waiting`',
+    );
+    expect(internals.dispatchBusy()).toBe(0);
+
+    // A second child takes the only dispatch slot, so `dispatchBusy() === cap`.
+    const holder = a.manager.startRun(HOLD_LONG, { task: 'holds the only dispatch slot' });
+    a.store.updateRun(holder.id, { dispatch: { rootRunId: 'root', parentRunId: 'root' } });
+    await waitFor(() => internals.dispatchBusy() === 1, 'the cap to be full');
+
+    // Resuming never passes through `pump()/startable()`: it re-enters the counted set with no cap
+    // check, exactly as `maxParallel` treats a resume (#347 — gating resumes is the deadlock).
+    expect(
+      a.manager.sendMessage(parked.id, [{ type: 'text', text: 'a child report arrived' }]),
+    ).toBe(true);
+    expect(a.store.getRun(parked.id)?.status).toBe('running');
+    expect(internals.dispatchBusy()).toBe(2); // above the cap of 1, deliberately
+
+    // It runs its turn and re-parks; the holder keeps its slot throughout.
+    await waitFor(
+      () => a.store.getRun(parked.id)?.status === 'waiting',
+      'the resumed child to re-park after its turn',
+    );
+    expect(a.store.getRun(holder.id)?.status).toBe('running');
+  }, 45_000);
+
   it('per-project cap: project A limited to 1 runs one at a time while B fills the workspace cap', async () => {
     // Shared snapshot the load hook copies on each refresh — mutating the map
     // and calling refresh() mirrors a settings write to a project's maxParallel.

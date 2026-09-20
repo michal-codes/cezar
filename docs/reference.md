@@ -47,10 +47,13 @@ Five moves that make the cockpit worth the browser tab:
   that turns "one agent at a time" into a backlog that drains itself. Tasks that
   dispatch other tasks can be bounded separately: **Settings → Resources → Max
   running dispatched tasks** (`dispatchMaxConcurrent`, default *no limit*) admits a
-  dispatched child only while fewer than N dispatch children are running
-  workspace-wide. Ordinary tasks keep their normal share of `maxParallel`, a capped
-  child simply waits in the queue, and lowering the value never stops a child that
-  is already running.
+  dispatched child **from the queue** only while fewer than N dispatch children
+  hold a slot workspace-wide. It is an admission ceiling rather than a running
+  one: a parked child returning to work (a child report, the monitoring wake, an
+  auto-resume) is never re-gated — the same #347 exemption `maxParallel` carries —
+  so the running count may transiently exceed N. Ordinary tasks keep their normal
+  share of `maxParallel` and a capped child simply waits in the queue, and lowering
+  the value never stops a child that is already running.
 - 🧠 **Memory-aware runs.** Each run's whole process tree is sampled (~2 s) for CPU
   and RSS, and its **peak memory** is recorded and shown in the task table. Set an
   optional per-task **memory ceiling** (`memoryLimitMb`) and a run that crosses it

@@ -193,7 +193,7 @@ function ResourcesForm({ config }: { config: WorkspaceConfigResponse }) {
 
       <SettingsField
         title="Max running dispatched tasks"
-        hint="Dispatched children wait in the queue while this many are already running. Ordinary tasks are not affected. Leave empty for no limit."
+        hint="At most this many dispatched tasks will be started at a time; others wait in the queue. Ordinary tasks are not affected. Leave empty for no limit."
       >
         <div className="flex items-center gap-2">
           <input
