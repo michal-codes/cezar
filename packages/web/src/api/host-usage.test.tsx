@@ -1,6 +1,6 @@
 import { QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { StrictMode, type ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HostUsage } from '@open-mercato/cezar-api-client'
@@ -115,6 +115,18 @@ function wrapper() {
       <QueryClientProvider client={client}>
         <HostUsageProvider>{children}</HostUsageProvider>
       </QueryClientProvider>
+    )
+  }
+}
+
+/** The same provider, mounted the way the app mounts it: inside `StrictMode` (main.tsx). */
+function strictWrapper() {
+  const Inner = wrapper()
+  return function StrictWrapper({ children }: { children: ReactNode }) {
+    return (
+      <StrictMode>
+        <Inner>{children}</Inner>
+      </StrictMode>
     )
   }
 }
@@ -318,10 +330,16 @@ describe('useHostSubscription — the root writer', () => {
     expect(socketsCreatedThisTest()).toHaveLength(0)
   })
 
-  it('subscribes once on desktop and releases the topic on unmount (StrictMode-safe)', async () => {
+  it('subscribes once on desktop and releases the topic on unmount, under StrictMode', async () => {
     fetchMock.mockImplementation(localOnly)
 
-    const { unmount } = renderHook(() => useHostSubscription(), { wrapper: wrapper() })
+    const { result, unmount } = renderHook(
+      () => {
+        useHostSubscription()
+        return { sample: useHostUsage(), history: useHostHistory() }
+      },
+      { wrapper: strictWrapper() },
+    )
     await waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(0))
     const socket = liveSocket()
     const frameBaseline = socket.frames().length
@@ -334,6 +352,15 @@ describe('useHostSubscription — the root writer', () => {
         .slice(frameBaseline)
         .filter((frame) => frame.type === 'subscribe' && frame.topic === 'host'),
     ).toHaveLength(1)
+
+    // StrictMode's mount → unmount → mount must still fold ONE frame once: two folds would show
+    // up as a doubled ring.
+    act(() => {
+      socket.deliver('host', sample({ cpuPct: 44, sampledAt: '2026-09-20T00:00:08.000Z' }))
+    })
+    await waitFor(() => expect(result.current.sample?.cpuPct).toBe(44))
+    expect(result.current.history).toHaveLength(1)
+
     unmount()
     await waitFor(() =>
       expect(
@@ -378,6 +405,20 @@ describe('createHostUsageStore', () => {
     ).toISOString()
     store.push(point(next), 9_000, 'root')
     expect(store.get().history).toHaveLength(1)
+  })
+
+  it('clears the ring even when the new writer replays the sample the old one delivered', () => {
+    const store = createHostUsageStore()
+    const cardsSample = sample({ sampledAt: '2026-09-20T00:00:00.000Z', cpuPct: 10 })
+    store.push(cardsSample, 1_000, 'card')
+    store.push(sample({ sampledAt: '2026-09-20T00:00:02.000Z', cpuPct: 20 }), 3_000, 'card')
+    expect(store.get().history).toHaveLength(2)
+
+    // A rotation across `md`: the root writer's first frame is the topic snapshot, which repeats
+    // the last sampledAt. The line belongs to the new writer, so it restarts - with that one
+    // point, not with a duplicate of the old writer's two.
+    store.push(cardsSample, 4_000, 'root')
+    expect(store.get().history.map((entry) => entry.cpuPct)).toEqual([10])
   })
 
   it('drops CPU-less samples from the ring and forgets everything on reset', () => {

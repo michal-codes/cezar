@@ -225,4 +225,71 @@ describe('cgroup v1 probe', () => {
       })(),
     ).toBeUndefined();
   });
+
+  it('reads usage from a SEPARATE cpuacct mount, not from the cpu controller mount', () => {
+    const facts = createCgroupProbe({
+      readFile: fileReader({
+        '/proc/self/cgroup': '9:cpu:/docker/abc\n10:cpuacct:/docker/abc\n12:memory:/docker/abc\n',
+        '/proc/self/mountinfo': [
+          '25 23 0:24 / /sys/fs/cgroup/cpu rw,relatime shared:5 - cgroup cgroup rw,cpu',
+          '26 23 0:25 / /sys/fs/cgroup/cpuacct rw,relatime shared:6 - cgroup cgroup rw,cpuacct',
+          '27 23 0:26 / /sys/fs/cgroup/memory rw,relatime shared:7 - cgroup cgroup rw,memory',
+        ].join('\n'),
+        '/sys/fs/cgroup/cpu/docker/abc/cpu.cfs_quota_us': '200000\n',
+        '/sys/fs/cgroup/cpu/docker/abc/cpu.cfs_period_us': '100000\n',
+        // Only the cpuacct mount carries the counter: a probe that reads it under `cpu` would
+        // report the quota with no percentage at all.
+        '/sys/fs/cgroup/cpuacct/docker/abc/cpuacct.usage': '2500000000\n',
+      }),
+      platform: 'linux',
+    })();
+
+    expect(facts?.cpuQuotaCores).toBeCloseTo(2);
+    expect(facts?.cpuUsageUs).toBe(2_500_000);
+  });
+});
+
+describe('cgroup v2 + v1 hybrids', () => {
+  const HYBRID_MOUNTINFO = [
+    '29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:9 - cgroup2 cgroup2 rw,nsdelegate',
+    '25 23 0:24 / /sys/fs/cgroup/cpu,cpuacct rw,relatime shared:5 - cgroup cgroup rw,cpu,cpuacct',
+  ].join('\n');
+
+  it('falls through to v1 when the unified mount carries usage but NO limit', () => {
+    const facts = createCgroupProbe({
+      readFile: fileReader({
+        // Both hierarchies are mounted; the process's own path on the v1 side holds the quota.
+        '/proc/self/cgroup': '0::/system.slice/cezar.service\n11:cpu,cpuacct:/system.slice/cezar.service\n',
+        '/proc/self/mountinfo': HYBRID_MOUNTINFO,
+        '/sys/fs/cgroup/system.slice/cpu.max': 'max 100000\n',
+        '/sys/fs/cgroup/system.slice/memory.max': 'max\n',
+        '/sys/fs/cgroup/system.slice/cezar.service/cpu.max': 'max 100000\n',
+        '/sys/fs/cgroup/system.slice/cezar.service/memory.stat': 'inactive_file 4096\n',
+        '/sys/fs/cgroup/cpu,cpuacct/system.slice/cezar.service/cpu.cfs_quota_us': '150000\n',
+        '/sys/fs/cgroup/cpu,cpuacct/system.slice/cezar.service/cpu.cfs_period_us': '100000\n',
+      }),
+      platform: 'linux',
+    })();
+
+    // Answering with the v2 facts alone would make the card say "no cgroup limit detected" about a
+    // process capped at 1.5 cores - the false negative this fallback exists to prevent.
+    expect(facts?.source).toBe('cgroup-v1');
+    expect(facts?.cpuQuotaCores).toBeCloseTo(1.5);
+  });
+
+  it('keeps the v2 facts when v2 already carries the limit', () => {
+    const facts = createCgroupProbe({
+      readFile: fileReader({
+        '/proc/self/cgroup': '0::/\n11:cpu,cpuacct:/x\n',
+        '/proc/self/mountinfo': HYBRID_MOUNTINFO,
+        '/sys/fs/cgroup/cpu.max': '200000 100000\n',
+        '/sys/fs/cgroup/cpu,cpuacct/x/cpu.cfs_quota_us': '800000\n',
+        '/sys/fs/cgroup/cpu,cpuacct/x/cpu.cfs_period_us': '100000\n',
+      }),
+      platform: 'linux',
+    })();
+
+    expect(facts?.source).toBe('cgroup-v2');
+    expect(facts?.cpuQuotaCores).toBeCloseTo(2);
+  });
 });

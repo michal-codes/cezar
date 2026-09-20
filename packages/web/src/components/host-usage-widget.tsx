@@ -1,6 +1,12 @@
 import { useEffect, useState } from 'react'
 
-import { useHostHistory, useHostLastFrameAt, useHostTransport, useHostUsage } from '@/api/host-usage'
+import {
+  HOST_HISTORY_LENGTH,
+  useHostHistory,
+  useHostLastFrameAt,
+  useHostTransport,
+  useHostUsage,
+} from '@/api/host-usage'
 import { Link } from '@/lib/project-router'
 import { effectiveHostView, formatCpuCores, formatMemPair } from '@/lib/host-effective'
 import { useIsDesktop } from '@/lib/use-desktop'
@@ -79,7 +85,9 @@ function HostUsageWidgetRow() {
     history.length >= MIN_SPARK_POINTS
       ? history
           .map((point, index) => {
-            const x = (index / (history.length - 1)) * SPARK_WIDTH
+            // The SAME 30-point axis the card draws on, so both sparklines describe the same 60 s
+            // of the same series - a short ring plots on the left, exactly as it does up there.
+            const x = (index / (HOST_HISTORY_LENGTH - 1)) * SPARK_WIDTH
             const y = SPARK_HEIGHT - (clampPct(point.cpuPct) / 100) * SPARK_HEIGHT
             return `${x.toFixed(1)},${y.toFixed(1)}`
           })

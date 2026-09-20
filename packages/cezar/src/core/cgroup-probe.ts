@@ -311,7 +311,10 @@ function probeV1(
   const cpu = controllerMount('cpu');
   const memory = controllerMount('memory');
   const cpuset = controllerMount('cpuset');
-  if (!cpu && !memory && !cpuset) return undefined;
+  // `cpuacct` alone is still worth a probe: a quota with no percentage is worse than a percentage
+  // without a quota, but neither is worth discarding the other fact over.
+  const cpuacct = controllerMount('cpuacct');
+  if (!cpu && !memory && !cpuset && !cpuacct) return undefined;
 
   let cpuQuotaCores: number | undefined;
   let memLimitBytes: number | undefined;
@@ -337,8 +340,11 @@ function probeV1(
   let cpuUsageUs: number | undefined;
   let memUsedBytes: number | undefined;
   let cpusetCores: number | undefined;
-  if (cpu) {
-    const leafDir = joinCgroupPath(cpu.mountPoint, cpu.path);
+  // Usage lives where `cpuacct` lives - the same `cpu,cpuacct` mount on most hosts, a mount of its
+  // own on some, so read it from its own resolution rather than from the cpu controller's.
+  const usageMount = cpuacct ?? cpu;
+  if (usageMount) {
+    const leafDir = joinCgroupPath(usageMount.mountPoint, usageMount.path);
     // `cpuacct.usage` is NANOSECONDS while the v2 `cpu.stat` counter is microseconds: a literal
     // read would be 1000x too large and clamp every v1 container to 100 %.
     const cpuacctNs = parseCgroupNumber(readFile(`${leafDir}/cpuacct.usage`));
@@ -371,6 +377,17 @@ function probeV1(
 }
 
 /**
+ * Whether these facts carry a limit a caller can act on. `cpusetCores` is deliberately NOT one:
+ * the sampler treats a cpuset as a limit only when it is below the host's core count, and a v2
+ * cpuset equal to every core must not stop the walk from finding a real quota on the v1 side.
+ */
+function hasAuthoritativeLimit(facts: CgroupFacts | undefined): facts is CgroupFacts {
+  return (
+    facts !== undefined && (facts.cpuQuotaCores !== undefined || facts.memLimitBytes !== undefined)
+  );
+}
+
+/**
  * Resolve the process's cgroup and read its limits and usage. v2 first (the unified hierarchy is
  * what every current distribution ships), v1 as the fallback; on non-Linux, or with nothing
  * readable, `undefined` - which is the sampler's "emit no `container`" signal.
@@ -388,18 +405,19 @@ export function createCgroupProbe(options: CgroupProbeOptions = {}): CgroupProbe
     const mounts = parseMountInfo(mountInfo);
     const unified = mounts.find((mount) => mount.fileSystem === 'cgroup2');
     try {
-      if (unified) {
-        const facts = probeV2(
-          readFile,
-          cgroupFile,
-          unified.mountPoint.replace(/\/+$/, '') || '/',
-        );
-        if (facts) return facts;
-      }
-      if (mounts.some((mount) => mount.fileSystem === 'cgroup')) {
-        return probeV1(readFile, cgroupFile, mounts);
-      }
-      return undefined;
+      const unifiedFacts = unified
+        ? probeV2(readFile, cgroupFile, unified.mountPoint.replace(/\/+$/, '') || '/')
+        : undefined;
+      if (hasAuthoritativeLimit(unifiedFacts)) return unifiedFacts;
+      // A hybrid host can mount cgroup2 while the controllers still live on v1 (or a container
+      // can expose an empty unified mount). Answering with v2's usage-only facts there would make
+      // the card claim "no cgroup limit detected" about a process that HAS one, so the v1 side
+      // gets its say whenever v2 carries no quota and no memory limit.
+      const legacyFacts = mounts.some((mount) => mount.fileSystem === 'cgroup')
+        ? probeV1(readFile, cgroupFile, mounts)
+        : undefined;
+      if (hasAuthoritativeLimit(legacyFacts)) return legacyFacts;
+      return unifiedFacts ?? legacyFacts;
     } catch {
       // A probe that throws is worse than a probe that answers nothing: the whole sampler tick
       // (host CPU, memory, load) would be lost with it.
