@@ -1,5 +1,8 @@
 import { realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { createAdmissionGovernor, type AdmissionGovernor } from '../core/admission-governor.ts';
+import { setAdmissionStatusProvider, type AdmissionStatus } from '../core/admission-status.ts';
+import { createCgroupPressureSource } from '../core/cgroup-pressure.ts';
 import { DEFAULT_MONITORING_WAKE_MINUTES, loadWorkspaceConfig } from './config.ts';
 
 /**
@@ -165,11 +168,18 @@ export interface WorkspaceSemaphoreOptions {
    *  schema's own defaults (`maxParallel: 2`, no memory limit), so a manager
    *  constructed without boot wiring behaves like a fresh workspace. */
   initial?: Partial<WorkspaceResourceLimits>;
+  /**
+   * The adaptive admission governor (spec 2026-09-20-adaptive-admission-governor): the REDUCTION
+   * layer under the configured dispatch ceiling. Injected so tests drive the levels without a
+   * cgroup; production reads the process's own cgroup through the default below.
+   */
+  governor?: AdmissionGovernor;
 }
 
 export class WorkspaceSemaphore {
   private readonly participants = new Set<SemaphoreParticipant>();
   private readonly load: () => Promise<WorkspaceResourceLimits>;
+  private readonly governor: AdmissionGovernor;
   private limits: WorkspaceResourceLimits;
   /** A `release()` sweep is in flight — see `pendingRelease`. */
   private broadcasting = false;
@@ -180,6 +190,11 @@ export class WorkspaceSemaphore {
   constructor(options: WorkspaceSemaphoreOptions = {}) {
     this.load = options.load ?? loadResourceLimits;
     this.limits = { ...DEFAULT_LIMITS, ...options.initial };
+    this.governor = options.governor ?? createAdmissionGovernor({ sample: createCgroupPressureSource() });
+    // The telemetry side reads the governor's snapshot from HERE (spec A7): the semaphore owns the
+    // governor and registers the one provider, the sampler only reports. The arrow never points
+    // back - a display-side value must not be able to decide admission.
+    setAdmissionStatusProvider(() => this.admissionStatus());
   }
 
   /** Join the shared counter. Returns the unregister handle — the manager's
@@ -226,6 +241,47 @@ export class WorkspaceSemaphore {
    */
   dispatchMaxConcurrent(): number | null {
     return this.limits.dispatchMaxConcurrent ?? null;
+  }
+
+  /**
+   * The ceiling the dispatch admission gate enforces RIGHT NOW: the configured ceiling reduced by
+   * the governor's current level (`ceil(configured * 1)`, `* 1/2`, `* 1/4`, floor 1), or `null`
+   * when there is nothing to reduce.
+   *
+   * `null` covers both spellings of "no ceiling" the rest of the workspace already honors: an
+   * absent/null key AND the explicit `0` the operator can write (see `dispatchMaxConcurrent()`,
+   * whose tests pin `0` as a real value). Handing `0` to the governor would answer `1` - a ceiling
+   * the operator never set - so the "no cap" case never reaches it.
+   *
+   * `dispatchMaxConcurrent()` itself keeps answering the CONFIGURED value: the settings API and its
+   * tests read the user's number back, while the admission gate reads this one. Splitting the two
+   * is what lets the readout say "2 of 4" honestly (spec 2026-09-20-adaptive-admission-governor).
+   */
+  dispatchAdmissionCeiling(): number | null {
+    const configured = this.dispatchMaxConcurrent();
+    if (configured === null || configured <= 0) return null;
+    return this.governor.effectiveCeiling(configured);
+  }
+
+  /**
+   * The governor's state for the telemetry readout (spec A7/A8), or `undefined` when no ceiling is
+   * configured - there is nothing to reduce, so the payload carries no `admission` key at all.
+   * `since` is the ISO-8601 instant the current non-normal level began, and is absent while the
+   * machine is `normal`.
+   */
+  admissionStatus(): AdmissionStatus | undefined {
+    const configured = this.dispatchMaxConcurrent();
+    if (configured === null || configured <= 0) return undefined;
+    // `level()` first: it advances the lazily-evaluated governor, so `since()` and
+    // `effectiveCeiling()` describe the same level the status reports.
+    const state = this.governor.level();
+    const since = this.governor.since();
+    return {
+      state,
+      configured,
+      effective: this.governor.effectiveCeiling(configured),
+      ...(since === undefined ? {} : { since: new Date(since).toISOString() }),
+    };
   }
 
   maxMonitoringSessions(): number {

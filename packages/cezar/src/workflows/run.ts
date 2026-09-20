@@ -1369,8 +1369,11 @@ export class RunManager {
         const repo = await getRepoInfo(this.repoRoot);
         const maxParallel = this.semaphore.maxParallel();
         // Cached dispatch-admission ceiling (null/0 = no cap) — read once per sweep, like the
-        // workspace cap above; `startable()` is the only consumer.
-        const dispatchCap = this.semaphore.dispatchMaxConcurrent();
+        // workspace cap above; `startable()` is the only consumer. The GOVERNED ceiling: the
+        // configured one reduced by the adaptive admission governor while the machine is under
+        // pressure (spec 2026-09-20-adaptive-admission-governor). `dispatchMaxConcurrent()` still
+        // answers the configured value for the settings API.
+        const dispatchCap = this.semaphore.dispatchAdmissionCeiling();
         // Per-project ceiling (spec 2026-07-22-per-project-concurrency): this
         // project never runs more than its own configured `maxParallel`; absent
         // an override it equals the workspace cap, so behavior is unchanged.

@@ -3,6 +3,11 @@ import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  reducedCeiling,
+  type AdmissionGovernor,
+  type AdmissionLevel,
+} from '../core/admission-governor.ts';
 import { RunStore } from '../runs/store.ts';
 import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { RunManager } from './run.ts';
@@ -281,6 +286,20 @@ describe('workspace semaphore across RunManagers (step 2.5)', () => {
     dispatch: { rootRunId: root, parentRunId: root },
   });
 
+  /**
+   * A governor pinned to a level the test controls (spec 2026-09-20-adaptive-admission-governor,
+   * implementation step 4). The reduction math is the SHIPPED one (`reducedCeiling`), so these
+   * tests exercise the real ceiling; only the level is synthetic, which is what keeps a
+   * pressure-driven policy and the cgroup of whatever machine runs the suite out of an end-to-end
+   * scheduling test.
+   */
+  const governedBy = (level: () => AdmissionLevel): AdmissionGovernor => ({
+    level,
+    since: () => undefined,
+    effectiveCeiling: (configured) => reducedCeiling(configured, level()),
+    reset: () => {},
+  });
+
   it('cap 1: one dispatch child runs, the next queues, and an ordinary run passes it', async () => {
     const semaphore = new WorkspaceSemaphore({ initial: { maxParallel: 4, dispatchMaxConcurrent: 1 } });
     const a = project('cez-wsem-dcap1-', semaphore);
@@ -391,6 +410,88 @@ describe('workspace semaphore across RunManagers (step 2.5)', () => {
         `both children to run with dispatchMaxConcurrent=${String(dispatchMaxConcurrent)}`,
       );
     }
+  }, 45_000);
+
+  /**
+   * The gate reads the GOVERNED ceiling (spec 2026-09-20-adaptive-admission-governor, step 4):
+   * under pressure the effective ceiling is lower than the configured one, and it holds dispatch
+   * children ONLY - ordinary runs keep starting, because the whole reason the ceiling is
+   * dispatch-specific is that a fan-out must never stop the user's own work.
+   */
+  it('a reduced (governed) ceiling holds a dispatch child while ordinary runs keep starting', async () => {
+    const semaphore = new WorkspaceSemaphore({
+      initial: { maxParallel: 4, dispatchMaxConcurrent: 2 },
+      governor: governedBy(() => 'critical'),
+    });
+    const a = project('cez-wsem-govhold-', semaphore);
+    expect(semaphore.dispatchAdmissionCeiling()).toBe(1); // configured 2, critical → ceil(2 / 4)
+    expect(semaphore.dispatchMaxConcurrent()).toBe(2); // the settings value is untouched
+
+    const child1 = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+    await waitFor(() => a.store.getRun(child1.id)?.status === 'running', 'the first child to run');
+    const child2 = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(a.store.getRun(child2.id)?.status).toBe('queued'); // held by the REDUCED ceiling
+
+    const ordinary = a.manager.startRun(INSTANT, { task: 'ordinary work beside the held child' });
+    await waitFor(
+      () => settled.includes(a.store.getRun(ordinary.id)?.status ?? ''),
+      'the ordinary run to finish beside a held dispatch child',
+    );
+    expect(a.store.getRun(ordinary.id)?.status).toBe('done');
+  }, 45_000);
+
+  it('a reduced ceiling lifts without a restart: the next sweep re-reads it and admits the child', async () => {
+    let level: AdmissionLevel = 'critical';
+    const semaphore = new WorkspaceSemaphore({
+      initial: { maxParallel: 4, dispatchMaxConcurrent: 2 },
+      governor: governedBy(() => level),
+    });
+    const a = project('cez-wsem-govlift-', semaphore);
+
+    const child1 = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+    await waitFor(() => a.store.getRun(child1.id)?.status === 'running', 'the first child to run');
+    const child2 = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(a.store.getRun(child2.id)?.status).toBe('queued');
+
+    // The machine calmed down. The sweep a freed slot triggers must re-read the ceiling rather
+    // than cache the reduction - a ceiling that cannot lift is just a lower cap.
+    level = 'normal';
+    await semaphore.release();
+    await waitFor(
+      () => a.store.getRun(child2.id)?.status === 'running',
+      'the queued child to start once the reduction lifted',
+    );
+  }, 45_000);
+
+  it('clearing the ceiling mid-reduction drops the reduction, admitting the held child', async () => {
+    let configured: number | null = 2;
+    const semaphore = new WorkspaceSemaphore({
+      load: () =>
+        Promise.resolve({ maxParallel: 4, memoryLimitMb: null, dispatchMaxConcurrent: configured }),
+      initial: { maxParallel: 4, dispatchMaxConcurrent: 2 },
+      governor: governedBy(() => 'critical'),
+    });
+    const a = project('cez-wsem-govclear-', semaphore);
+
+    const child1 = a.manager.startRun(SLOW, CHILD('child one', 'root-one'));
+    await waitFor(() => a.store.getRun(child1.id)?.status === 'running', 'the first child to run');
+    const child2 = a.manager.startRun(SLOW, CHILD('child two', 'root-two'));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(a.store.getRun(child2.id)?.status).toBe('queued');
+
+    // The operator clears the ceiling while the governor is still critical. `refresh()` is the
+    // PUT /workspace/config hook and it pumps every manager, so the child held by a reduction that
+    // no longer has a base must become admissible on the spot.
+    configured = null;
+    await semaphore.refresh();
+    expect(semaphore.dispatchMaxConcurrent()).toBeNull();
+    expect(semaphore.dispatchAdmissionCeiling()).toBeNull();
+    await waitFor(
+      () => a.store.getRun(child2.id)?.status === 'running',
+      'the held child to start once the ceiling was cleared',
+    );
   }, 45_000);
 
   it('a dispatch cap above maxParallel never raises concurrency — the host cap still decides', async () => {
