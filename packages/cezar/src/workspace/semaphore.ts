@@ -219,9 +219,10 @@ export class WorkspaceSemaphore {
    * Cached ADMISSION ceiling on dispatch children, or null for "no cap" — what the queue gate
    * compares `dispatchBusy()` against; a resume never consults it (#347). Answered from the
    * in-memory snapshot like `maxParallel()`, refreshed by `refresh()` (boot and every
-   * `PUT /workspace/config`), never re-read per pump. The accessor collapses absent to `null`
-   * exactly the way `maxMonitoringSessions()`/`autoResumeOnUsageLimit()` do, because this field is
-   * optional and here `null` and absent mean the same thing.
+   * `PUT /workspace/config`), never re-read per pump. Like `maxMonitoringSessions()` and
+   * `autoResumeOnUsageLimit()`, this accessor reads an OPTIONAL field and collapses absent to a
+   * usable default — `null` here, where absent and `null` mean the same thing ("no cap"), unlike
+   * #810's `monitoringWakeIntervalMinutes` where collapsing them was the bug.
    */
   dispatchMaxConcurrent(): number | null {
     return this.limits.dispatchMaxConcurrent ?? null;
