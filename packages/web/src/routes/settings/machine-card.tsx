@@ -27,6 +27,11 @@ import { cn } from '@/lib/utils'
  * state, so the sidebar widget and this card draw the same line and the same age. Values are read
  * through `effectiveHostView`, the one place that decides which number is effective: a limit whose
  * value is missing shows `—`, never the host figure.
+ *
+ * One more muted line reads the dispatch governor's snapshot off the same sample (spec
+ * `.ai/specs/2026-09-20-adaptive-admission-governor.md`): the ceiling the admission gate enforces
+ * right now, shown only while a `dispatchMaxConcurrent` ceiling is configured. The card reports it;
+ * the semaphore decides it.
  */
 
 /** How many points the sparkline plots; the store keeps exactly this ring. */
@@ -96,6 +101,13 @@ export function MachineCard() {
     view === undefined
       ? undefined
       : `${view.memUsedBytes === undefined ? '—' : formatMem(view.memUsedBytes)} / ${formatMem(view.memTotalBytes)}`
+  // Same rule as every other row here: a snapshot without the pair has nothing to show, so the
+  // line stays away rather than printing blanks.
+  const admission = sample?.admission
+  const admissionText =
+    admission?.configured === undefined || admission.effective === undefined
+      ? undefined
+      : `Dispatch admission: ${admission.state} · ${admission.effective} of ${admission.configured}`
 
   return (
     <section
@@ -124,6 +136,12 @@ export function MachineCard() {
           cgroup limits detected · {view.source}
         </p>
       ) : null}
+
+      {admissionText === undefined ? null : (
+        <p data-slot="machine-card-admission" className="mt-2 text-[11.5px] text-soft-foreground">
+          {admissionText}
+        </p>
+      )}
 
       {isError && sample === undefined ? (
         <p data-slot="machine-card-error" className="mt-3 text-[12.5px] text-soft-foreground">
