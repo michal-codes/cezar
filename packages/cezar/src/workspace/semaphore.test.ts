@@ -152,6 +152,22 @@ describe('WorkspaceSemaphore', () => {
       expect(sem.admissionStatus()).toMatchObject({ state: 'critical', configured: 1, effective: 1 });
     });
 
+    it('a per-manager fallback never blanks the readout of the semaphore that is enforcing', () => {
+      const real = governed(
+        { maxParallel: 8, dispatchMaxConcurrent: 4 },
+        governorAt(() => ({ memoryUsedRatio: 0.99 }), { now: 1_700_000_000_000 }),
+      );
+      expect(admissionStatusSnapshot()).toMatchObject({ state: 'critical', configured: 4 });
+
+      // `RunManager` without an injected semaphore constructs its own. It has no workspace ceiling
+      // to report, and the registration slot is last-writer-wins - so it must not register at all,
+      // or the `admission` key would vanish from telemetry while the real governor keeps reducing.
+      const fallback = new WorkspaceSemaphore({ registersAdmissionStatus: false });
+      expect(fallback.admissionStatus()).toBeUndefined();
+      expect(admissionStatusSnapshot()).toMatchObject({ state: 'critical', configured: 4 });
+      expect(real.dispatchAdmissionCeiling()).toBe(1);
+    });
+
     it('clearing the ceiling mid-reduction drops the reduction with it; a new ceiling re-bases', async () => {
       const clock = { now: 1_700_000_000_000 };
       let configured: number | null = 4;

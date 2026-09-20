@@ -976,7 +976,10 @@ export class RunManager {
   ) {
     this.dataDir = join(repoRoot, '.ai/cezar');
     this.projectId = options.projectId;
-    this.semaphore = options.semaphore ?? new WorkspaceSemaphore();
+    // A fallback for headless/tests only; boot always injects the shared workspace semaphore. It
+    // must not register as the telemetry readout's provider: the slot is last-writer-wins, and a
+    // per-manager fallback with no ceiling would blank the real semaphore's `admission` key.
+    this.semaphore = options.semaphore ?? new WorkspaceSemaphore({ registersAdmissionStatus: false });
     this.offSemaphore = this.semaphore.register({
       busySlots: () => this.busySlots(),
       dispatchBusy: () => this.dispatchBusy(),
