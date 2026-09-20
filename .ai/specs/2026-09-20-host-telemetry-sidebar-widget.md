@@ -7,7 +7,9 @@
 > `461df7d3` + `d3d0e2ca` (widget subscription/store/UI), `366cf417` + `9a043744` (v2.1
 > architecture and OS-level cgroup defects) — every Critical/High/Medium is folded here ·
 > final verification `f450c6b4` residuals F1-F12 folded as v2.3 (quota + cpuset affinity +
-> pressure pin) · Delivery: stacked on #1036's head while it is open (the implementation PR body
+> pressure pin; the local `(v2.4)` commit's content was absorbed into this same pushed v2.3
+> revision, so the document's own numbering runs one step behind its git history) · Delivery:
+> stacked on #1036's head while it is open (the implementation PR body
 > says `Stacked on #1036 (head 0537b32e); merge #1036 first, then rebase/merge main`), as Phase 1
 > (server + card) and Phase 2 (widget), one or two PRs · v2.3 re-review residuals R1-R3 folded
 > (stacked-delivery wording, cpuset example count, ambient-cpuset note).
@@ -140,8 +142,10 @@ chain, hard-ceiling invariant and pressure-signal source (raw `memory.current`/`
    re-armed timeout at `lastFrameAt + 10 s` (`lastFrameAt` = the client receipt stamp kept with
    the latest sample, a TRANSPORT fact), cleared on unmount; the rendered age derives from the
    sample's own `sampledAt`, so a cockpit that stopped receiving counts up instead of freezing at
-   `updated 0 s ago`. No counts, no effective/host marker; the swap row keeps v1's bare label and
-   the load chip pairs with `hostCpuCount` only when a container is present.
+   `updated 0 s ago`. No task or run counts, and no effective/host marker: the CPU cell carries
+   the effective core-count chip when a CPU limit exists (`6 CPU`, `cpuset 4 CPU`), the swap row
+   keeps v1's bare label, and the load chip pairs with `hostCpuCount` only when a container is
+   present.
 6. **Adaptive admission — deferred; chain and hard ceiling stated once:**
 
    ```
@@ -260,7 +264,8 @@ subtracted" sentence is rewritten in the same commit. Error/stale behavior uncha
 - With a finite limit: a `cgroup limits detected · cgroup-v2` line (not "Container" — a
   systemd-limited host service is not a container) with effective CPU (`6 CPU · 38%`) and RAM
   (`14.2 / 16 GB`) or, for a cpuset-only pin, `cpuset 4 CPU · 100%`, plus a muted
-  `host 64 CPU · 755 GB` context line using `hostCpuCount`.
+  `host 8 CPU · 32.0 GB RAM` context line using `hostCpuCount` (the shipped format: cores via
+  `formatCpuCores`, one unit word).
 - Without a finite limit: v1 numbers and layout, but the caveat becomes host-mode copy
   ("Host totals - no cgroup limit tighter than the host detected for this process"), replacing the stale
   "container/cgroup limits are not subtracted" wording (F9).
@@ -398,13 +403,17 @@ Every step leaves the app working and is covered by a test.
    core count.
 3. Extend `hostUsageSchema` with `container` (incl. `cpuAffinityCores`) + gated `hostCpuCount`;
    parity in `contract-parity.workspace.test.ts`; fixture-driven `host-topic` tests for
-   container-present/absent/rejected frames (CI never has a container).
+   container-present/absent frames (CI never has a container). The rejection path is pinned where
+   the bytes actually enter - the store boundary (`host-usage.test.tsx` drops a malformed frame),
+   so no topic-side "rejected" fixture ships.
 4. Implement the effective composition (one helper, unit-tested matrix: quota-only, mem-only,
    cpuset-only, quota > host cores, both, limit-without-value, no limit) with `—` semantics;
    assert no scope mixing and that `effectiveCores` is the `cpuPct` denominator.
 5. Surface the card labels: `cgroup limits detected · <source>` + effective/host lines, load vs
    `cpuCount`/`hostCpuCount` (the single rule above), host-labelled swap; tests for
-   container-present/absent/partial and for the cpuset-only label.
+   container-present/absent/partial and for the cpuset-only label. Host mode additionally asserts
+   the rows are NOT labelled effective (`machine-card.test.tsx`); the positive `(effective)`
+   suffix itself is carried by the container-fixture evidence, not by a text assertion.
 6. Add the per-app store/context (`createHostUsageStore`, timestamped ring, dedupe, clear,
    `reset`, the `lastFrameAt` client receipt stamp) and `useSyncExternalStore` reads; remove the
    card's component-local ring; test store sharing + the `useHostUsageRoute()` remote fold.
