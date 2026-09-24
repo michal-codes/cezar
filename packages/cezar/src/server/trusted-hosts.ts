@@ -1,7 +1,9 @@
 /**
  * `CEZ_TRUSTED_HOSTS` — an explicit, default-off allowlist of extra `Host`
- * authorities that the `/api/*` origin guard and `verifyWsUpgrade` treat like
- * loopback.
+ * authorities that the two admission checks (`/api/*` in `server.ts` and
+ * `verifyWsUpgrade`) accept in addition to loopback. Nothing else changes: the
+ * loopback-only fallbacks in those checks stay loopback-only, the bind is
+ * unchanged, and CORS is unchanged.
  *
  * Why: the loopback allowlist (#426) is the DNS-rebinding guard, and as a side
  * effect it refuses every legitimate reverse-proxied request while the cockpit
@@ -11,6 +13,13 @@
  * name this code cannot enumerate — without paying for hosted mode
  * (`CEZ_REMOTE=1` disables local handoff, home-file browsing and agent-config
  * editing).
+ *
+ * The risk this opens is deliberate and must be named: a trusted authority
+ * keeps `capabilities.localHandoff` true, so anything that can reach that
+ * authority also reaches the local-only surfaces — agent-config editing,
+ * home-wide `fs/browse`, the launch key, Origin-less writes. Restrict the
+ * authority to a private, device-authenticating network; never expose it
+ * publicly (see docs/server-install/tailnet.md).
  *
  * The guard's reasoning survives: a rebound `evil.com` still sends
  * `Host: evil.com`, which is not in the list, so it is refused exactly as

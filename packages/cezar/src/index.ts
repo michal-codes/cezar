@@ -30,7 +30,8 @@ import {
   unavailableProviderMessage,
 } from './server/provider-action-gate.ts';
 import { checkForUpdate } from './update-check.ts';
-import { printCockpitQr } from './cli/qr.ts';
+import { cockpitAccessWarnings, printCockpitQr } from './cli/qr.ts';
+import { resolveCapabilities } from './server/capabilities.ts';
 import { trustedHosts } from './server/trusted-hosts.ts';
 import { printSkillsBanner } from './skills-banner.ts';
 import { initWorkspace } from './workspace/boot.ts';
@@ -267,7 +268,7 @@ async function serveCommand(
   // Set before the first run can start, read by every manager's `agentEnv` while dispatch is on.
   process.env.CEZ_API_URL = `http://127.0.0.1:${port}`;
   process.env.CEZ_BIN = resolve(process.argv[1] ?? fileURLToPath(import.meta.url));
-  startServer({
+  const server = startServer({
     repoRoot,
     store,
     manager,
@@ -291,11 +292,24 @@ async function serveCommand(
   }
   if (port !== preferredPort) console.log(`  (port ${preferredPort} was busy — using ${port})`);
   console.log(`\n  cockpit → ${url}\n`);
-  const trusted = trustedHosts();
-  if (trusted.size > 0) {
-    console.log(`  trusted hosts (CEZ_TRUSTED_HOSTS) → ${[...trusted].join(', ')}\n`);
-  }
-  printCockpitQr({ publicUrl: process.env.CEZ_PUBLIC_URL, bindHost, port, tty: Boolean(process.stdout.isTTY) });
+  // Printed only once the listener is actually up: a bind that fails
+  // (EADDRNOTAVAIL) must not hand out a QR for a cockpit nobody can reach.
+  const printPrivateFrontBanner = () => {
+    const trusted = trustedHosts();
+    if (trusted.size > 0) {
+      console.log(`  trusted hosts (CEZ_TRUSTED_HOSTS) → ${[...trusted].join(', ')}\n`);
+    }
+    printCockpitQr({ publicUrl: process.env.CEZ_PUBLIC_URL, bindHost, port });
+    for (const warning of cockpitAccessWarnings({
+      publicUrl: process.env.CEZ_PUBLIC_URL,
+      trusted,
+      hosted: !resolveCapabilities(process.env, bindHost).localHandoff,
+    })) {
+      console.log(`  ⚠ ${warning}\n`);
+    }
+  };
+  if (server.listening) printPrivateFrontBanner();
+  else server.once('listening', printPrivateFrontBanner);
   // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
   await printSkillsBanner(repoRoot);
 

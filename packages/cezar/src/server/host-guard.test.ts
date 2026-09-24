@@ -78,6 +78,41 @@ describe('host-header guard (DNS rebinding)', () => {
     }
   });
 
+  it('admits a trusted write only when the Origin matches, and ignores the allowlist in hosted mode', async () => {
+    const saved = process.env.CEZ_TRUSTED_HOSTS;
+    const savedRemote = process.env.CEZ_REMOTE;
+    process.env.CEZ_TRUSTED_HOSTS = 'cockpit.tailnet.ts.net:8445';
+    try {
+      const ok = await makeApp().request('/api/v1/projects', {
+        method: 'POST',
+        headers: {
+          host: 'cockpit.tailnet.ts.net:8445',
+          origin: 'http://cockpit.tailnet.ts.net:8445',
+          'content-type': 'application/json',
+        },
+        body: '{}',
+      });
+      expect(ok.status).not.toBe(403); // the guard admitted it; the handler may still refuse the payload
+      const foreign = await makeApp().request('/api/v1/projects', {
+        method: 'POST',
+        headers: {
+          host: 'cockpit.tailnet.ts.net:8445',
+          origin: 'https://evil.example',
+          'content-type': 'application/json',
+        },
+        body: '{}',
+      });
+      expect(foreign.status).toBe(403);
+      process.env.CEZ_REMOTE = '1';
+      expect((await request('any.example')).status).toBe(200); // hosted mode admits any Host, allowlist or not
+    } finally {
+      if (saved === undefined) delete process.env.CEZ_TRUSTED_HOSTS;
+      else process.env.CEZ_TRUSTED_HOSTS = saved;
+      if (savedRemote === undefined) delete process.env.CEZ_REMOTE;
+      else process.env.CEZ_REMOTE = savedRemote;
+    }
+  });
+
   it.each(['attacker.example', 'attacker.example:4321', 'cezar.attacker.example', '192.168.1.10:4321'])(
     'rejects the rebound host %s with 403 on every route',
     async (host) => {

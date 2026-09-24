@@ -70,14 +70,50 @@ export function printCockpitQr(opts: {
 }): string | null {
   const env = opts.env ?? process.env;
   const log = opts.log ?? console.log;
+  // Defaulted here, not at the call site: the first cut had the CLI forget to
+  // pass it, which made the whole feature dead code with green tests.
+  const tty = opts.tty ?? Boolean(process.stdout.isTTY);
   const target = qrTargetUrl(opts);
   if (!target) return null;
   const explicit = Boolean(opts.publicUrl?.trim());
-  if (!explicit && !opts.tty) return null;
+  if (!explicit && !tty) return null;
   if (env.CEZ_NO_QR === '1' || env.CI) return null;
   log('');
   log(`  phone → ${target}`);
   for (const line of qrLines(target)) log(`  ${line}`);
   log('');
   return target;
+}
+
+/**
+ * Boot warnings for the two ways the private-front story can be misconfigured.
+ * Both are printed by the banner, never silently ignored: a QR that lands on
+ * the guard's 403, and a trusted authority whose reach the operator may not
+ * have priced in (local handoff stays on).
+ */
+export function cockpitAccessWarnings(opts: {
+  publicUrl?: string | undefined;
+  trusted: Set<string>;
+  hosted: boolean;
+}): string[] {
+  const out: string[] = [];
+  if (opts.hosted) return out;
+  const publicUrl = opts.publicUrl?.trim();
+  if (publicUrl) {
+    let authority = '';
+    try {
+      authority = new URL(publicUrl).host.toLowerCase();
+    } catch {
+      authority = '';
+    }
+    if (!authority || !opts.trusted.has(authority)) {
+      out.push(`CEZ_PUBLIC_URL (${publicUrl}) is not in CEZ_TRUSTED_HOSTS — a scan would hit the #426 host guard`);
+    }
+  }
+  if (opts.trusted.size > 0) {
+    out.push(
+      `CEZ_TRUSTED_HOSTS is on: ${[...opts.trusted].join(', ')} also reaches agent-config editing, home-wide fs browse and the launch key — keep it on a private network, never a public front`,
+    );
+  }
+  return out;
 }

@@ -16,6 +16,16 @@ describe('CEZ_TRUSTED_HOSTS', () => {
     expect([...parseTrustedHosts('://broken')]).toEqual([]);
   });
 
+  it('never lets an empty entry, a wildcard or a near-miss name match', () => {
+    const trusted = parseTrustedHosts('host.ts.net, ');
+    expect(isTrustedHostHeader('', trusted)).toBe(false);
+    expect(isTrustedHostHeader('host.ts.net.', trusted)).toBe(false); // trailing dot is a different authority
+    const wildcard = parseTrustedHosts('*');
+    expect(isTrustedHostHeader('anything.example', wildcard)).toBe(false);
+    const portStrict = parseTrustedHosts('host.ts.net:8445');
+    expect(isTrustedHostHeader('host.ts.net:443', portStrict)).toBe(false);
+  });
+
   it('matches a Host by authority, case-insensitively, never partially', () => {
     const trusted = parseTrustedHosts('host.ts.net:8445');
     expect(isTrustedHostHeader('host.ts.net:8445', trusted)).toBe(true);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { printCockpitQr, qrLines, qrTargetUrl } from './qr.ts';
+import { cockpitAccessWarnings, printCockpitQr, qrLines, qrTargetUrl } from './qr.ts';
 
 describe('terminal QR for the cockpit address', () => {
   it('renders a square block string with a quiet zone', () => {
@@ -32,5 +32,32 @@ describe('terminal QR for the cockpit address', () => {
     expect(printCockpitQr({ ...base, tty: true, env: { CEZ_NO_QR: '1' } })).toBeNull();
     expect(printCockpitQr({ ...base, tty: true, env: { CI: 'true' } })).toBeNull();
     expect(lines.length).toBe(0);
+  });
+
+  it('warns when the QR target is not trusted, and about what a trusted authority reaches', () => {
+    const trusted = new Set(['host.ts.net:8445']);
+    expect(
+      cockpitAccessWarnings({ publicUrl: 'https://host.ts.net:8445/', trusted, hosted: false }).length,
+    ).toBe(1); // only the "what it reaches" warning
+    const mismatch = cockpitAccessWarnings({ publicUrl: 'https://other.ts.net:8445/', trusted, hosted: false });
+    expect(mismatch[0]).toContain('not in CEZ_TRUSTED_HOSTS');
+    expect(cockpitAccessWarnings({ publicUrl: 'not a url', trusted, hosted: false })[0]).toContain('not in CEZ_TRUSTED_HOSTS');
+    // Hosted mode already admits any Host, and local handoff is off there: no warnings.
+    expect(cockpitAccessWarnings({ publicUrl: 'https://other.ts.net/', trusted, hosted: true })).toEqual([]);
+  });
+
+  it('defaults the TTY check to the real stdout, so the call site cannot forget it', () => {
+    const lines: string[] = [];
+    const original = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+    Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
+    try {
+      expect(
+        printCockpitQr({ bindHost: '100.95.163.12', port: 4321, env: {}, log: (line) => lines.push(line) }),
+      ).toBe('http://100.95.163.12:4321');
+    } finally {
+      if (original) Object.defineProperty(process.stdout, 'isTTY', original);
+      else delete (process.stdout as { isTTY?: boolean }).isTTY;
+    }
+    expect(lines.length).toBeGreaterThan(10);
   });
 });
