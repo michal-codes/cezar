@@ -42,6 +42,8 @@ This spec adds one explicit, default-off knob: `CEZ_TRUSTED_HOSTS=host[:port],â€
 | A4 | Hosted mode | Untouched; the variable is ignored when `CEZ_REMOTE=1`/non-loopback bind already admits any Host | One predicate, not two. |
 | A5 | WebSocket | `verifyWsUpgrade` consults the same list; trusted Host with a matching Origin authority is `trusted: true` | Live channels must work, not just HTTP. |
 | A6 | Observability | One boot log line naming the trusted hosts; `/api/v1/health` unchanged | Operators need to see it took effect. |
+| A7 | How the QR learns the phone's URL | `CEZ_PUBLIC_URL` names it explicitly; without it, a non-loopback `--bind-host` is used; a loopback cockpit prints nothing, and `CEZ_NO_QR=1` (or any CI) silences it | A proxy URL is not derivable from the bind address, and printing a QR for `localhost` is noise. |
+| A8 | QR encoder | `qrcode-generator` (MIT, zero runtime dependencies) for the module matrix, rendered as half-block text by our own ~30-line formatter | No vendored encoder to maintain and no dependency tree; the terminal formatter stays ours and unit-testable. |
 
 ## Proposed solution
 
@@ -50,9 +52,9 @@ This spec adds one explicit, default-off knob: `CEZ_TRUSTED_HOSTS=host[:port],â€
 2. `/api/*` guard: accept loopback **or** trusted; keep the `Origin`-vs-`Host` comparison and the
    `Sec-Fetch-Site` belt-and-suspenders unchanged.
 3. `verifyWsUpgrade`: same addition; the existing `trusted` verdict logic is unchanged.
-4. CLI: print the cockpit URL as a **QR code** in the terminal banner when the address is not
-   loopback (a tailnet URL), so the phone can scan it. Opt-out flag; never printed for a loopback
-   URL, where it is noise.
+4. CLI: print the address as a **QR code** in the terminal banner â€” `CEZ_PUBLIC_URL` when set,
+   otherwise a non-loopback `--bind-host` â€” so the phone can scan it. Never printed for a loopback
+   address, silenced by `CEZ_NO_QR=1` or a CI environment.
 5. Docs: a `docs/server-install/tailnet.md` page â€” the recipe (tailnet front, `tailscale serve` or
    a direct tailnet bind), the value for `CEZ_TRUSTED_HOSTS`, the QR handoff, and a security note
    that the private network now owns what the loopback guard used to.
