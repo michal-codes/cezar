@@ -30,7 +30,7 @@ import {
   unavailableProviderMessage,
 } from './server/provider-action-gate.ts';
 import { checkForUpdate } from './update-check.ts';
-import { cockpitAccessWarnings, printCockpitQr } from './cli/qr.ts';
+import { printPrivateFrontBanner } from './cli/qr.ts';
 import { resolveCapabilities } from './server/capabilities.ts';
 import { trustedHosts } from './server/trusted-hosts.ts';
 import { printSkillsBanner } from './skills-banner.ts';
@@ -294,22 +294,17 @@ async function serveCommand(
   console.log(`\n  cockpit → ${url}\n`);
   // Printed only once the listener is actually up: a bind that fails
   // (EADDRNOTAVAIL) must not hand out a QR for a cockpit nobody can reach.
-  const printPrivateFrontBanner = () => {
-    const trusted = trustedHosts();
-    if (trusted.size > 0) {
-      console.log(`  trusted hosts (CEZ_TRUSTED_HOSTS) → ${[...trusted].join(', ')}\n`);
-    }
-    printCockpitQr({ publicUrl: process.env.CEZ_PUBLIC_URL, bindHost, port });
-    for (const warning of cockpitAccessWarnings({
+  const emitPrivateFrontBanner = () => {
+    printPrivateFrontBanner({
       publicUrl: process.env.CEZ_PUBLIC_URL,
-      trusted,
+      bindHost,
+      port,
+      trusted: trustedHosts(),
       hosted: !resolveCapabilities(process.env, bindHost).localHandoff,
-    })) {
-      console.log(`  ⚠ ${warning}\n`);
-    }
+    });
   };
-  if (server.listening) printPrivateFrontBanner();
-  else server.once('listening', printPrivateFrontBanner);
+  if (server.listening) emitPrivateFrontBanner();
+  else server.once('listening', emitPrivateFrontBanner);
   // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
   await printSkillsBanner(repoRoot);
 

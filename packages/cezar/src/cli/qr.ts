@@ -117,3 +117,35 @@ export function cockpitAccessWarnings(opts: {
   }
   return out;
 }
+
+/**
+ * The whole private-front banner block, in one call: the trusted-hosts line,
+ * the QR (with its target), and the warnings. Extracted so the *wiring* is
+ * unit-tested — the first cut shipped a dead feature because the call site,
+ * not the function, was the untested part.
+ */
+export function printPrivateFrontBanner(opts: {
+  publicUrl?: string | undefined;
+  bindHost?: string | undefined;
+  port: number;
+  trusted: Set<string>;
+  hosted: boolean;
+  env?: NodeJS.ProcessEnv;
+  tty?: boolean;
+  log?: (line: string) => void;
+}): { printedQr: string | null; warnings: string[] } {
+  const log = opts.log ?? console.log;
+  const emit = (line: string) => log(line);
+  if (opts.trusted.size > 0) emit(`  trusted hosts (CEZ_TRUSTED_HOSTS) → ${[...opts.trusted].join(', ')}\n`);
+  const printedQr = printCockpitQr({
+    publicUrl: opts.publicUrl,
+    bindHost: opts.bindHost,
+    port: opts.port,
+    env: opts.env,
+    tty: opts.tty,
+    log: emit,
+  });
+  const warnings = cockpitAccessWarnings({ publicUrl: opts.publicUrl, trusted: opts.trusted, hosted: opts.hosted });
+  for (const warning of warnings) emit(`  ⚠ ${warning}\n`);
+  return { printedQr, warnings };
+}

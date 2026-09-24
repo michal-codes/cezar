@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { cockpitAccessWarnings, printCockpitQr, qrLines, qrTargetUrl } from './qr.ts';
+import {
+  cockpitAccessWarnings,
+  printCockpitQr,
+  printPrivateFrontBanner,
+  qrLines,
+  qrTargetUrl,
+} from './qr.ts';
 
 describe('terminal QR for the cockpit address', () => {
   it('renders a square block string with a quiet zone', () => {
@@ -59,5 +65,23 @@ describe('terminal QR for the cockpit address', () => {
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
     }
     expect(lines.length).toBeGreaterThan(10);
+  });
+
+  it('drives the whole private-front banner block in one call — the wiring, not just the parts', () => {
+    const lines: string[] = [];
+    const result = printPrivateFrontBanner({
+      publicUrl: 'https://host.ts.net:8445/',
+      port: 4321,
+      trusted: new Set(['host.ts.net:8445']),
+      hosted: false,
+      env: {},
+      log: (line) => lines.push(line),
+    });
+    expect(result.printedQr).toBe('https://host.ts.net:8445/');
+    expect(lines.some((line) => line.includes('trusted hosts (CEZ_TRUSTED_HOSTS)'))).toBe(true);
+    expect(lines.some((line) => /[█▀▄]/.test(line))).toBe(true);
+    // The one warning left in this configuration is the reach of a trusted authority.
+    expect(result.warnings.length).toBe(1);
+    expect(lines.some((line) => line.includes('agent-config editing'))).toBe(true);
   });
 });

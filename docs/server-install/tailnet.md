@@ -43,7 +43,9 @@ The catch: the loopback Host allowlist (the DNS-rebinding guard, #426) refuses a
    ```
 
    The banner prints the URL and a scannable QR code (`CEZ_NO_QR=1` silences it; a loopback-only
-   cockpit never prints one).
+   cockpit never prints one). An explicit `CEZ_PUBLIC_URL` prints the QR even when stdout is not a
+   terminal — captured logs and `--no-open` runs included — while a target inferred from
+   `--bind-host` still needs the interactive check.
 
 ## Security — read once
 
