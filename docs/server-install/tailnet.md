@@ -6,8 +6,8 @@ SSH-tunnelled proxy on the host) while the cockpit keeps running in **local mode
 home-file browsing and agent-config editing all stay available. `CEZ_REMOTE=1` is *not* used here.
 
 ```
-  phone ──tailnet──► tailscale serve (or a direct tailnet bind) ──► cezar on 127.0.0.1:4321
-                                                            (Host: <tailnet name>)
+  phone ──tailnet──► tailscale serve ──► cezar on 127.0.0.1:4321   (local mode)
+                                          (Host: <tailnet name>)
 ```
 
 The catch: the loopback Host allowlist (the DNS-rebinding guard, #426) refuses a request whose
@@ -15,37 +15,40 @@ The catch: the loopback Host allowlist (the DNS-rebinding guard, #426) refuses a
 
 ## Setup
 
-1. Front the cockpit. Either bind cezar to the tailnet address directly —
-
-   ```bash
-   CEZ_REMOTE=0 npx cezar-cli --bind-host 100.x.y.z
-   ```
-
-   — or keep it on loopback and let `tailscale serve` proxy to it:
+1. Keep cezar on loopback and let a front that runs *on this host* proxy to it:
 
    ```bash
    npx cezar-cli                        # stays on 127.0.0.1:4321
    sudo tailscale serve --bg --https=8445 http://127.0.0.1:4321
    ```
 
+   > **A direct `--bind-host 100.x.y.z` is a different mode, not a shortcut.** A non-loopback bind
+   > drops `localHandoff` (that is the documented hosted-mode switch), and hosted mode **skips the
+   > Host guard entirely** — so `CEZ_TRUSTED_HOSTS` is inert there and the local-mode promises below
+   > (handoff, home-file browsing, agent-config editing) no longer hold. If you want local mode, use
+   > the loopback + `tailscale serve` shape above; if you want the direct bind, you are in hosted
+   > mode and this page does not apply.
+
 2. Tell cezar which `Host` values are legitimate. The value must be exactly what the request
    carries — authority, port included when the URL has one:
 
    ```bash
-   CEZ_TRUSTED_HOSTS=zabawy.tailf8f3dd.ts.net:8445 npx cezar-cli
-   # several hosts: CEZ_TRUSTED_HOSTS=a.ts.net:8445,b.ts.net
+   CEZ_TRUSTED_HOSTS=my-node.example.ts.net:8445 npx cezar-cli
+   # several hosts: CEZ_TRUSTED_HOSTS=a.example.ts.net:8445,b.example.ts.net
    ```
 
 3. Point the terminal QR at that address so a phone can scan it:
 
    ```bash
-   CEZ_PUBLIC_URL=https://zabawy.tailf8f3dd.ts.net:8445/ npx cezar-cli
+   CEZ_PUBLIC_URL=https://my-node.example.ts.net:8445/ npx cezar-cli
    ```
 
    The banner prints the URL and a scannable QR code (`CEZ_NO_QR=1` silences it; a loopback-only
    cockpit never prints one). An explicit `CEZ_PUBLIC_URL` prints the QR even when stdout is not a
    terminal — captured logs and `--no-open` runs included — while a target inferred from
-   `--bind-host` still needs the interactive check.
+   `--bind-host` still needs the interactive check. The code is drawn with the terminal's foreground
+   colour for dark modules, which is right for a light profile and inverted on a dark one; phone
+   cameras read both, and a light terminal profile is the fallback if yours does not.
 
 ## Security — read once
 

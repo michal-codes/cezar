@@ -1,4 +1,5 @@
 import qrcode from 'qrcode-generator';
+import { isLoopbackHost } from '../server/capabilities.ts';
 
 /**
  * Renders `text` as a QR code a human can scan straight off the terminal, two
@@ -49,8 +50,20 @@ export function qrTargetUrl(opts: {
   if (publicUrl) return publicUrl;
   const bind = opts.bindHost?.trim();
   if (!bind) return null;
-  if (bind === 'localhost' || bind === '::1' || bind === '[::1]' || /^127\./.test(bind)) return null;
-  return `http://${bind}:${opts.port}`;
+  const unwrapped = bind.replace(/^\[|\]$/g, '');
+  // One definition of loopback, shared with the server: LOCALHOST, 127/8 and
+  // every spelling of ::1 all mean the local browser is one click away.
+  if (isLoopbackHost(unwrapped) || isLoopbackHost(`[${unwrapped}]`)) return null;
+  // The unspecified addresses name no host another device can reach.
+  if (unwrapped === '0.0.0.0' || unwrapped === '::') return null;
+  const host = unwrapped.includes(':') ? `[${unwrapped}]` : unwrapped;
+  const target = `http://${host}:${opts.port}`;
+  try {
+    new URL(target);
+  } catch {
+    return null;
+  }
+  return target;
 }
 
 /**
@@ -80,7 +93,13 @@ export function printCockpitQr(opts: {
   if (env.CEZ_NO_QR === '1' || env.CI) return null;
   log('');
   log(`  phone → ${target}`);
-  for (const line of qrLines(target)) log(`  ${line}`);
+  try {
+    for (const line of qrLines(target)) log(`  ${line}`);
+  } catch (err) {
+    // The encoder refuses payloads it cannot fit (~2.3 KB). That must never take
+    // the cockpit down — the URL line above is already the useful half.
+    log(`  (QR skipped: ${err instanceof Error ? err.message : String(err)})`);
+  }
   log('');
   return target;
 }
@@ -101,12 +120,16 @@ export function cockpitAccessWarnings(opts: {
   const publicUrl = opts.publicUrl?.trim();
   if (publicUrl) {
     let authority = '';
+    let host = '';
     try {
-      authority = new URL(publicUrl).host.toLowerCase();
+      const parsed = new URL(publicUrl);
+      authority = parsed.host.toLowerCase();
+      host = parsed.hostname.replace(/^\[|\]$/g, '');
     } catch {
       authority = '';
     }
-    if (!authority || !opts.trusted.has(authority)) {
+    const loopbackTarget = host !== '' && (isLoopbackHost(host) || isLoopbackHost(`[${host}]`));
+    if (!loopbackTarget && (!authority || !opts.trusted.has(authority))) {
       out.push(`CEZ_PUBLIC_URL (${publicUrl}) is not in CEZ_TRUSTED_HOSTS — a scan would hit the #426 host guard`);
     }
   }

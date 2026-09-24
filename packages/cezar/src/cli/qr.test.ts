@@ -19,9 +19,22 @@ describe('terminal QR for the cockpit address', () => {
     expect(
       qrTargetUrl({ publicUrl: 'https://host.ts.net:8445/', bindHost: '127.0.0.1', port: 4321 }),
     ).toBe('https://host.ts.net:8445/');
-    expect(qrTargetUrl({ bindHost: '100.95.163.12', port: 4321 })).toBe('http://100.95.163.12:4321');
+    expect(qrTargetUrl({ bindHost: '203.0.113.10', port: 4321 })).toBe('http://203.0.113.10:4321');
     expect(qrTargetUrl({ bindHost: '127.0.0.1', port: 4321 })).toBeNull();
+    expect(qrTargetUrl({ bindHost: 'LOCALHOST', port: 4321 })).toBeNull();
+    expect(qrTargetUrl({ bindHost: '0:0:0:0:0:0:0:1', port: 4321 })).toBeNull();
+    expect(qrTargetUrl({ bindHost: '0.0.0.0', port: 4321 })).toBeNull();
+    expect(qrTargetUrl({ bindHost: '::', port: 4321 })).toBeNull();
+    expect(qrTargetUrl({ bindHost: 'fd7a::1', port: 4321 })).toBe('http://[fd7a::1]:4321');
+    expect(qrTargetUrl({ bindHost: '[fd7a::1]', port: 4321 })).toBe('http://[fd7a::1]:4321');
     expect(qrTargetUrl({ port: 4321 })).toBeNull();
+  });
+
+  it('survives a payload the encoder refuses instead of taking the cockpit down', () => {
+    const lines: string[] = [];
+    const huge = `https://host.ts.net:8445/${'x'.repeat(4000)}`;
+    expect(printCockpitQr({ publicUrl: huge, port: 4321, env: {}, log: (line) => lines.push(line) })).toBe(huge);
+    expect(lines.some((line) => line.includes('QR skipped'))).toBe(true);
   });
 
   it('prints an explicit CEZ_PUBLIC_URL anywhere, an inferred target only on a TTY, and honours CEZ_NO_QR / CI', () => {
@@ -34,7 +47,7 @@ describe('terminal QR for the cockpit address', () => {
     expect(printCockpitQr({ ...base, tty: false, env: {} })).toBe('https://host.ts.net:8445/');
     lines.length = 0;
     // An inferred target (non-loopback --bind-host) still needs the interactive check.
-    expect(printCockpitQr({ bindHost: '100.95.163.12', port: 4321, tty: false, env: {}, log: (line: string) => lines.push(line) })).toBeNull();
+    expect(printCockpitQr({ bindHost: '203.0.113.10', port: 4321, tty: false, env: {}, log: (line: string) => lines.push(line) })).toBeNull();
     expect(printCockpitQr({ ...base, tty: true, env: { CEZ_NO_QR: '1' } })).toBeNull();
     expect(printCockpitQr({ ...base, tty: true, env: { CI: 'true' } })).toBeNull();
     expect(lines.length).toBe(0);
@@ -48,6 +61,9 @@ describe('terminal QR for the cockpit address', () => {
     const mismatch = cockpitAccessWarnings({ publicUrl: 'https://other.ts.net:8445/', trusted, hosted: false });
     expect(mismatch[0]).toContain('not in CEZ_TRUSTED_HOSTS');
     expect(cockpitAccessWarnings({ publicUrl: 'not a url', trusted, hosted: false })[0]).toContain('not in CEZ_TRUSTED_HOSTS');
+    // A loopback public URL is exactly what the guard admits: no false warning.
+    expect(cockpitAccessWarnings({ publicUrl: 'http://localhost:4321/', trusted: new Set(), hosted: false })).toEqual([]);
+    expect(cockpitAccessWarnings({ publicUrl: 'http://127.0.0.1:4321/', trusted: new Set(), hosted: false })).toEqual([]);
     // Hosted mode already admits any Host, and local handoff is off there: no warnings.
     expect(cockpitAccessWarnings({ publicUrl: 'https://other.ts.net/', trusted, hosted: true })).toEqual([]);
   });
@@ -58,8 +74,8 @@ describe('terminal QR for the cockpit address', () => {
     Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true });
     try {
       expect(
-        printCockpitQr({ bindHost: '100.95.163.12', port: 4321, env: {}, log: (line) => lines.push(line) }),
-      ).toBe('http://100.95.163.12:4321');
+        printCockpitQr({ bindHost: '203.0.113.10', port: 4321, env: {}, log: (line) => lines.push(line) }),
+      ).toBe('http://203.0.113.10:4321');
     } finally {
       if (original) Object.defineProperty(process.stdout, 'isTTY', original);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
