@@ -31,6 +31,9 @@ This spec adds one explicit, default-off knob: `CEZ_TRUSTED_HOSTS=host[:port],�
   local-mode affordances for reach. Right for a VPS, wrong for a private front.
 - **It is the smallest thing that makes the private-front case work** — and the QR handoff
   (below) becomes a two-line addition instead of a reason to build a client.
+- **The perimeter moves to the network, and this document says so.** A trusted authority keeps
+  `capabilities.localHandoff` true, so the local-only surfaces stay reachable — that is the point,
+  and it is also the risk. The assumptions below name exactly what the operator is trusting.
 
 ## Resolved assumptions
 
@@ -44,17 +47,26 @@ This spec adds one explicit, default-off knob: `CEZ_TRUSTED_HOSTS=host[:port],�
 | A6 | Observability | One boot log line naming the trusted hosts; `/api/v1/health` unchanged | Operators need to see it took effect. |
 | A7 | How the QR learns the phone's URL | `CEZ_PUBLIC_URL` names it explicitly; without it, a non-loopback `--bind-host` is used; a loopback cockpit prints nothing, and `CEZ_NO_QR=1` (or any CI) silences it | A proxy URL is not derivable from the bind address, and printing a QR for `localhost` is noise. |
 | A8 | QR encoder | `qrcode-generator` (MIT, zero runtime dependencies) for the module matrix, rendered as half-block text by our own ~30-line formatter | No vendored encoder to maintain and no dependency tree; the terminal formatter stays ours and unit-testable. |
+| A9 | What a trusted authority reaches | It is admitted by the two Host admission checks **only**. `capabilities.localHandoff` stays true, so anything able to reach that authority and present it also reaches the local-only surfaces: agent-config editing (`PUT /api/agent-config/:id` — the gate that closes a hooks-based RCE path), home-wide `GET /api/v1/fs/browse`, `GET /api/v1/launch-key`, and Origin-less writes/WS. The operator must restrict the authority to a private, device-authenticating network (tailnet ACL or equivalent `serve` restriction), never a Funnel/public front; the banner prints a boot warning naming those surfaces. | The one-line "keep the ACL tight" note in the docs page was not enough — the boundary belongs in the contract, where review can see it. |
+| A10 | Matching unit and parser contract | The request's **raw `Host` authority**, lowercased, compared exactly. An empty or unparseable entry never matches. `*` is not a wildcard — a literal that matches no authority. A scheme or path is tolerated only as input convenience (the pasted-URL case). IPv6 must be bracketed (`[fd7a::1]:8445`). An explicit default port (`host:443`) is a different authority from `host`. Trailing dots are not normalized. `X-Forwarded-Host` is never consulted. Matching is case-insensitive. | A1 named the unit but not its contract; each of these is a way to believe a host is trusted when it is not. |
+| A11 | QR URL rule | `CEZ_PUBLIC_URL` is an absolute URL and **only the URL is ever printed** — never the launch key or a query token. In local mode the printed authority must be in `CEZ_TRUSTED_HOSTS`; when it is not, the banner warns instead of handing the user a link that lands on the 403 this feature removes. | The QR exists to remove a manual step; a QR that leads to a refusal is worse than no QR. |
+| A12 | When the variables are read | Per request, memoized by raw value, exactly like `CEZ_REMOTE` — flipping `CEZ_TRUSTED_HOSTS` takes effect without a restart | Matches the existing capability semantics and keeps tests able to toggle it. |
 
 ## Proposed solution
 
-1. Parse `CEZ_TRUSTED_HOSTS` once at boot into a set of authorities; add
-   `isTrustedHostHeader(host, trusted)` beside `isLoopbackHostHeader`.
+1. Parse `CEZ_TRUSTED_HOSTS` into a set of authorities (read per request, memoized by raw value);
+   add `isTrustedHostHeader(host, trusted)`, which matches the request's **raw `Host` authority** —
+   not the port-stripped canonical name `isLoopbackHostHeader` receives.
 2. `/api/*` guard: accept loopback **or** trusted; keep the `Origin`-vs-`Host` comparison and the
    `Sec-Fetch-Site` belt-and-suspenders unchanged.
 3. `verifyWsUpgrade`: same addition; the existing `trusted` verdict logic is unchanged.
 4. CLI: print the address as a **QR code** in the terminal banner — `CEZ_PUBLIC_URL` when set,
    otherwise a non-loopback `--bind-host` — so the phone can scan it. Never printed for a loopback
-   address, silenced by `CEZ_NO_QR=1` or a CI environment.
+   address, silenced by `CEZ_NO_QR=1` or a CI environment. Authority-only URL (A11); a boot warning
+   when the target is not in `CEZ_TRUSTED_HOSTS`; the same commit carries the `.env.example` and
+   `docs/reference.md` rows the repo requires for new variables, and states the three things the
+   loopback guard keeps (bind unchanged, CORS unchanged, loopback-only fallbacks stay
+   loopback-only).
 5. Docs: a `docs/server-install/tailnet.md` page — the recipe (tailnet front, `tailscale serve` or
    a direct tailnet bind), the value for `CEZ_TRUSTED_HOSTS`, the QR handoff, and a security note
    that the private network now owns what the loopback guard used to.
@@ -68,12 +80,17 @@ layer of our own. Those are separate decisions.
 
 `npm run typecheck`, `npm test`, `npm run test:unit`, `npm run build`, `npm run test:package`, plus:
 
-- unit tests for the parser (empty, single, multi, port, IPv6, duplicates, whitespace);
-- guard tests: trusted Host accepted; unlisted Host refused; trusted Host with a foreign Origin
-  refused for writes;
+- unit tests for the parser (empty, single, multi, port, IPv6, duplicates, whitespace) plus the
+  negatives that must never match: an empty entry, `*`, a bare `host` against `host:8445`, a
+  trailing dot — and the case variant that must still match;
+- guard tests: trusted Host accepted; unlisted Host refused; an **unlisted private address** still
+  refused (the #426 case must not regress); trusted Host with a foreign Origin refused for writes;
+  a trusted Host with a **matching** Origin accepted for a write through a real route;
 - `verifyWsUpgrade` tests for the trusted-Host case, trusted vs untrusted verdict;
+- a hosted-mode regression: with `CEZ_REMOTE=1` the allowlist is irrelevant and behaviour is
+  unchanged;
 - a CLI test for the QR banner: printed for a non-loopback URL, absent for loopback, suppressed by
-  the opt-out;
+  the opt-out, plus the coherence warning when the target is not trusted;
 - a docs link from `docs/server-install/README.md`.
 
 ## Evidence from the field (2026-09-24)
