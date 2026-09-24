@@ -30,6 +30,8 @@ import {
   unavailableProviderMessage,
 } from './server/provider-action-gate.ts';
 import { checkForUpdate } from './update-check.ts';
+import { printCockpitQr } from './cli/qr.ts';
+import { trustedHosts } from './server/trusted-hosts.ts';
 import { printSkillsBanner } from './skills-banner.ts';
 import { initWorkspace } from './workspace/boot.ts';
 import { loadWorkspaceConfig } from './workspace/config.ts';
@@ -289,6 +291,11 @@ async function serveCommand(
   }
   if (port !== preferredPort) console.log(`  (port ${preferredPort} was busy — using ${port})`);
   console.log(`\n  cockpit → ${url}\n`);
+  const trusted = trustedHosts();
+  if (trusted.size > 0) {
+    console.log(`  trusted hosts (CEZ_TRUSTED_HOSTS) → ${[...trusted].join(', ')}\n`);
+  }
+  printCockpitQr({ publicUrl: process.env.CEZ_PUBLIC_URL, bindHost, port });
   // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
   await printSkillsBanner(repoRoot);
 

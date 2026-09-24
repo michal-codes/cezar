@@ -63,6 +63,21 @@ describe('host-header guard (DNS rebinding)', () => {
     expect(res.status).toBe(403);
   });
 
+  it('admits a Host named in CEZ_TRUSTED_HOSTS and keeps refusing everything else', async () => {
+    const saved = process.env.CEZ_TRUSTED_HOSTS;
+    process.env.CEZ_TRUSTED_HOSTS = 'cockpit.tailnet.ts.net:8445';
+    try {
+      expect((await request('cockpit.tailnet.ts.net:8445')).status).toBe(200);
+      expect((await request('cockpit.tailnet.ts.net:8445', '/api/v1/projects')).status).toBe(200);
+      // Documented semantics: matching is by authority, so a port-less Host is a different one.
+      expect((await request('cockpit.tailnet.ts.net')).status).toBe(403);
+      expect((await request('evil.tailnet.ts.net:8445')).status).toBe(403);
+    } finally {
+      if (saved === undefined) delete process.env.CEZ_TRUSTED_HOSTS;
+      else process.env.CEZ_TRUSTED_HOSTS = saved;
+    }
+  });
+
   it.each(['attacker.example', 'attacker.example:4321', 'cezar.attacker.example', '192.168.1.10:4321'])(
     'rejects the rebound host %s with 403 on every route',
     async (host) => {
