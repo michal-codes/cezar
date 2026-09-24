@@ -53,9 +53,13 @@ export function qrTargetUrl(opts: {
   return `http://${bind}:${opts.port}`;
 }
 
-/** Prints the QR (and its URL) when a target exists, we are on a TTY, and the
- *  operator has not silenced it (`CEZ_NO_QR=1`, or any CI). Returns the target
- *  it printed, or `null`. */
+/**
+ * Prints the QR (and its URL) when a target exists and the operator has not
+ * silenced it (`CEZ_NO_QR=1`, or any CI). A TTY is required only when the
+ * target was inferred from `--bind-host`: an explicitly set `CEZ_PUBLIC_URL`
+ * is an instruction to show it, so the QR also lands in a captured log or a
+ * `--no-open` run. Returns the target it printed, or `null`.
+ */
 export function printCockpitQr(opts: {
   publicUrl?: string | undefined;
   bindHost?: string | undefined;
@@ -68,7 +72,9 @@ export function printCockpitQr(opts: {
   const log = opts.log ?? console.log;
   const target = qrTargetUrl(opts);
   if (!target) return null;
-  if (!opts.tty || env.CEZ_NO_QR === '1' || env.CI) return null;
+  const explicit = Boolean(opts.publicUrl?.trim());
+  if (!explicit && !opts.tty) return null;
+  if (env.CEZ_NO_QR === '1' || env.CI) return null;
   log('');
   log(`  phone → ${target}`);
   for (const line of qrLines(target)) log(`  ${line}`);

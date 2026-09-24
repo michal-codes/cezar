@@ -295,7 +295,7 @@ async function serveCommand(
   if (trusted.size > 0) {
     console.log(`  trusted hosts (CEZ_TRUSTED_HOSTS) → ${[...trusted].join(', ')}\n`);
   }
-  printCockpitQr({ publicUrl: process.env.CEZ_PUBLIC_URL, bindHost, port });
+  printCockpitQr({ publicUrl: process.env.CEZ_PUBLIC_URL, bindHost, port, tty: Boolean(process.stdout.isTTY) });
   // Silenced by CEZ_NO_BANNER=1 or by dismissing the cockpit's banner (#391).
   await printSkillsBanner(repoRoot);
 
