@@ -26,6 +26,11 @@
     <img alt="PRs welcome!" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat" /></a>
 </p>
 
+<p align="center">
+  <a href="https://openmercatocloud.com/247agentic-cear" target="_blank" rel="noopener">
+    <img src="docs/screenshots/cloud-banner.svg" alt="Use cezar on a cloud sandbox for 24/7 coding. Start for free." width="720" /></a>
+</p>
+
 <div align="center">
   <a href="https://www.youtube.com/watch?v=nNLJm9gArnE" target="_blank" rel="noopener">
     <img src="docs/screenshots/video-thumbnail.jpg" alt="Meet Cezar, your new parallel coding tool (video)" width="720" />
@@ -162,3 +167,7 @@ npm run dev
 ## License
 
 **MIT** © Patryk Lewczuk. Full text in [LICENSE](LICENSE).
+
+## Jira and Linear
+
+Connect a project issue tracker in Settings to browse issues, launch workflows and configure event automations. See [setup, permissions and recovery](docs/issue-trackers.md).
