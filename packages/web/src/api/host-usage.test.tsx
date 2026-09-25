@@ -444,6 +444,19 @@ describe('createHostUsageStore', () => {
     expect(store.get().history).toHaveLength(0)
   })
 
+  it('records a refused topic until a fresh mount, and a late frame never clears it', () => {
+    const store = createHostUsageStore()
+    expect(store.get().topicUnavailable).toBeUndefined()
+    store.markTopicUnavailable()
+    expect(store.get().topicUnavailable).toBe(true)
+    // A route-fallback sample arriving afterwards is a different fact about the same origin: the
+    // refusal stands until the store is recreated (a fresh mount re-subscribes).
+    store.push(point('2026-09-20T00:00:00.000Z'), 1_000, 'route')
+    expect(store.get().topicUnavailable).toBe(true)
+    store.reset()
+    expect(store.get().topicUnavailable).toBeUndefined()
+  })
+
   it('rings the EFFECTIVE percentage, so the line under a number is the same quantity', () => {
     const store = createHostUsageStore()
     // A sandboxed sample: 31 % host-wide, 50 % of the two effective cores.

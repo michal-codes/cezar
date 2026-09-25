@@ -284,4 +284,37 @@ describe('host sampler', () => {
   it('keeps the stale bound at three sampling intervals', () => {
     expect(HOST_SAMPLE_STALE_MS).toBe(3 * HOST_SAMPLE_INTERVAL_MS);
   });
+
+  it('survives a throwing tick: the interval keeps going and the next read publishes', () => {
+    vi.useFakeTimers();
+    const probe = cpuTimesProbe();
+    let calls = 0;
+    const sampler = createHostSampler({
+      cpuTimes: () => {
+        calls += 1;
+        // The prime (1) is fine; the first timer tick (2) throws - a /proc file that vanished
+        // mid-read, a probe that hiccuped. Before the fix that exception escaped the timer
+        // callback and took the whole cockpit down.
+        if (calls === 2) throw new Error('boom');
+        return probe.source();
+      },
+      readMeminfo: () => undefined,
+      now: () => Date.now(),
+    });
+    const listener = vi.fn();
+    const stop = sampler.onHostUsage(listener);
+
+    probe.advance({ idle: 600, busy: 400 });
+    expect(() => vi.advanceTimersByTime(HOST_SAMPLE_INTERVAL_MS)).not.toThrow();
+    expect(listener).not.toHaveBeenCalled();
+
+    // The next tick re-reads and publishes a real delta (two intervals of 40 % busy).
+    probe.advance({ idle: 600, busy: 400 });
+    vi.advanceTimersByTime(HOST_SAMPLE_INTERVAL_MS);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener.mock.calls[0]?.[0]).toMatchObject({ cpuPct: 40 });
+
+    stop();
+    sampler.dispose();
+  });
 });

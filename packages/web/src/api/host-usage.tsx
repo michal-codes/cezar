@@ -105,6 +105,12 @@ export interface HostUsageState {
   /** Client receipt stamp of the latest sample — the widget's `stale` clock. */
   lastFrameAt?: number
   history: HostUsagePoint[]
+  /**
+   * The hub REFUSED the `host` topic for this origin (`{"type":"error","topic":"host"}`, the ws
+   * upgrade guard's trust rule) rather than staying quiet. The card must say what happened and
+   * read the authenticated route instead of showing `sampling…` forever.
+   */
+  topicUnavailable?: boolean
 }
 
 export interface HostUsageStore {
@@ -113,6 +119,8 @@ export interface HostUsageStore {
    *  pushes, and a selector then only re-renders the component whose slice changed. */
   get(): HostUsageState
   push(sample: HostUsage, receivedAt: number, writer: HostUsageWriter): void
+  /** The hub refused this origin's `host` subscription - see `HostUsageState.topicUnavailable`. */
+  markTopicUnavailable(): void
   /** For tests: forget every sample and the writer, as a fresh mount would. */
   reset(): void
 }
@@ -179,7 +187,19 @@ export function createHostUsageStore(): HostUsageStore {
             -HOST_HISTORY_LENGTH,
           )
         : base
-      state = { latest: sample, lastFrameAt: receivedAt, history }
+      state = {
+        latest: sample,
+        lastFrameAt: receivedAt,
+        history,
+        // A refusal is a fact about the ORIGIN, not about one sample: the route-fallback pushes
+        // (the very path the refusal switches on) must not clear it.
+        ...(previous.topicUnavailable === true ? { topicUnavailable: true } : {}),
+      }
+      for (const listener of listeners) listener()
+    },
+    markTopicUnavailable() {
+      if (state.topicUnavailable === true) return
+      state = { ...state, topicUnavailable: true }
       for (const listener of listeners) listener()
     },
     reset() {
@@ -253,6 +273,19 @@ export function useHostLastFrameAt(): number | undefined {
 }
 
 /**
+ * Whether this cockpit's `host` subscription was REFUSED by the hub (trust rule, not a quiet
+ * socket). The card uses it to stop claiming `live` and to explain the fallback.
+ */
+export function useHostTopicUnavailable(): boolean {
+  const store = useContext(HostUsageContext)
+  return useSyncExternalStore(
+    store ? store.subscribe : noopSubscribe,
+    () => store?.get().topicUnavailable === true,
+    () => false,
+  )
+}
+
+/**
  * The age of the MEASUREMENT, ticking once every second while a reader is mounted.
  *
  * `sampledAt` is the server's own stamp for the sample, so an answer served from the sampler's
@@ -294,10 +327,18 @@ function useHostFrames(writer: HostUsageWriter, enabled: boolean): void {
 
   useEffect(() => {
     if (!store || !enabled || transport !== 'local') return
-    return subscribeTopic('host', (data) => {
-      const parsed = hostUsageSchema.safeParse(data)
-      if (parsed.success) store.push(parsed.data, Date.now(), writer)
-    })
+    return subscribeTopic(
+      'host',
+      (data) => {
+        const parsed = hostUsageSchema.safeParse(data)
+        if (parsed.success) store.push(parsed.data, Date.now(), writer)
+      },
+      // A refused subscription answers with `{type:'error', topic:'host'}` and then silence. That
+      // is not `sampling…`: record it, so the card can name the reason and fall back to the
+      // authenticated route (a dev-server proxy whose page origin differs from the server's
+      // authority is the known case - the hub's trust rule is same-origin by design).
+      () => store.markTopicUnavailable(),
+    )
   }, [store, enabled, transport, writer])
 }
 
@@ -332,10 +373,13 @@ export function useHostUsageSubscription(options: { enabled?: boolean } = {}): v
 export function useHostUsageRoute() {
   const store = useContext(HostUsageContext)
   const transport = useHostTransport()
+  const topicUnavailable = useHostTopicUnavailable()
   const query = useQuery({
     queryKey: workspaceQueryKeys.hostUsage,
     queryFn: ({ signal }) => readWorkspaceHostUsage(signal),
-    enabled: transport === 'remote',
+    // Remote cockpits read the route by design; a LOCAL cockpit whose `host` topic the hub refused
+    // falls back to the same authenticated same-origin read instead of an eternal `sampling…`.
+    enabled: transport === 'remote' || topicUnavailable,
     staleTime: 0,
     retry: false,
   })

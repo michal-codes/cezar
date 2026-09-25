@@ -544,7 +544,12 @@ evidence that it is not.
 desktop the topic is held for the session, because the sidebar glance is always
 there; the sidebar's machine row carries the staleness clock (`stale` after ~10 s
 without a frame). A remote cockpit never opens a socket and keeps reading the
-route.
+route. The `host` topic is **trusted-only**: the hub admits a socket whose page
+origin matches the server's authority, and refuses the subscription (`forbidden
+topic`) for anything else - a dev server proxying a `localhost` page to
+`127.0.0.1` without `Sec-Fetch-Site: same-origin` is the common case. The card
+says so and falls back to the authenticated same-origin route instead of showing
+`sampling…` forever.
 
 ### Editing the agents' own config (Settings → Agent config)
 

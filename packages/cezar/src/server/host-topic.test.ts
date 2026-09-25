@@ -24,6 +24,11 @@ function stubHub() {
   const hub: SocketHub = {
     registerTopic: (name, publisher, options) => {
       topics.set(name, { publisher, options });
+      // `registerTopic` returns an idempotent disposer on main (dynamic topics); the stub has to
+      // match the interface or the whole server typecheck fails.
+      return () => {
+        topics.delete(name);
+      };
     },
     attach: () => undefined,
     close: () => undefined,

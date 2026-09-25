@@ -1,6 +1,7 @@
 import {
   useHostHistory,
   useHostSampleAgeSeconds,
+  useHostTopicUnavailable,
   useHostTransport,
   useHostUsage,
   useHostUsageRoute,
@@ -45,6 +46,7 @@ const clampPct = (value: number): number => Math.min(100, Math.max(0, value))
 export function MachineCard() {
   useHostUsageSubscription({ enabled: !useIsDesktop() })
   const transport = useHostTransport()
+  const topicUnavailable = useHostTopicUnavailable()
   const { isError } = useHostUsageRoute()
   const sample = useHostUsage()
   const history = useHostHistory()
@@ -53,6 +55,9 @@ export function MachineCard() {
   const view = sample === undefined ? undefined : effectiveHostView(sample)
   const cpuPct = view?.cpuPct
   const local = transport === 'local'
+  // `live` is the transport AND the hub's answer: a refused `host` subscription is not live, it is
+  // a fallback route read, and the header has to say so.
+  const live = local && !topicUnavailable
   const memTotal = view?.memTotalBytes ?? 0
   const usedPct =
     view?.memUsedBytes !== undefined && memTotal > 0
@@ -103,12 +108,12 @@ export function MachineCard() {
       className="rounded-xl border border-border bg-card/60 p-4"
     >
       <header className="flex min-w-0 items-center gap-2">
-        <StatusDot tone={local ? 'success' : 'neutral'} pulse={local} />
+        <StatusDot tone={live ? 'success' : 'neutral'} pulse={live} />
         <h2 id="machine-card-title" className="text-sm font-semibold">
           Machine
         </h2>
         <span data-slot="machine-card-mode" className="text-[11px] text-soft-foreground">
-          {local ? 'live' : 'last known'}
+          {live ? 'live' : 'last known'}
         </span>
         <span
           data-slot="machine-card-freshness"
@@ -121,6 +126,13 @@ export function MachineCard() {
       {view?.hasContainer === true ? (
         <p data-slot="machine-card-limits" className="mt-2 text-[11.5px] text-soft-foreground">
           cgroup limits detected · {view.source}
+        </p>
+      ) : null}
+
+      {topicUnavailable ? (
+        <p data-slot="machine-card-transport" className="mt-2 text-[11.5px] text-soft-foreground">
+          Live updates unavailable - the server refused this origin's host topic, so the card reads
+          the authenticated route instead.
         </p>
       ) : null}
 

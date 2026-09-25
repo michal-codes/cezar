@@ -76,6 +76,13 @@ class FakeSocket {
     this.fire('message', { data: JSON.stringify({ type: 'event', topic, data }) })
   }
 
+  /** The hub's refusal for a topic this origin is not trusted for: an error frame, then silence. */
+  refuse(topic: string): void {
+    this.fire('message', {
+      data: JSON.stringify({ type: 'error', topic, error: 'forbidden topic' }),
+    })
+  }
+
   private fire(name: string, event: unknown): void {
     for (const handler of this.handlers.get(name) ?? []) handler(event)
   }
@@ -428,5 +435,24 @@ describe('MachineCard — review fixes (freshness basis, cache read, swap pair)'
     // The pair is both-or-neither by construction; a partial producer must not print `Swap  / 8 GB`.
     expect(document.querySelector('[data-slot="machine-card-swap"]')).toBeNull()
     expect(screen.queryByText(/8\.0 GB/)).toBeNull()
+  })
+
+  it('falls back to the authenticated route when the hub refuses the host topic', async () => {
+    // The dev-proxy/macOS case: the socket opens, `host` answers with an error frame and then
+    // silence. Before this fix the card claimed `live` and sat on `sampling…` forever; now it
+    // names the refusal and reads the authenticated same-origin route instead.
+    serve(HEALTH, sample({ cpuPct: 21 }))
+    render(<MachineCard />, { wrapper: wrapper() })
+
+    const socket = await subscribedSocket()
+    act(() => {
+      socket.refuse('host')
+    })
+
+    await waitFor(() => expect(screen.getByText(/Live updates unavailable/)).toBeTruthy())
+    expect(screen.getByText('last known')).toBeTruthy()
+    // The route read fills the same store, so real values arrive instead of `sampling…`.
+    await waitFor(() => expect(screen.getByText('21%')).toBeTruthy())
+    expect(document.querySelector('[data-slot="machine-card-cpu-sparkline"]')).toBeNull()
   })
 })

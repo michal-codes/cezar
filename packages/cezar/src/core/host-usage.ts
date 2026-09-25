@@ -354,8 +354,22 @@ export function createHostSampler(options: HostSamplerOptions = {}): HostSampler
         const facts = probe();
         if (facts?.cpuUsageUs !== undefined) previousCgroupUsage = { cpuUsageUs: facts.cpuUsageUs, at: now() };
         timer = setInterval(() => {
-          const sample = takeSample(true);
-          for (const current of [...listeners]) current(sample);
+          let sample: HostUsage;
+          try {
+            sample = takeSample(true);
+          } catch {
+            // One bad read (a /proc file that vanished mid-tick, a probe that threw) must not kill
+            // the interval: a cockpit that dies because telemetry hiccuped is worse than a gap,
+            // and the next tick re-reads everything from scratch.
+            return;
+          }
+          for (const current of [...listeners]) {
+            try {
+              current(sample);
+            } catch {
+              // A throwing listener is that listener's problem; the sampler keeps publishing.
+            }
+          }
         }, HOST_SAMPLE_INTERVAL_MS);
         timer.unref?.();
       }
