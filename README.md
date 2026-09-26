@@ -1,4 +1,9 @@
+<details>
+<summary>🌐 Language: English · 简体中文 · 繁體中文</summary>
+
 English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
+
+</details>
 
 <div align="center">
   <h1>Cezar - orchestrate hundreds of AI coding agents, 24/7.</h1>

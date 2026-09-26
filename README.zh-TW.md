@@ -1,4 +1,9 @@
+<details>
+<summary>🌐 語言：English · 简体中文 · 繁體中文</summary>
+
 [English](README.md) | [简体中文](README.zh-CN.md) | 繁體中文
+
+</details>
 
 <div align="center">
   <h1>cezar ⚡</h1>
