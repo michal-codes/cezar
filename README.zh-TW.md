@@ -1,12 +1,5 @@
-<details>
-<summary>🌐 語言：English · 简体中文 · 繁體中文</summary>
-
-[English](README.md) | [简体中文](README.zh-CN.md) | 繁體中文
-
-</details>
-
 <div align="center">
-  <h1>cezar ⚡</h1>
+  <h1>Cezar：協調數百個 AI 編碼代理，全天候 24/7。</h1>
 </div>
 
 <h4 align="center">
@@ -16,10 +9,17 @@
   <a href="https://github.com/open-mercato/cezar/issues">問題回報</a>
 </h4>
 
+<p align="center">
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a> | 繁體中文
+</p>
+
+> 本文譯自 README.md @ 33aee0ee；如有出入，以英文版為準。
+
 <div align="center">
   <h2>
-    直接在你的儲存庫裡平行執行編碼代理。<br />
-    在本機執行，零設定，不需要帳號。
+    一個面向 Claude Code、Codex、OpenCode 及其他編碼代理的控制台。<br />
+    在本機或 VPS 上執行代理，自動化多步驟工作流程，<br />
+    並讓它們在你離開時繼續工作。
   </h2>
 </div>
 

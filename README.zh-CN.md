@@ -1,12 +1,5 @@
-<details>
-<summary>🌐 语言：English · 简体中文 · 繁體中文</summary>
-
-[English](README.md) | 简体中文 | [繁體中文](README.zh-TW.md)
-
-</details>
-
 <div align="center">
-  <h1>cezar ⚡</h1>
+  <h1>Cezar：编排数百个 AI 编程智能体，7×24 小时不间断。</h1>
 </div>
 
 <h4 align="center">
@@ -16,10 +9,17 @@
   <a href="https://github.com/open-mercato/cezar/issues">问题反馈</a>
 </h4>
 
+<p align="center">
+  <a href="README.md">English</a> | 简体中文 | <a href="README.zh-TW.md">繁體中文</a>
+</p>
+
+> 本文译自 README.md @ 33aee0ee；如有出入，以英文版为准。
+
 <div align="center">
   <h2>
-    直接在你的仓库里并行运行编程智能体。<br />
-    本地运行，零配置，无需账号。
+    一个面向 Claude Code、Codex、OpenCode 及其他编程智能体的控制台。<br />
+    在本地或 VPS 上运行智能体，自动化多步骤工作流，<br />
+    并让它们在你离开时继续工作。
   </h2>
 </div>
 

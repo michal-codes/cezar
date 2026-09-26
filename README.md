@@ -1,10 +1,3 @@
-<details>
-<summary>🌐 Language: English · 简体中文 · 繁體中文</summary>
-
-English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
-
-</details>
-
 <div align="center">
   <h1>Cezar - orchestrate hundreds of AI coding agents, 24/7.</h1>
 </div>
@@ -15,6 +8,10 @@ English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
   <a href="docs/reference.md">Docs</a>&nbsp;·
   <a href="https://github.com/open-mercato/cezar/issues">Issues</a>
 </h4>
+
+<p align="center">
+  English | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a>
+</p>
 
 <div align="center">
   <h2>
