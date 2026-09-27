@@ -41,13 +41,46 @@ export function qrLines(text: string): string[] {
  * `--bind-host` is addressable on its own. A loopback cockpit gets no QR: the
  * local browser is already one click away.
  */
+/**
+ * A11: the target is printed to the terminal and encoded into the QR frame, so
+ * it must never carry credentials or a query token. An operator pasting
+ * `https://user:pass@host/` would otherwise put a password into the scrollback
+ * and into a picture; `?token=…` gets the same treatment because the spec
+ * promises the URL is the only thing ever printed, never a token. Both are
+ * stripped from the target itself, and `cockpitAccessWarnings` names the strip.
+ * A value that will not parse as a URL is returned untouched — it cannot carry
+ * a parsed credential, and the trust warning already names it.
+ */
+function sanitizePublicUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
+
+/** True when the raw value carries something the banner must not print. */
+function publicUrlCarriesSecrets(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    return Boolean(url.username || url.password || url.search || url.hash);
+  } catch {
+    return false;
+  }
+}
+
 export function qrTargetUrl(opts: {
   publicUrl?: string | undefined;
   bindHost?: string | undefined;
   port: number;
 }): string | null {
   const publicUrl = opts.publicUrl?.trim();
-  if (publicUrl) return publicUrl;
+  if (publicUrl) return sanitizePublicUrl(publicUrl);
   const bind = opts.bindHost?.trim();
   if (!bind) return null;
   const unwrapped = bind.replace(/^\[|\]$/g, '');
@@ -119,10 +152,16 @@ export function cockpitAccessWarnings(opts: {
   if (opts.hosted) return out;
   const publicUrl = opts.publicUrl?.trim();
   if (publicUrl) {
+    const printed = sanitizePublicUrl(publicUrl);
+    if (publicUrlCarriesSecrets(publicUrl)) {
+      out.push(
+        'CEZ_PUBLIC_URL carries credentials or a query string — they are stripped from the printed URL and the QR',
+      );
+    }
     let authority = '';
     let host = '';
     try {
-      const parsed = new URL(publicUrl);
+      const parsed = new URL(printed);
       authority = parsed.host.toLowerCase();
       host = parsed.hostname.replace(/^\[|\]$/g, '');
     } catch {
@@ -130,12 +169,12 @@ export function cockpitAccessWarnings(opts: {
     }
     const loopbackTarget = host !== '' && (isLoopbackHost(host) || isLoopbackHost(`[${host}]`));
     if (!loopbackTarget && (!authority || !opts.trusted.has(authority))) {
-      out.push(`CEZ_PUBLIC_URL (${publicUrl}) is not in CEZ_TRUSTED_HOSTS — a scan would hit the #426 host guard`);
+      out.push(`CEZ_PUBLIC_URL (${printed}) is not in CEZ_TRUSTED_HOSTS — a scan would hit the #426 host guard`);
     }
   }
   if (opts.trusted.size > 0) {
     out.push(
-      `CEZ_TRUSTED_HOSTS is on: ${[...opts.trusted].join(', ')} also reaches agent-config editing, home-wide fs browse and the launch key — keep it on a private network, never a public front`,
+      `CEZ_TRUSTED_HOSTS is on: ${[...opts.trusted].join(', ')} also reaches agent-config editing, home-wide fs browse, the launch key and Origin-less writes/WS — keep it on a private network, never a public front`,
     );
   }
   return out;

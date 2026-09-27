@@ -30,6 +30,33 @@ describe('terminal QR for the cockpit address', () => {
     expect(qrTargetUrl({ port: 4321 })).toBeNull();
   });
 
+  it('strips credentials and query tokens before printing or encoding the target (A11)', () => {
+    expect(qrTargetUrl({ publicUrl: 'https://user:pass@host.ts.net:8445/', port: 4321 })).toBe(
+      'https://host.ts.net:8445/',
+    );
+    expect(qrTargetUrl({ publicUrl: 'https://host.ts.net:8445/?token=secret#frag', port: 4321 })).toBe(
+      'https://host.ts.net:8445/',
+    );
+    const lines: string[] = [];
+    const printed = printCockpitQr({
+      publicUrl: 'https://user:pass@host.ts.net:8445/',
+      port: 4321,
+      env: {},
+      tty: false,
+      log: (line) => lines.push(line),
+    });
+    expect(printed).toBe('https://host.ts.net:8445/');
+    expect(lines.join('\n')).not.toContain('pass');
+    const warnings = cockpitAccessWarnings({
+      publicUrl: 'https://user:pass@other.ts.net:8445/?token=secret',
+      trusted: new Set(['other.ts.net:8445']),
+      hosted: false,
+    });
+    expect(warnings.some((line) => line.includes('credentials or a query string'))).toBe(true);
+    expect(warnings.join('\n')).not.toContain('pass');
+    expect(warnings.join('\n')).not.toContain('token=secret');
+  });
+
   it('survives a payload the encoder refuses instead of taking the cockpit down', () => {
     const lines: string[] = [];
     const huge = `https://host.ts.net:8445/${'x'.repeat(4000)}`;
