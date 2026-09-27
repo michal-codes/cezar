@@ -1,5 +1,5 @@
 <div align="center">
-  <h1>cezar ⚡</h1>
+  <h1>Cezar - orchestrate hundreds of AI coding agents, 24/7.</h1>
 </div>
 
 <h4 align="center">
@@ -9,10 +9,15 @@
   <a href="https://github.com/open-mercato/cezar/issues">Issues</a>
 </h4>
 
+<p align="center">
+  English | <a href="README.zh-CN.md">简体中文</a> | <a href="README.zh-TW.md">繁體中文</a>
+</p>
+
 <div align="center">
   <h2>
-    Run coding agents in parallel, right in your repo.<br />
-    Local, zero config, no accounts.
+    One control center for Claude Code, Codex, OpenCode and other coding agents.<br />
+    Run agents locally or on a VPS, automate multi-step workflows,<br />
+    and let them keep working while you're away.
   </h2>
 </div>
 
@@ -98,23 +103,23 @@ You need **Node 20+** and at least one agent CLI you're logged into:
 
 ```bash
 cd your-repo
-npx cezar-cli
+npx cezar-run
 ```
 
-This opens the cockpit at `http://localhost:4321`. Type a task, pick a workflow, then hit **Start**.
+This opens the cockpit at `http://localhost:4321`. Type a task, pick a workflow, then hit **Start**. `npx cezar-cli` still works too — it's the same package under its older name.
 
 ```bash
-npx cezar-cli run "add a --json flag to the export command"   # headless, no browser
-npx cezar-cli init                                            # scaffold .ai/cezar/
-npx cezar-cli@nightly                                         # try tonight's build
+npx cezar-run run "add a --json flag to the export command"   # headless, no browser
+npx cezar-run init                                            # scaffold .ai/cezar/
+npx cezar-run@nightly                                         # try tonight's build
 ```
 
-> Just want to look around? Run `CEZ_DRY_RUN=1 npx cezar-cli`. It uses a built-in mock agent, so you don't need to log in.
+> Just want to look around? Run `CEZ_DRY_RUN=1 npx cezar-run`. It uses a built-in mock agent, so you don't need to log in.
 
 ### Run it on a server
 
 ```bash
-npx cezar-cli server-install --platform ubuntu-vps
+npx cezar-run server-install --platform ubuntu-vps
 ```
 
 This sets up HTTPS, a login and a system service, so you can open the cockpit from anywhere, including your phone.
@@ -167,3 +172,7 @@ npm run dev
 ## License
 
 **MIT** © Patryk Lewczuk. Full text in [LICENSE](LICENSE).
+
+## Jira and Linear
+
+Connect a project issue tracker in Settings to browse issues, launch workflows and configure event automations. See [setup, permissions and recovery](docs/issue-trackers.md).
