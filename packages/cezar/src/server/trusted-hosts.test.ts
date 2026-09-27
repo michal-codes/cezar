@@ -21,9 +21,22 @@ describe('CEZ_TRUSTED_HOSTS', () => {
     expect(isTrustedHostHeader('', trusted)).toBe(false);
     expect(isTrustedHostHeader('host.ts.net.', trusted)).toBe(false); // trailing dot is a different authority
     const wildcard = parseTrustedHosts('*');
+    expect([...wildcard]).toEqual([]); // '*' is not an authority: the entry is dropped, not matched literally
     expect(isTrustedHostHeader('anything.example', wildcard)).toBe(false);
+    expect(isTrustedHostHeader('*', wildcard)).toBe(false);
     const portStrict = parseTrustedHosts('host.ts.net:8445');
     expect(isTrustedHostHeader('host.ts.net:443', portStrict)).toBe(false);
+  });
+
+  it('drops entries that are not an authority, keeping the valid ones', () => {
+    expect([...parseTrustedHosts('*, *.example.com, bad host, good.example')]).toEqual(['good.example']);
+    expect([...parseTrustedHosts('*')]).toEqual([]);
+    expect([...parseTrustedHosts('host.ts.net.')]).toEqual([]); // a rooted FQDN entry is not the authority it resembles
+    expect([...parseTrustedHosts('[fd7a::1]:8443, 10.0.0.7:80, name-with-dash.ts.net')].sort()).toEqual([
+      '10.0.0.7:80',
+      '[fd7a::1]:8443',
+      'name-with-dash.ts.net',
+    ]);
   });
 
   it('matches a Host by authority, case-insensitively, never partially', () => {

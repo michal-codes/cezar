@@ -28,8 +28,18 @@
  *
  * Matching is by authority (`host[:port]`, lowercased), the same unit
  * `authorityOfHost` compares: a port-less entry matches only a port-less
- * `Host`. There is deliberately no wildcard and no "trust everything" value.
+ * `Host`. There is deliberately no wildcard and no "trust everything" value:
+ * an entry that is not an authority (`*`, `*.example.com`, a mistyped name) is
+ * ignored exactly like an empty one, so `CEZ_TRUSTED_HOSTS=*` trusts nothing.
  */
+
+/**
+ * The only shapes an authority may take: a DNS name or a bracketed IPv6
+ * literal, optionally with a port. Anything else is a typo or an attempt to
+ * smuggle in a wildcard, and is dropped below.
+ */
+const AUTHORITY_RE =
+  /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*|\[[0-9a-f:.]+\])(?::\d{1,5})?$/;
 
 /** Parses the comma-separated value; tolerates a pasted URL per entry. */
 export function parseTrustedHosts(raw: string | undefined): Set<string> {
@@ -45,7 +55,7 @@ export function parseTrustedHosts(raw: string | undefined): Set<string> {
       }
     }
     value = value.replace(/\/+$/, '');
-    if (value) out.add(value);
+    if (value && AUTHORITY_RE.test(value)) out.add(value);
   }
   return out;
 }
