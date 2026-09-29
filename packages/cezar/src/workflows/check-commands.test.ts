@@ -573,6 +573,279 @@ describe('check-commands — the command policy resolver', () => {
       expect(commandInvokesMake('npm run make-stuff')).toBe(false);
     });
   });
+
+  describe('the npm-run closure — a stub is not a body (F1)', () => {
+    it('refuses when the candidate neuters a script an inner npm run delegates to — the reviewer’s probe', () => {
+      const manifest = (inner: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: 'npm run inner', inner }),
+      });
+      baseSha = freeze(dir, manifest('vitest run'));
+      candidate(dir, manifest('echo "all good"'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.changedVsBase).toBe(true);
+      expect(commands(resolution)).toEqual([]);
+      expect(resolution.diff).toContain('@@ script:inner @@');
+      expect(resolution.diff).toContain('- vitest run');
+      expect(resolution.diff).toContain('+ echo "all good"');
+    });
+
+    it('refuses when the candidate neuters the tail of a compound command', () => {
+      const manifest = (typecheck: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run lint && npm run typecheck']),
+        'package.json': pkg({ lint: 'eslint .', typecheck }),
+      });
+      baseSha = freeze(dir, manifest('tsc --noEmit'));
+      candidate(dir, manifest('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:typecheck @@');
+      expect(resolution.diff).toContain('+ exit 0');
+    });
+
+    it('pins a sub-script two npm runs deep, and the pre*/post* hooks of the whole chain', () => {
+      const manifest = (hook: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: 'npm run inner', inner: 'npm run deep', deep: 'node deep.js', predeep: hook }),
+      });
+      baseSha = freeze(dir, manifest('node pre-deep.js'));
+      candidate(dir, manifest('node pre-deep-moved.js'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:predeep @@');
+      expect(resolution.diff).toContain('+ node pre-deep-moved.js');
+    });
+
+    it('pins a local script file the argv names — a moved file is drift', () => {
+      const manifest = (body: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['./scripts/gate.sh']),
+        'package.json': pkg({}),
+        'scripts/gate.sh': `#!/bin/sh\n${body}\n`,
+      });
+      baseSha = freeze(dir, manifest('npm run typecheck'));
+      candidate(dir, manifest('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ file:scripts/gate.sh @@');
+      expect(resolution.diff).toContain('+ exit 0');
+    });
+
+    it('pins a local script file named in argv as an interpreter argument', () => {
+      const manifest = (body: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['sh ./scripts/gate.sh']),
+        'package.json': pkg({}),
+        'scripts/gate.sh': `#!/bin/sh\n${body}\n`,
+      });
+      baseSha = freeze(dir, manifest('npm run build'));
+      candidate(dir, manifest('true'));
+
+      expect(resolve(dir, baseSha).reason).toBe('commands-changed-vs-base');
+    });
+
+    it('terminates on an npm-run cycle and still pins every body in it', () => {
+      const manifest = (b: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run a']),
+        'package.json': pkg({ a: 'npm run b', b }),
+      });
+      baseSha = freeze(dir, manifest('npm run a'));
+      candidate(dir, manifest('echo ok'));
+
+      expect(resolve(dir, baseSha).status).toBe('nothing-to-check');
+      expect(resolve(dir, baseSha).reason).toBe('commands-changed-vs-base');
+      expect(resolve(dir, baseSha).diff).toContain('@@ script:b @@');
+    });
+
+    it('records a dynamic npm-run reference as not pinned instead of guessing a name', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: 'npm run "$TARGET"' }),
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('dynamic npm-run reference');
+      expect(notes(resolution)).toContain('$TARGET');
+      expect(notes(resolution)).toContain('not pinned');
+    });
+
+    it('bounds the npm-run chain and records what the bound left unpinned', () => {
+      const scripts: Record<string, string> = {};
+      for (let hop = 0; hop < 20; hop += 1) scripts[`s${hop}`] = `npm run s${hop + 1}`;
+      scripts['s20'] = 'node end.js';
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm run s0']),
+        'package.json': pkg(scripts),
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('npm-run chain');
+      expect(notes(resolution)).toContain('not pinned');
+    });
+
+    it('records a workspace delegation as a manifest this resolver does not pin', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm run build:server']),
+        'package.json': pkg({ 'build:server': 'npm run build -w @open-mercato/cezar' }),
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('@open-mercato/cezar');
+      expect(notes(resolution)).toContain('workspace');
+      expect(notes(resolution)).toContain('not pinned');
+    });
+  });
+
+  describe('the install lifecycle — npm 11’s full set (F2)', () => {
+    for (const hook of ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare']) {
+      it(`pins the lifecycle hook the install step runs: ${hook}`, () => {
+        const withHook = (body: string): Record<string, string> => ({
+          '.ai/agentic.config.json': config(['npm test']),
+          'package.json': pkg({ test: 'node t.js', [hook]: body }),
+          [PACKAGE_LOCK_PATH]: '{}\n',
+        });
+        baseSha = freeze(dir, withHook('node hook.js'));
+        candidate(dir, withHook('node hook-moved.js'));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.reason).toBe('commands-changed-vs-base');
+        expect(resolution.diff).toContain(`@@ script:${hook} @@`);
+        expect(resolution.diff).toContain('+ node hook-moved.js');
+      });
+    }
+  });
+
+  describe('base reads that are not absence (F3)', () => {
+    /** A narrow view of the mocked execFileSync, enough to inject one failure mode. */
+    type ExecMock = {
+      getMockImplementation(): ((...args: unknown[]) => unknown) | undefined;
+      mockImplementation(fn: (program: string, args: string[], options?: unknown) => unknown): void;
+    };
+    const execMock = (): ExecMock => vi.mocked(execFileSync) as unknown as ExecMock;
+
+    const failRead = (path: string, code: string, status: number | null): (() => void) => {
+      const mock = execMock();
+      const original = mock.getMockImplementation();
+      mock.mockImplementation((program, args, options) => {
+        if (program === 'git' && args[0] === 'show' && String(args[1]).endsWith(`:${path}`)) {
+          const failure = new Error(`spawnSync git ${code}`) as NodeJS.ErrnoException & { status?: number | null };
+          failure.code = code;
+          failure.status = status;
+          throw failure;
+        }
+        return original?.(program, args, options);
+      });
+      return () => mock.mockImplementation(original!);
+    };
+
+    it('reads a Makefile larger than the old 16 MiB buffer instead of calling it absent', () => {
+      const huge = `all:\n\t@echo ok\n${'# padding line for the buffer probe\n'.repeat(500_000)}`;
+      expect(huge.length).toBeGreaterThan(16 * 1024 * 1024);
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['make test']),
+        'package.json': pkg({}),
+        [MAKEFILE_PATH]: huge,
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(resolution.makefile.present).toBe(true);
+      expect(resolution.makefile.targets).toEqual(['all']);
+
+      candidate(dir, { [MAKEFILE_PATH]: huge.replace('@echo ok', '@echo moved') });
+      const drifted = resolve(dir, baseSha);
+
+      expect(drifted.reason).toBe('commands-changed-vs-base');
+      expect(drifted.diff).toContain(`@@ ${MAKEFILE_PATH} @@`);
+    });
+
+    it('a base file that fails with ENOBUFS is could-not-run, never absent', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['make test']),
+        'package.json': pkg({}),
+        [MAKEFILE_PATH]: 'all:\n',
+      });
+      const restore = failRead(MAKEFILE_PATH, 'ENOBUFS', 0);
+      try {
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('could-not-run');
+        expect(resolution.reason).toBe('unreadable-source');
+        expect(commands(resolution)).toEqual([]);
+        expect(notes(resolution)).toContain('ENOBUFS');
+      } finally {
+        restore();
+      }
+    });
+
+    it('an EACCES on the base lockfile is could-not-run, not a silent npm install', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: 'vitest run' }),
+        [PACKAGE_LOCK_PATH]: '{}\n',
+      });
+      const restore = failRead(PACKAGE_LOCK_PATH, 'EACCES', null);
+      try {
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('could-not-run');
+        expect(resolution.reason).toBe('unreadable-source');
+        expect(resolution.install.argv).toEqual([]);
+        expect(resolution.install.because).toContain('EACCES');
+      } finally {
+        restore();
+      }
+    });
+
+    it('exit 128 stays absence — a path the base does not carry is not an error', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['./scripts/gate.sh']),
+        'package.json': pkg({}),
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).not.toContain('could not be read');
+    });
+  });
+
+  describe('explicit lists — supplied is not the same as non-empty (F4)', () => {
+    it('a supplied-but-blank explicit list means nothing to check — it never falls through', () => {
+      baseSha = freeze(dir, { 'package.json': pkg({ test: 'vitest run' }) });
+
+      const absent = resolve(dir, baseSha);
+      expect(absent.source).toBe('package-json');
+      expect(absent.status).toBe('resolved');
+
+      for (const list of [[''], []]) {
+        const resolution = resolve(dir, baseSha, list);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.reason).toBe('no-commands');
+        expect(resolution.source).toBe('explicit');
+        expect(commands(resolution)).toEqual([]);
+        expect(notes(resolution)).toContain('explicit: supplied but declares no command');
+        expect(notes(resolution)).not.toContain('explicit: not supplied');
+      }
+    });
+  });
 });
 
 describe('this repo’s own gate list', () => {

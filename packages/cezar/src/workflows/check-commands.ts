@@ -30,6 +30,21 @@
  *                             fallback to a lower-precedence source.
  * `nothing-to-check` is not green and `commands` is empty on every non-`resolved`
  * status, so a caller that ignores `status` still has nothing to execute.
+ *
+ * What the pinned plan covers — the F1 lesson. Pinning the bodies a list
+ * *directly* names is close to vacuous in a repo whose gate is a set of thin
+ * delegating stubs (`typecheck` -> `npm run typecheck:server` -> …), so the
+ * digest covers the TRANSITIVE CLOSURE of npm-run references (bounded depth,
+ * cycle-safe, `pre*`/`post*` hooks included), the local script files an argv
+ * names (best effort: an argv-position token that exists in the tree), and the
+ * Makefile when a make command makes it a body. What cannot be resolved
+ * statically — `npm run "$TARGET"`, a chain past the depth bound, a `-w`
+ * workspace delegation — is recorded in `notes`, never guessed at.
+ *
+ * And what "cannot be read" means — the F3 lesson. `git show` exits 128 when the
+ * path is not in that tree; that is absence. Every other failure (ENOBUFS on a
+ * huge file, EACCES, a missing git) is a read that did not happen, and a read
+ * that did not happen is `could-not-run` — never a silent "absent".
  */
 
 import { execFileSync } from 'node:child_process';
@@ -57,10 +72,42 @@ const DISCOVERY_SCRIPT_NAMES = ['lint', 'typecheck', 'test', 'build'] as const;
 
 /**
  * npm's own lifecycle scripts the root package runs during `npm ci` /
- * `npm install`. Their bodies execute as part of the install step, so they are
- * pinned with the list whenever an install step exists.
+ * `npm install`, in npm 11's execution order. Their bodies execute as part of
+ * the install step, so they are pinned with the list whenever an install step
+ * exists. `prepublish` is deprecated but still RUN by npm 11 (verified against
+ * npm 11.19.0: all seven run), so it is pinned like the rest.
  */
-const INSTALL_LIFECYCLE_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepare'] as const;
+const INSTALL_LIFECYCLE_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'] as const;
+
+/** How many npm-run hops the closure follows before the rest is recorded, not pinned. */
+const MAX_SCRIPT_DEPTH = 8;
+
+/** Cap on the text pinned for a local script file an argv names; larger files are recorded, not pinned. */
+const MAX_PINNED_FILE_CHARS = 2 * 1024 * 1024;
+
+/**
+ * `git`'s stdout cap. A Makefile a make command pins is read through `git show`,
+ * and this buffer is what stands between "present" and a silent "absent": the
+ * reviewer proved a ~19 MB Makefile read as absent under the old 16 MiB cap.
+ * Overflowing THIS cap is `could-not-run` (see `createFrozenBase`), never
+ * absence — 64 MiB is comfortably past anything a repo keeps in-tree.
+ */
+const GIT_MAX_BUFFER = 64 * 1024 * 1024;
+
+/** Extensions that make a bare argv token worth probing as a local script file. */
+const SCRIPT_FILE_EXTENSIONS = ['.sh', '.bash', '.zsh', '.ksh', '.mjs', '.cjs', '.js', '.ts', '.py', '.rb', '.pl', '.ps1'];
+
+/** Interpreters whose first non-flag argument is itself the script to pin. */
+const SCRIPT_INTERPRETERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'node', 'tsx', 'deno', 'bun', 'python', 'python3', 'ruby', 'perl', 'pwsh', 'powershell']);
+
+/** Wrappers that precede the real program in a simple command. */
+const SEGMENT_WRAPPERS = new Set(['env', 'command', 'exec', 'nohup', 'time', 'sudo']);
+
+/** npm script names are plain identifiers; anything else (`$VAR`, `$(…)`) is dynamic and recorded, not guessed. */
+const PLAUSIBLE_SCRIPT_NAME = /^[A-Za-z0-9_:.+-][A-Za-z0-9_:.@+-]*$/;
+
+/** `-w <name>`, `--workspace <name>`, `-w=<name>`: a delegation to another manifest this resolver does not read. */
+const WORKSPACE_FLAG = /^(?:-w|--workspace)(?:=(.+))?$/;
 
 /** How much of a drift diff is kept. A moved body is the interesting part, and a
  *  manifest diff cannot usefully exceed this. */
@@ -73,7 +120,9 @@ export type CheckCommandReason =
   | 'commands-changed-vs-base'
   | 'malformed-agentic-config'
   | 'malformed-package-json'
-  | 'unreadable-base';
+  | 'unreadable-base'
+  /** A file is in the tree but the read failed (ENOBUFS/EACCES/…) — not the same as absent. */
+  | 'unreadable-source';
 
 export type CheckCommandStatus = 'resolved' | 'nothing-to-check' | 'could-not-run';
 
@@ -146,15 +195,23 @@ interface ScriptBody {
   body: string;
 }
 
+/** A local script file an argv names, pinned by its text. */
+interface PinnedFile {
+  path: string;
+  text: string;
+}
+
 /** Everything one tree resolves to; base and candidate are built the same way. */
 interface TreePlan {
   label: string;
   source: CheckCommandSource;
   commands: string[];
-  /** Referenced scripts + their pre/post hooks + the install lifecycle hooks, sorted by name. */
+  /** The npm-run closure: referenced scripts, their hooks, the hooks of the chain, sorted by name. */
   scripts: ScriptBody[];
+  /** Local script files named in argv, sorted by path. */
+  files: PinnedFile[];
   makefile: { present: boolean; targets: string[]; text: string; pinned: boolean };
-  install: { kind: InstallKind; argv: string[]; file?: string };
+  install: { kind: InstallKind; argv: string[]; file?: string; error?: string };
   /** The tree's consulted source is present but unusable — the plan stops there. */
   malformed?: { reason: CheckCommandReason; detail: string };
   notes: string[];
@@ -169,28 +226,55 @@ function shortSha(sha: string): string {
   return sha.slice(0, 8);
 }
 
+/** What one fixed-argv `git` read returned: ok, or why it failed. */
+interface GitRun {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  /** The child's exit status; `null` when it never exited (spawn failure, buffer overflow). */
+  status: number | null;
+  /** Node's error code (`ENOBUFS`, `EACCES`, …), when there is one. */
+  code?: string;
+}
+
 /** `git`, no shell, never throws — degradation is the caller's policy. */
-function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
+function git(cwd: string, args: string[]): GitRun {
   try {
     const stdout = execFileSync('git', args, {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      maxBuffer: 16 * 1024 * 1024,
+      maxBuffer: GIT_MAX_BUFFER,
     });
-    return { ok: true, stdout, stderr: '' };
+    return { ok: true, stdout, stderr: '', status: 0 };
   } catch (err) {
-    const failure = err as { stdout?: string; stderr?: string; message?: string };
-    return { ok: false, stdout: failure.stdout ?? '', stderr: (failure.stderr ?? failure.message ?? 'git failed').trim() };
+    const failure = err as { stdout?: string; stderr?: string; message?: string; status?: number | null; code?: string };
+    return {
+      ok: false,
+      stdout: failure.stdout ?? '',
+      stderr: (failure.stderr ?? failure.message ?? 'git failed').trim(),
+      status: typeof failure.status === 'number' ? failure.status : null,
+      ...(failure.code ? { code: failure.code } : {}),
+    };
   }
+}
+
+/** Why a read failed, as the notes and details report it. */
+function readFailureReason(run: GitRun): string {
+  if (run.code) return run.stderr ? `${run.code}: ${run.stderr}` : run.code;
+  if (run.status !== null) return `exit ${run.status}${run.stderr ? `: ${run.stderr}` : ''}`;
+  return run.stderr || 'git failed';
 }
 
 /**
  * Open the frozen base for reading. One probe decides whether the base is
  * readable at all: `git cat-file -e` cannot separate "no such path" from "no
- * such object" (both exit 128), so the probe is `rev-parse --verify --quiet`
- * and every later `git show` failure then means exactly one thing — the path is
- * absent from that tree. Never throws; an unreadable base is a value.
+ * such object" (both exit 128), so the probe is `rev-parse --verify --quiet`.
+ * After it, `git show` exit 128 means exactly one thing — the path is absent
+ * from that tree. Every OTHER failure (ENOBUFS on a huge file, EACCES, a git
+ * that cannot spawn) is a read that did not happen: it yields `error`, which
+ * the plan treats as `could-not-run`, never as absence. Never throws; an
+ * unreadable base is a value.
  */
 function createFrozenBase(repoRoot: string, baseSha: string): { kind: 'ok'; base: FrozenBase } | { kind: 'error'; detail: string } {
   const probe = git(repoRoot, ['rev-parse', '--verify', '--quiet', `${baseSha}^{commit}`]);
@@ -207,7 +291,11 @@ function createFrozenBase(repoRoot: string, baseSha: string): { kind: 'ok'; base
         if (cached) return cached;
         // A FIXED argv: the only tree-supplied part is the path constant above.
         const show = git(repoRoot, ['show', `${baseSha}:${path}`]);
-        const result: TreeFile = show.ok ? { kind: 'file', text: show.stdout } : { kind: 'absent' };
+        const result: TreeFile = show.ok
+          ? { kind: 'file', text: show.stdout }
+          : show.status === 128
+            ? { kind: 'absent' }
+            : { kind: 'error', message: `git show ${shortSha(baseSha)}:${path} could not be read (${readFailureReason(show)}) — present but unreadable, not absent` };
         cache.set(path, result);
         return result;
       },
@@ -280,6 +368,284 @@ export function npmScriptName(command: string): string | undefined {
 /** Does the list invoke `make`? A make target's body lives in the Makefile, so its text is pinned too. */
 export function commandInvokesMake(command: string): boolean {
   return /^make(\s|$)/.test(command.trim());
+}
+
+/** Strip one matching pair of surrounding quotes. */
+function unquote(token: string): string {
+  const first = token[0];
+  if (token.length >= 2 && (first === '"' || first === "'") && token[token.length - 1] === first) return token.slice(1, -1);
+  return token;
+}
+
+function dedupe(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+/**
+ * Split a command line into shell "simple command" segments. Unquoted `;&|<>()`
+ * and newlines end a segment, whitespace separates tokens, quotes group. This is
+ * deliberately small — it exists to find script references, never to execute.
+ */
+function shellSegments(text: string): string[][] {
+  const segments: string[][] = [];
+  let tokens: string[] = [];
+  let token = '';
+  let quote: '"' | "'" | null = null;
+  const endToken = (): void => {
+    if (token) {
+      tokens.push(token);
+      token = '';
+    }
+  };
+  const endSegment = (): void => {
+    endToken();
+    if (tokens.length) {
+      segments.push(tokens);
+      tokens = [];
+    }
+  };
+  for (const ch of text) {
+    if (quote) {
+      token += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      token += ch;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t') {
+      endToken();
+      continue;
+    }
+    if (ch === '\n' || ch === '\r') {
+      endSegment();
+      continue;
+    }
+    if (ch === ';' || ch === '&' || ch === '|' || ch === '(' || ch === ')' || ch === '<' || ch === '>') {
+      endSegment();
+      continue;
+    }
+    token += ch;
+  }
+  endSegment();
+  return segments;
+}
+
+interface NpmScriptRefs {
+  names: string[];
+  /** References whose target cannot be resolved statically, verbatim. */
+  dynamic: string[];
+  /** `-w` / `--workspace` delegations to a manifest this resolver does not read. */
+  workspaces: string[];
+}
+
+/**
+ * Every npm script a piece of shell text references, ANYWHERE in it: the head of
+ * a simple command (`npm test`), the tail of a compound one (`a && npm run b`),
+ * and every hop of a script body. A name that is not a plain identifier
+ * (`npm run "$TARGET"`) is reported as dynamic instead of guessed at; a name npm
+ * resolves against another manifest (`-w`) is reported as a workspace delegation.
+ */
+function extractNpmScriptRefs(text: string): NpmScriptRefs {
+  const names: string[] = [];
+  const dynamic: string[] = [];
+  const workspaces: string[] = [];
+  for (const tokens of shellSegments(text)) {
+    for (let i = 0; i < tokens.length; i += 1) {
+      if (unquote(tokens[i] ?? '') !== 'npm') continue;
+      const verb = tokens[i + 1] === undefined ? undefined : unquote(tokens[i + 1]!);
+      let after = i + 2;
+      if (verb === 'test') {
+        names.push('test');
+      } else if (verb === 'run' || verb === 'run-script') {
+        while (after < tokens.length && unquote(tokens[after]!).startsWith('-')) after += 1;
+        const raw = tokens[after];
+        if (raw === undefined) continue;
+        const name = unquote(raw);
+        if (PLAUSIBLE_SCRIPT_NAME.test(name)) names.push(name);
+        else dynamic.push(`npm ${verb} ${raw}`);
+        after += 1;
+      } else {
+        continue;
+      }
+      for (let k = after; k < tokens.length; k += 1) {
+        const match = WORKSPACE_FLAG.exec(unquote(tokens[k]!));
+        if (!match) continue;
+        const inline = match[1];
+        const value = inline ?? (tokens[k + 1] === undefined ? undefined : unquote(tokens[k + 1]!));
+        if (value) {
+          workspaces.push(value);
+          if (!inline) k += 1;
+        }
+      }
+      i = after - 1;
+    }
+  }
+  return { names: dedupe(names), dynamic: dedupe(dynamic), workspaces: dedupe(workspaces) };
+}
+
+/** The local script path a bare argv token names, if it looks like one. */
+function localScriptPath(token: string): string | undefined {
+  const raw = unquote(token.trim());
+  if (!raw || raw.startsWith('-') || raw.startsWith('/') || raw.startsWith('~')) return undefined;
+  if (/[$`*?{}[\]<>|;&()!'"]/.test(raw)) return undefined;
+  const path = raw.replace(/^\.\//, '');
+  if (!path || path.split('/').includes('..')) return undefined;
+  if (!SCRIPT_FILE_EXTENSIONS.some((ext) => path.toLowerCase().endsWith(ext))) return undefined;
+  return path;
+}
+
+/**
+ * Local script files a command names in argv: the program position of a simple
+ * command (`./scripts/gate.sh`), or the first non-flag argument of an
+ * interpreter (`sh .ai/scripts/e2e.sh`). Best effort by design — a token that
+ * does not exist in the tree is simply not pinned, and a data argument
+ * (`vitest run src/x.test.ts`) is never a candidate because it sits after a
+ * non-interpreter program.
+ */
+function scriptFilePaths(commands: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const command of commands) {
+    for (const tokens of shellSegments(command)) {
+      let head = 0;
+      while (head < tokens.length) {
+        const token = unquote(tokens[head]!);
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token) || SEGMENT_WRAPPERS.has(token)) {
+          head += 1;
+          continue;
+        }
+        break;
+      }
+      const program = tokens[head] === undefined ? undefined : unquote(tokens[head]!);
+      if (program === undefined) continue;
+      const candidates = [program];
+      if (SCRIPT_INTERPRETERS.has(program)) {
+        for (let i = head + 1; i < tokens.length; i += 1) {
+          const token = unquote(tokens[i]!);
+          if (token.startsWith('-')) continue;
+          candidates.push(token);
+          break;
+        }
+      }
+      for (const candidate of candidates) {
+        const path = localScriptPath(candidate);
+        if (path) out.push(path);
+      }
+    }
+  }
+  return dedupe(out);
+}
+
+/** One node of the closure: an npm script body, or a local script file named in argv. */
+type ClosureNode = { kind: 'script'; name: string; depth: number } | { kind: 'file'; path: string; depth: number };
+
+/**
+ * The bodies the plan would execute: the transitive npm-run closure of the list
+ * plus the local script files its argv names, plus (when an install step exists)
+ * npm's install lifecycle hooks and everything THEY reach. Each body contributes
+ * its `pre*`/`post*` hooks and every npm script it references, to a bounded
+ * depth; `seen` makes a cycle terminate, and a node is pinned once, at the
+ * shallowest depth it is reached (the queue is FIFO). Best effort is the point:
+ * anything that cannot be resolved statically is recorded in `notes`, so the
+ * verdict can state what is NOT pinned.
+ */
+function collectPinnedBodies(
+  manifestScripts: Record<string, string>,
+  commandRoots: readonly string[],
+  lifecycleRoots: readonly string[],
+  filePaths: readonly string[],
+  readFile: (path: string) => TreeFile,
+  notes: string[],
+): { scripts: ScriptBody[]; files: PinnedFile[]; errors: string[] } {
+  const bodies = new Map<string, string>();
+  const files = new Map<string, string>();
+  const seenScripts = new Set<string>();
+  const seenFiles = new Set<string>();
+  const errors: string[] = [];
+  const queue: ClosureNode[] = [];
+  const note = (line: string): void => {
+    if (!notes.includes(line)) notes.push(line);
+  };
+
+  const visitScript = (name: string, depth: number): void => {
+    if (seenScripts.has(name)) return;
+    seenScripts.add(name);
+    queue.push({ kind: 'script', name, depth });
+  };
+  const visitFile = (path: string, depth: number): void => {
+    if (seenFiles.has(path)) return;
+    seenFiles.add(path);
+    queue.push({ kind: 'file', path, depth });
+  };
+
+  for (const name of lifecycleRoots) if (manifestScripts[name] !== undefined) visitScript(name, 1);
+  for (const path of filePaths) visitFile(path, 1);
+  for (const command of commandRoots) {
+    for (const name of extractNpmScriptRefs(command).names) {
+      visitScript(name, 1);
+      if (manifestScripts[name] === undefined) {
+        notes.push(`${command}: the frozen base resolves no "${name}" script — the argv is pinned, its body is not`);
+      }
+    }
+  }
+
+  const follow = (origin: string, text: string, depth: number): void => {
+    const refs = extractNpmScriptRefs(text);
+    for (const ref of refs.names) {
+      if (manifestScripts[ref] === undefined) {
+        note(`${origin}: references npm script "${ref}", which the frozen base does not define — its body is not pinned`);
+        continue;
+      }
+      if (depth >= MAX_SCRIPT_DEPTH) {
+        note(`${origin}: the npm-run chain is deeper than ${MAX_SCRIPT_DEPTH} hops at "${ref}" — its body is not pinned (bounded depth)`);
+        continue;
+      }
+      visitScript(ref, depth + 1);
+    }
+    for (const dynamic of refs.dynamic) note(`${origin}: dynamic npm-run reference (${dynamic}) — not pinnable, and not pinned`);
+    for (const workspace of refs.workspaces) {
+      note(`${origin}: npm workspace "${workspace}" has its own manifest, which this resolver does not pin — the delegated script bodies are not pinned`);
+    }
+  };
+
+  while (queue.length) {
+    const node = queue.shift()!;
+    if (node.kind === 'script') {
+      const body = manifestScripts[node.name];
+      if (body === undefined) continue;
+      bodies.set(node.name, body);
+      for (const hook of [`pre${node.name}`, `post${node.name}`]) {
+        if (manifestScripts[hook] !== undefined) visitScript(hook, node.depth);
+      }
+      follow(`script "${node.name}"`, body, node.depth);
+      continue;
+    }
+    const file = readFile(node.path);
+    if (file.kind === 'error') {
+      errors.push(`${node.path}: ${file.message}`);
+      continue;
+    }
+    if (file.kind === 'absent') continue;
+    if (file.text.length > MAX_PINNED_FILE_CHARS) {
+      note(`${node.path}: ${file.text.length} characters exceeds the ${MAX_PINNED_FILE_CHARS} character pin cap — its body is NOT pinned`);
+      continue;
+    }
+    files.set(node.path, file.text);
+    note(`${node.path}: pinned as a body named in argv (${file.text.length} characters)`);
+    follow(`file "${node.path}"`, file.text, node.depth);
+  }
+
+  return {
+    scripts: [...bodies.entries()]
+      .map(([name, body]) => ({ name, body }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    files: [...files.entries()]
+      .map(([path, text]) => ({ path, text }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
+    errors,
+  };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -357,6 +723,8 @@ interface TreeSources {
   packageJson: TreeFile;
   packageLock: TreeFile;
   makefile: TreeFile;
+  /** Read another path from THIS tree — the local script files argv names. */
+  read: (path: string) => TreeFile;
 }
 
 /**
@@ -371,8 +739,12 @@ function planFromSources(sources: TreeSources): TreePlan {
   const label = sources.label;
   const notes: string[] = [];
 
+  // Supplied is a PRESENCE question, not a length one: an explicit `['']` is a
+  // caller saying "run this list", and the list normalizes to nothing — it must
+  // not fall through to the repo sources and quietly run the repo's gate.
+  const explicitSupplied = sources.explicit !== undefined;
   const explicit = normalizeCommands(sources.explicit ?? []);
-  const configConsulted = explicit.length === 0;
+  const configConsulted = !explicitSupplied;
   const config = parseAgenticConfig(sources.agenticConfig, label);
   const manifest = parseManifest(sources.packageJson, label);
 
@@ -385,7 +757,13 @@ function planFromSources(sources: TreeSources): TreePlan {
   }
 
   // --- notes: every source, in precedence order, saying what it contributed.
-  notes.push(explicit.length ? `explicit: ${explicit.length} command(s) from the request — wins` : 'explicit: not supplied');
+  notes.push(
+    !explicitSupplied
+      ? 'explicit: not supplied'
+      : explicit.length
+        ? `explicit: ${explicit.length} command(s) from the request — wins`
+        : 'explicit: supplied but declares no command — nothing to check',
+  );
   if (!configConsulted) {
     notes.push(`${AGENTIC_CONFIG_PATH} (${label}): not consulted (an explicit list wins)`);
   } else if (!config.ok) {
@@ -403,14 +781,14 @@ function planFromSources(sources: TreeSources): TreePlan {
     name === 'test' ? 'npm test' : `npm run ${name}`,
   );
 
-  const source: CheckCommandSource = explicit.length
+  const source: CheckCommandSource = explicitSupplied
     ? 'explicit'
     : (config.value ?? []).length
       ? 'agentic-config'
       : discovered.length
         ? 'package-json'
         : 'none';
-  const commands = explicit.length ? explicit : (config.value ?? []).length ? (config.value ?? []) : discovered;
+  const commands = explicitSupplied ? explicit : (config.value ?? []).length ? (config.value ?? []) : discovered;
 
   if (sources.packageJson.kind === 'absent') {
     notes.push(`${PACKAGE_JSON_PATH} (${label}): absent — no npm script bodies to pin`);
@@ -424,11 +802,17 @@ function planFromSources(sources: TreeSources): TreePlan {
     notes.push(`${PACKAGE_JSON_PATH} (${label}): consulted for script bodies only (a higher-precedence source won the list)`);
   }
 
-  const makefilePresent = sources.makefile.kind === 'file';
+  const makefilePresent = sources.makefile.kind !== 'absent';
   const makefileText = sources.makefile.kind === 'file' ? sources.makefile.text : '';
-  const targets = makefilePresent ? makefileTargets(makefileText) : [];
+  const targets = makefileText ? makefileTargets(makefileText) : [];
   const makefilePinned = commands.some(commandInvokesMake);
-  if (!makefilePresent) {
+  if (sources.makefile.kind === 'error') {
+    // A huge Makefile used to overflow `git show`'s buffer and read as ABSENT —
+    // which silently dropped it from the digest. A read that did not happen is
+    // could-not-run when the make command would have run it.
+    if (makefilePinned) malformed ??= { reason: 'unreadable-source', detail: `${MAKEFILE_PATH} (${label}): ${sources.makefile.message}` };
+    notes.push(`${MAKEFILE_PATH} (${label}): ${sources.makefile.message}${makefilePinned ? ' — the make command pins it, so nothing may run' : ' — targets not surfaced'}`);
+  } else if (!makefilePresent) {
     notes.push(`${MAKEFILE_PATH} (${label}): absent`);
   } else if (makefilePinned) {
     notes.push(`${MAKEFILE_PATH} (${label}): pinned by the make command in the list — targets surfaced, never run (${targets.map((t) => `make ${t}`).join(', ') || 'none in the first 50 lines'})`);
@@ -437,6 +821,7 @@ function planFromSources(sources: TreeSources): TreePlan {
   }
 
   const install = resolveInstall(sources);
+  if (install.error) malformed ??= { reason: 'unreadable-source', detail: install.error };
   notes.push(
     install.kind === 'none'
       ? `install (${label}): nothing to install (no ${PACKAGE_JSON_PATH} and no ${PACKAGE_LOCK_PATH})`
@@ -449,6 +834,7 @@ function planFromSources(sources: TreeSources): TreePlan {
       source,
       commands: [],
       scripts: [],
+      files: [],
       makefile: { present: makefilePresent, targets, text: makefileText, pinned: makefilePinned },
       install,
       malformed,
@@ -456,58 +842,58 @@ function planFromSources(sources: TreeSources): TreePlan {
     };
   }
 
-  // --- the bodies this plan would execute: referenced npm scripts (+ their npm
-  //     pre/post hooks), and the root lifecycle hooks the install step runs.
-  const scripts = new Map<string, string>();
-  const addScript = (name: string): void => {
-    const body = manifestScripts[name];
-    if (body === undefined || scripts.has(name)) return;
-    scripts.set(name, body);
-  };
-  for (const command of commands) {
-    const name = npmScriptName(command);
-    if (!name) continue;
-    if (manifestScripts[name] === undefined) {
-      notes.push(`${command}: the frozen base resolves no "${name}" script — the argv is pinned, its body is not`);
-      continue;
-    }
-    addScript(name);
-    addScript(`pre${name}`);
-    addScript(`post${name}`);
-  }
-  if (install.kind !== 'none') for (const name of INSTALL_LIFECYCLE_SCRIPTS) addScript(name);
+  // --- the bodies this plan would execute: the transitive npm-run closure of the
+  //     list (with pre*/post* hooks), the local script files the argv names, and
+  //     the install lifecycle hooks when an install step exists.
+  const pinned = collectPinnedBodies(
+    manifestScripts,
+    commands,
+    install.kind === 'none' ? [] : INSTALL_LIFECYCLE_SCRIPTS,
+    scriptFilePaths(commands),
+    sources.read,
+    notes,
+  );
+  for (const error of pinned.errors) malformed ??= { reason: 'unreadable-source', detail: error };
 
   return {
     label,
     source,
     commands,
-    scripts: [...scripts.entries()]
-      .map(([name, body]) => ({ name, body }))
-      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    scripts: pinned.scripts,
+    files: pinned.files,
     makefile: { present: makefilePresent, targets, text: makefileText, pinned: makefilePinned },
     install,
+    malformed,
     notes,
   };
 }
 
 function resolveInstall(sources: TreeSources): TreePlan['install'] {
+  if (sources.packageLock.kind === 'error') {
+    // Presence of the lockfile decides `npm ci` vs `npm install`; a lockfile that
+    // is there but unreadable must not silently become "absent" and flip the argv.
+    return { kind: 'none', argv: [], error: `${PACKAGE_LOCK_PATH} (${sources.label}): ${sources.packageLock.message}` };
+  }
   if (sources.packageLock.kind === 'file') return { kind: 'ci', argv: ['npm', 'ci'], file: PACKAGE_LOCK_PATH };
   if (sources.packageJson.kind === 'file') return { kind: 'install', argv: ['npm', 'install'], file: PACKAGE_JSON_PATH };
   return { kind: 'none', argv: [] };
 }
 
 /**
- * Identity of the plan that would run: the ordered list, the resolved bodies
- * (referenced scripts, their hooks, the install lifecycle hooks) and the
- * Makefile text when a make command makes it a body. Deterministic — sorted
- * bodies, no paths, no timestamps. Exactly what the drift rule compares.
+ * Identity of the plan that would run: the ordered list, the resolved closure
+ * (referenced scripts, their hooks, the whole npm-run chain), the local script
+ * files named in argv, and the Makefile text when a make command makes it a
+ * body. Deterministic — sorted bodies, no paths, no timestamps. Exactly what the
+ * drift rule compares. `version: 2` is the closure + files shape (v1 pinned only
+ * directly referenced bodies).
  */
-function planDigest(plan: Pick<TreePlan, 'source' | 'commands' | 'scripts' | 'makefile'>): string {
+function planDigest(plan: Pick<TreePlan, 'source' | 'commands' | 'scripts' | 'files' | 'makefile'>): string {
   const payload = {
-    version: 1,
+    version: 2,
     source: plan.source,
     commands: plan.commands,
     scripts: plan.scripts.map(({ name, body }) => ({ name, body })),
+    files: plan.files.map(({ path, text }) => ({ path, text })),
     makefile: plan.makefile.pinned ? plan.makefile.text : null,
   };
   return `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
@@ -551,6 +937,19 @@ function renderPlanDiff(base: TreePlan, candidate: TreePlan): string {
       ),
     );
   }
+  const filePaths = [...new Set([...base.files.map((f) => f.path), ...candidate.files.map((f) => f.path)])].sort();
+  for (const path of filePaths) {
+    const before = base.files.find((f) => f.path === path)?.text;
+    const after = candidate.files.find((f) => f.path === path)?.text;
+    if (before === after) continue;
+    sections.push(
+      diffSection(
+        `file:${path}`,
+        before === undefined ? [MISSING_BASE] : before.split('\n'),
+        after === undefined ? [MISSING_CANDIDATE] : after.split('\n'),
+      ),
+    );
+  }
   if (base.makefile.pinned && base.makefile.text !== candidate.makefile.text) {
     sections.push(diffSection(MAKEFILE_PATH, base.makefile.text.split('\n'), candidate.makefile.text.split('\n')));
   }
@@ -570,6 +969,7 @@ function resolvedCommands(plan: TreePlan): ResolvedCheckCommand[] {
 }
 
 function installPlan(base: TreePlan, baseLabel: string): CheckInstallPlan {
+  if (base.install.error) return { kind: 'none', argv: [], because: base.install.error };
   if (base.install.kind === 'none') {
     return { kind: 'none', argv: [], because: `no ${PACKAGE_JSON_PATH} and no ${PACKAGE_LOCK_PATH} in ${baseLabel}` };
   }
@@ -589,6 +989,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
       source: 'none',
       commands: [],
       scripts: [],
+      files: [],
       makefile: { present: false, targets: [], text: '', pinned: false },
       install: { kind: 'none', argv: [] },
       notes: [],
@@ -615,6 +1016,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
     packageJson: frozen.base.read(PACKAGE_JSON_PATH),
     packageLock: frozen.base.read(PACKAGE_LOCK_PATH),
     makefile: frozen.base.read(MAKEFILE_PATH),
+    read: frozen.base.read,
   });
   const candidate = planFromSources({
     label: 'candidate (working tree)',
@@ -623,6 +1025,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
     packageJson: readWorkingFile(options.repoRoot, PACKAGE_JSON_PATH),
     packageLock: readWorkingFile(options.repoRoot, PACKAGE_LOCK_PATH),
     makefile: readWorkingFile(options.repoRoot, MAKEFILE_PATH),
+    read: (path: string) => readWorkingFile(options.repoRoot, path),
   });
 
   const diff = renderPlanDiff(base, candidate);
@@ -650,7 +1053,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
     return {
       status: 'nothing-to-check',
       reason: 'no-commands',
-      source: 'none',
+      source: base.source,
       commands: [],
       digest,
       changedVsBase: false,
