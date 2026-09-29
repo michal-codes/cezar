@@ -950,9 +950,12 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
         // same nested scan a `-c` string gets — with env's remaining argv appended
         // (`env -S 'sh -c' 'npm run inner --ws'` runs the workspace bodies,
         // measured). The raw tokens keep their quotes, so an appended argument that
-        // is one word for coreutils stays one word here.
+        // is one word for coreutils stays one word here. The split argv is
+        // RE-PROCESSED by env as its own argv (`env -S '-u FOO sh -c …'` unsets
+        // FOO and runs the wrapper; a `-S` inside the string splits again —
+        // measured), so the scan is the env invocation the string spells.
         const text = [env.text, ...tokens.slice(env.rest)].join(' ');
-        const nested = extractNpmScriptRefs(text);
+        const nested = extractNpmScriptRefs(`env ${text}`);
         if (nested.names.length || nested.delegations.length) {
           names.push(...nested.names);
           dynamic.push(...nested.dynamic);

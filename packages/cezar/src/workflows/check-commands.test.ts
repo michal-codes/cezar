@@ -1772,6 +1772,7 @@ describe('check-commands — the command policy resolver', () => {
         "env --spl 'npm run inner --ws'",
         "env -vS 'npm run inner --ws'",
         "env -S 'sh -c' 'npm run inner --ws'",
+        "env -S '-S \"npm run inner --ws\"'",
       ]) {
         expectDelegationPinned(probe);
       }
