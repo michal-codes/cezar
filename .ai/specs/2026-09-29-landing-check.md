@@ -5,6 +5,13 @@ HEAD `2fe68575` unless a sentence says it does; every `path:line` citation in th
 document was re-verified at that HEAD. The implementation ships as the five PRs in
 `## 📋 The chain`, starting with the runner hardening.
 
+**Revision 3 (post-implementation review).** This document was re-read against the delivered
+implementation chain (PRs #1164–#1169) and four independent review lanes. The contract is sound
+where it speaks; this revision adds the cross-cutting invariants and recovery semantics the
+implementation had to discover defect-by-defect, a cross-cutting acceptance list, and targeted
+amendments (ack binding, the 409 set, the executed entry-point closure, terminal completeness).
+v1's scope is unchanged.
+
 ## 📝 TLDR
 
 A dispatch parent is told to merge each accepted child into its own branch and to
@@ -162,8 +169,9 @@ and a spec — which is why this PR files the `Implement:` tracking issue.
   alone (the parent asking whether its own branch is green), records `sources: []`
   and says so in the verdict card.
 - Identity is the **resulting tree sha** (two merge orders over disjoint files
-  produce different HEADs and the same tree). It is stored with the verdict and
-  recomputed at read time for staleness.
+  produce different HEADs and the same tree). It is stored with the verdict;
+  staleness is computed at read time from the recorded pins — the base ref and each
+  source ref resolved against the sha recorded for it — and never re-derives the tree.
 
 ### Source derivation — the ledger, never ancestry alone
 
@@ -195,6 +203,11 @@ returns `listRuns()` order, which is `createdAt` descending
   precondition (a dirty, non-overlapping tracked file merges silently otherwise),
   `MERGE_HEAD` / `git ls-files -u` after each merge, and a post-run assertion that
   the tree did not move.
+- The clean precondition is about **local modifications to the check's own
+  worktree**. A freshly created worktree that git reports dirty only because the
+  frozen content is non-canonical under attributes that content itself declares (a
+  `text` attribute over a CRLF blob) MUST be reported as its own case, naming the
+  paths, distinct from a locally modified worktree; no merge may run in it.
 - **Conflict ⇒ stop.** Record `git diff --diff-filter=U`, `git merge --abort`, run
   **no** commands, verdict `conflict` with the conflicting paths and the prefix that
   merged cleanly (marked non-subject). An agent-resolved conflict is out of v1: the
@@ -217,12 +230,21 @@ Sources, in order, all resolved against the **frozen base** tree (`git show
    promoted into the list with `source: 'package-json'` recorded;
 4. none — verdict `nothing-to-check`, reason `no-commands`.
 
-Rules: the list is **base-pinned**; if the list or the resolved script bodies differ
-between base and candidate the check runs nothing and records
+Rules: the plan is **base-pinned** — the list, the resolved script bodies, the local
+files those bodies execute (resolved relative to the manifest that names them), the
+workspace topology and the build-file text the plan runs; if anything in that closure
+differs between base and candidate the check runs nothing and records
 `nothing-to-check: commands-changed-vs-base` **with the diff** (a branch cannot
-introduce a command, and a moved script body is visible); `Makefile` targets are
-shown, not run; the resolved bodies are stored on the record (see `## 📝 Data Model`);
-execution stops at a non-zero exit and the remaining commands are recorded `not-run`.
+introduce a command or an executed file, and a moved script body is visible);
+`Makefile` targets are shown, not run; the resolved bodies are stored on the record
+(see `## 📝 Data Model`); execution stops at a non-zero exit and the remaining
+commands are recorded `not-run`.
+
+Inputs the plan only *reads* — the configuration of the tools the commands invoke,
+the package manager's own configuration, the dependency resolution the install
+performs — are not pinned; the resolver models them and records every difference as
+unresolved on the verdict (see the invariants). A verdict's claim is bounded by the
+closure: the base's gate entry points ran against this tree.
 
 - **Install step.** A fresh worktree has no `node_modules` and never shares the
   parent's, so the runner installs before the gate: `npm ci` when the frozen base
@@ -262,9 +284,11 @@ never stack (the `#3144` precedent is run stacking).
 `stale` marker. Each carries: the argv list, the resolved script bodies, the install
 step, the env variable **names** allowed, the user the check ran as, the tree sha,
 per-command timings and exit codes, and the line that it is not a sandbox. A check that could
-not run is **not green**. The verdict is evidence: it publishes no GitHub status,
-disables no control, and the merge target is always the check run's own scratch
-branch.
+not run is **not green**. Every terminal check run carries exactly one verdict and
+its status agrees with it; `reason` is an open, engine-owned slug that a client MUST
+degrade to text, never to a verdict (see the invariants). The verdict is evidence: it
+publishes no GitHub status, disables no control, and the merge target is always the
+check run's own scratch branch.
 
 ### Trust model and acknowledgement
 
@@ -279,11 +303,15 @@ The acknowledgement round-trip is explicit: (1) a check run on a foreign subject
 freezes the subject, records `could-not-run: foreign-subject-needs-ack` plus a
 `preview` block (resolved command list and bodies, install argv, diffstat, author
 list, head sha and a `subjectDigest`) and runs **nothing**; (2) the client acks with
-a second request carrying `acknowledge: { digest: '<subjectDigest>' }`, which creates
-a new check run that proceeds **only** if the digest it computes equals the
-acknowledged one — if the subject moved, it previews again instead of running; (3)
-the ack is recorded on the run (`ack.digest`, `ack.at`). The verdict states plainly
-that this is not a sandbox.
+a second request carrying `acknowledge: { digest: '<subjectDigest>' }` **together with
+the subject-affecting inputs of the previewed request** (`sources`, `commands`),
+which creates a new check run that recomputes the digest over the subject it derives —
+whatever that subject's provenance or foreignness — and proceeds **only** if it equals
+the acknowledged one; if the subject moved, it records a fresh preview instead of
+running, and an acknowledgement is never silently dropped; (3) the ack is recorded on
+the run (`ack.digest`, `ack.at`). Every entry point that can start a check lets its
+user read the preview's `subjectDigest`; the CLI prints it with the refusal. The
+verdict states plainly that this is not a sandbox.
 
 ### Not in v1 (non-goals)
 
@@ -298,6 +326,202 @@ that this is not a sandbox.
 - No multi-repo subjects, no submodules, no LFS.
 - No Windows shell (see `## 📝 Edge Cases & Failure Scenarios`).
 - No new `CEZ_*` environment variable.
+
+## 📐 Normative invariants and recovery semantics
+
+These properties are cross-cutting: the sections above define the mechanism, this section defines
+what MUST be true of it. Where the two disagree, this section wins. The per-PR lists under
+`## 📝 Acceptance Criteria for PRs 2–6` are sign-off lists; the cross-cutting scenarios at the end
+of this section MUST pass too.
+
+### Lifecycle and recovery
+
+**Invariant — one run, one subject, one verdict.** A landing check is ONE run with ONE frozen
+subject and ONE verdict. Its persistent lifecycle is **freeze → materialize → plan → trust →
+install → gate → verdict → settle**. The subject is persisted before the check can execute; the
+materialized tree is the identity the verdict describes; the verdict is written once and never
+rewritten. A check run is *recovered*, never re-created, and the record carries everything a later
+attempt needs: the subject and its pins, the resolved plan and digest, the request and any
+acknowledgement, the results.
+
+**Recovery decisions, in order.** On every entry into a check run's execution: (1)
+`subject.treeSha` absent → **rematerialize** the frozen subject; (2) `treeSha` present and no
+verdict → **resume** the materialized subject; (3) verdict present → **settle only**. Only
+`passed` may settle green; every other verdict settles non-green. Recovery MUST NOT re-invoke or
+re-derive the check: a re-check after the subject moves is a NEW run with a NEW freeze.
+
+**Invariant — idempotency.** Materialization is repeatable and content-idempotent (see
+determinism below). Freeze, trust and install are NOT repeated by a resume: the frozen shas cannot
+change, the acknowledgement was granted for exactly them, and the recorded install outcome
+describes the same verified tree. The gate IS repeated in full: a resume re-walks every gate
+command from the beginning, and a later pass replaces — never appends to — an earlier pass's
+entries.
+
+**Invariant — one pass owns its results.** `results` and `reason` describe exactly one pass. A
+pass clears them before recording anything. A verdict MUST be derived only from the entries
+recorded by the pass that produced it: an entry, outcome or reason left by an interrupted attempt
+MUST NOT settle the resumed check.
+
+**Invariant — the worktree must still hold the subject.** The check worktree belongs to the check
+run and is reused across its attempts. Before any repository-authored step, a resume MUST verify
+that the worktree still holds the frozen tree (its `HEAD^{tree}` equals `subject.treeSha`). If it
+does not, the check records `could-not-run: worktree-lost` and runs nothing. Re-creating the
+worktree at the frozen base is never a substitute: a green gate on the base alone would be a
+verdict about a subject that was never checked.
+
+**Invariant — every terminal check run carries exactly one verdict.** Every terminal landing-check
+run MUST carry exactly one verdict, and the run status MUST agree with it: the run settles `done`
+if and only if the verdict is `passed`; every other recorded verdict settles `failed`; a check
+cancelled before it concludes settles `cancelled` and records `could-not-run: cancelled`, keeping
+any verdict already written. A terminal check run with no verdict is a record bug, not a state: it
+MUST never render green, and every surface reads it as "the check concluded nothing". The three
+surfaces of one truth are the verdict (what was observed), the run status (what happened to the
+run) and `stale` (whether the subject still resolves).
+
+### Determinism of the frozen subject
+
+**Invariant — materialization is a pure function of the frozen subject.** Materializing a subject
+MUST depend only on `(baseSha, the ordered source shas)` and the repository content those commits
+name. It MUST NOT depend on the operator's git configuration (identity, signing, merge drivers,
+renormalize, attributes), the ambient environment, the wall clock, the machine, the check's
+worktree path, or any repository hook. Where an input could change the resulting tree or a
+synthetic commit, the check MUST neutralize it for its own git invocations or refuse with
+`could-not-run`; it MUST NOT record a verdict for a tree a supported configuration would not
+reproduce.
+
+**Postcondition — re-materialization is identity.** Two materializations of one unchanged subject
+MUST produce the same `treeSha` and, where a synthetic commit sha is bound into any digest or
+record, the same commit sha. Every input of a synthetic commit — identity, date, signature state,
+message, parent order — MUST be derived from the frozen subject or fixed by the check, never from
+the operator or the clock.
+
+**Invariant — no repository-authored code runs before the trust decision.** Freezing and
+materializing MUST execute no repository-authored code: no repository hook and no program selected
+by repository content. Repository-authored execution begins only after the foreign-subject
+decision, as the check's own recorded steps. A repository whose content can make such a program
+run during materialization — for example by placing a hook at the path the check uses for hooks —
+MUST be refused with `could-not-run`; the check MUST NOT assume the repository cannot. The trust
+decision itself is made once per subject and BEFORE any gate step exists on the record: a resume
+never re-decides it, and a check whose interrupted attempt never passed it has no steps to walk
+and runs nothing. (Worktree creation is shared run machinery; its `post-checkout` hook is outside
+this invariant.)
+
+### Execution closure and the honest claim
+
+**Invariant — the pinned plan covers the executed entry-point closure.** The plan MUST be pinned
+to the frozen base: the command list; the resolved script bodies and their transitive runner
+closures (`pre*`/`post*` hooks included); workspace delegation, manifests and glob topology; every
+local file a pinned body executes or names as a program, resolved relative to the manifest that
+names it; and the build-file text the plan runs. Any difference anywhere in that closure between
+base and candidate is drift: the check records `nothing-to-check: commands-changed-vs-base` and
+executes nothing. A file the frozen base does not contain MUST NOT be executed as part of the
+plan: it is candidate-supplied procedure — drift or a named unresolved entry, never a silent
+green.
+
+**Invariant — no silent unresolved input.** Some repository-controlled inputs are read rather than
+executed: the configuration of the tools the pinned commands invoke, the package manager's own
+configuration, and the resolution the install performs. They are outside the pinned closure — a
+check that refused them would refuse exactly the dependency and configuration changes it exists to
+test — and MUST NOT be presented as covered. v1 MUST model at least the configuration of the tools
+its resolved commands invoke and the package manager's own configuration; every modelled input
+that differs between the frozen base and the materialized tree MUST be recorded on the verdict as
+unresolved. A consumer of a green verdict MUST be able to read exactly what the green does not
+cover. The honest claim of any verdict is "the base's gate entry points ran against this tree" —
+never "the tree is verified", never "the union is verified".
+
+**Boundary.** The closure stops at files: a pinned file's own imports and requires are the
+candidate's artifact (the repository's checks are themselves repository source) and are out of
+model. Arbitrary data a pinned body reads, non-shell interpreter indirection, dependency
+internals, and the host toolchain are declared out of model.
+
+### Acknowledgement binding
+
+**Invariant — an acknowledgement is bound to one subject and is never ignored.** The digest MUST
+be a pure function of what the acknowledgement authorizes — the frozen subject and the plan: at
+least base ref/sha, the ordered sources, the materialized tree sha, the plan digest and the
+install argv — and MUST be versioned, so an acknowledgement issued for an older shape can never
+match. It MUST NOT bind any input a re-materialization cannot reproduce; if it binds the synthetic
+commit sha, the determinism postcondition above is its precondition.
+
+**Precondition — the request repeats the subject.** A client acks by repeating the
+subject-affecting inputs of the previewed request (`sources`, `commands`) together with
+`acknowledge.digest`; the surfaces that offer the acknowledgement MUST send them. A request
+carrying `acknowledge.digest` MUST have that digest compared with the subject the request derives —
+whatever the subject's provenance or foreignness — before anything executes. Equal: the check
+proceeds and records `ack.digest` / `ack.at`. Not equal, or an acknowledgement absent on a foreign
+subject: nothing runs, and the check records a fresh `preview` for the subject it derived, exactly
+as a first preview does. An acknowledgement MUST never be silently dropped.
+
+**Invariant — the digest is obtainable from every entry point.** Every surface that can start a
+check MUST let its user obtain the preview's `subjectDigest` and complete the acknowledgement. In
+v1 the acknowledgement itself is an API/cockpit body field; the CLI MUST print the `subjectDigest`
+with the refusal reason, so a CLI-only user can complete the flow with one request.
+
+### Verdict semantics
+
+**Invariant — the verdict enum is closed; the reason vocabulary is open.** `passed | failed |
+conflict | nothing-to-check | could-not-run` are the only verdicts, and only `passed` means a gate
+ran to the end: every other value, and the read-time `stale` marker, never renders green. `reason`
+is an open, engine-owned slug for display and diagnosis: a client may branch on the values this
+document names and MUST degrade an unknown value to text, never to a verdict. `nothing-to-check`
+has exactly two causes, told apart by reason: `no-commands` (nothing declared) and
+`commands-changed-vs-base` (the candidate moved the pinned plan; the diff is emitted with the
+verdict). An install that did not run names the same cause the gate would (`dry-run`, `timeout`,
+`cancelled`, `unsupported-platform`); `install-failed` is reserved for an install that executed
+and failed.
+
+**Invariant — stale is about the subject, at read time.** `stale` is computed when the record is
+read, from the recorded pins: the base ref and each source ref resolved against the sha recorded
+for it. It never rewrites the verdict and never inspects the worktree; re-deriving the tree is not
+required and, once the worktree is gone, impossible. There is no attempt-staleness: frozen shas
+cannot move, and the verified tree is the tree that was checked, so a resume's carried-forward
+install outcome and acknowledgement describe that same tree.
+
+### Deliberate v1 scope-outs (recorded, not designed)
+
+- No re-resolution of the plan and no re-install on a resume: v1 resumes with the frozen plan and
+  the recorded install outcome.
+- A crash during the install is not distinguished from any other resume that runs no command: both
+  record `could-not-run: no-results`.
+- A worktree left dirty by an interrupted merge is refused `could-not-run: dirty-worktree`; v1
+  does not clean or resume a partial merge.
+- No automatic re-materialization loop on a terminal materialization error; the remedy is a new
+  check (a new freeze).
+- The transcript is append-only across attempts; `results` is authoritative for what the final
+  pass observed. v1 does not partition the transcript by attempt.
+- The changed-plan diff is transcript-only; the record carries `changedVsBase` and the resolver's
+  notes.
+- Environment identity is names, not a pinned environment (A11): determinism of materialization
+  does not promise identical gate *outcomes* across machines.
+
+### Cross-cutting acceptance criteria
+
+| Scenario class | What the test MUST show |
+| --- | --- |
+| Crash/restart after freeze, after materialization, mid-gate, during install, after the verdict | Exactly one verdict; correct status mapping; an interrupted pass's entries never settle the resumed check; no-subject recovery records a non-green verdict |
+| The same frozen subject materialized twice | Identical tree, identical synthetic commit where bound, identical digest — under changed user identity, signing, hooks, time and worktree path |
+| Operator config or content-selected code (merge driver, `GIT_CONFIG_GLOBAL`, a hook placed at the check's hooks path) | Neutralized or refused; no repository-authored code before the acknowledgement |
+| A file a pinned command body executes changes (or is added) | Drift: `nothing-to-check: commands-changed-vs-base`, nothing executed |
+| A repo-controlled input only read (compiler/test-runner/linter config, `.npmrc`) changes | Recorded as unresolved on the verdict; a green never claims coverage; detection names the path |
+| Retry after a partial execution | `results` describes one pass — the last one |
+| A stale or mismatched acknowledgement (including a digest-only ack whose request derives a different subject) | Nothing executes; a fresh preview with a new digest; the ack is recorded only on a match |
+| Zero eligible sources / base-only subject | The gate still runs on the base alone and says so |
+| A resolved command whose meaning depends on the candidate (added hook, moved workspace glob, changed body) | Drift, never a silent run |
+| A terminal check run with no verdict | Never green; rendered as "the check concluded nothing" |
+
+### Lessons learned from implementation (#1164–#1169)
+
+| Invariant | What the implementation round taught | Source |
+| --- | --- | --- |
+| Lifecycle + recovery decisions | An ordinary run recovers by resuming its agent session; a landing check has none, so restarts had to be handled bespoke — a check restarted after materialization settled `done` with no verdict | 4.2 `9014a2bb` / review `ad261afb`; spec A1 corrected |
+| Pure materialization | Synthetic merge identity and date pinned to the frozen base, `commit.gpgsign=false`; `--no-verify` proved insufficient for hooks and was replaced by a hooks-path override; operator merge drivers and the hooks path remain holes | 4.2 `9014a2bb`; 4.4 `cdf55e40` / review `7bf339ca`; R1 probes |
+| No repo code before the trust decision | A guard test moved the trust decision above the gate steps and went red; a foreign source can still place the hooks file and run code before the ack | 4.4 INFO guard; R1 probe 4 |
+| Idempotency + attempt ownership | A resume had to clear stored `results`/`reason`, or an interrupted pass settled the resumed check | 4.4 F3 `cdf55e40`; mutation-red `7bf339ca` |
+| Worktree must hold the subject | Without the `HEAD^{tree}` guard a re-created worktree would have gated the base alone | 4.2 review `ad261afb` |
+| Terminal completeness | A crash between `startRun` and the subject write settles `done` with no verdict; a queued cancel writes no verdict | R2 probe (`7e823ab8`) |
+| Executed entry-point closure | Seven review rounds on the npm scan (`--`, quotes, last-wins, wrappers, `env`) plus body-named script files, tool config and `.npmrc` that flip the gate with an identical digest | PR 3 `47964775`…`2cb0544a`; R3 `30c00058` |
+| Acknowledgement binding | Digest v2 binds the head sha; the cockpit's digest-only ack can be silently dropped and a different subject ran green | 5.1 `10a57e2c`; R4 `d0172af2` |
+| Verdict semantics | The five-value enum is closed and honest; the run-status mapping and "only `passed` is green" lived only in docs | 4.3 `a3071c59`; R4 |
 
 ## 📝 Architecture
 
@@ -342,13 +566,22 @@ landingCheck: z.object({
     sources: z.array(z.object({ ref: z.string(), sha: z.string() })),
     order: z.enum(['explicit', 'ledger']),
     treeSha: z.string().optional(),          // absent until materialized
+    excluded: z.array(z.object({             // candidates left out and why — an empty child names
+      runId: z.string(), sha: z.string().optional(), reason: z.string(),
+    })).optional(),                          // `empty`, never `already-landed`
   }),
   commands: z.object({
     source: z.enum(['explicit', 'agentic-config', 'package-json', 'none']),
     digest: z.string(),
     changedVsBase: z.boolean().optional(),
     resolvedBodies: z.record(z.string(), z.string()).optional(), // the bodies the digest covers
+    notes: z.array(z.string()).optional(),   // the resolver's durable record of what it could NOT
+                                             // pin; written only when non-empty
   }),
+  request: z.object({                          // carried verbatim so a queued or recovered check
+    commands: z.array(z.string()).optional(),  // resolves the same plan it was asked for
+    acknowledge: z.object({ digest: z.string() }).optional(),
+  }).optional(),
   install: z.object({                          // absent when the base has no manifest
     argv: z.array(z.string()), exitCode: z.number().nullable(),
     outcome: z.enum(['passed','failed','not-run']),
@@ -399,8 +632,10 @@ export const landingCheckResponseSchema = z.object({
 ```
 
 `POST /api/v1/p/:projectId/runs/:id/land-check` → 201 with the check run's id; `404`
-for an unknown run; `409` only when a landing check for this project is already in
-flight (a running invoking run is the normal case — its committed branch tip is
+for an unknown run; `409` when a landing check for this project is already in flight
+**or when the request cannot be frozen** — the invoking run's branch, an explicit
+source, or a ledger-derived source no longer resolves; a refused freeze creates no
+check run (a running invoking run is the normal case — its committed branch tip is
 frozen at request time); `400` on a shape violation (the validator trio, not a
 handler-side parse). A foreign subject without a matching `acknowledge.digest`
 returns 201 with a preview run whose `landingCheck.verdict` is `could-not-run` /
@@ -420,6 +655,12 @@ record schema.
   success tone.
 - The invoking run's row links to the check run; a stale verdict shows the marker
   next to the chip.
+- The card MUST render the record's unresolved-input notes and the preview's
+  `subjectDigest`; a green verdict never reads as covering the unresolved inputs.
+- The acknowledge control repeats the previewed request's subject-affecting inputs
+  together with the digest (see the acknowledgement invariant).
+- A terminal check run with no verdict renders neutral and names that the check
+  concluded nothing — never the success tone.
 - No new attention rung and no notification change in v1: the ladder
   (`packages/web/src/lib/attention.ts:20-27`) is a documented contract, and a check
   verdict is evidence, not a lifecycle state. If a nudge is wanted later, the change
@@ -437,8 +678,8 @@ record schema.
 | `review` / failed / cancelled / non-terminal child | Excluded; a review verdict is not a source |
 | Two sources with the same sha | Deduped; the record names the duplicate |
 | Conflict on merge N | Stop; record `diff --diff-filter=U`; `merge --abort`; **no** commands; verdict `conflict` |
-| Dirty worktree / pre-existing `MERGE_HEAD` | Refuse to start (`could-not-run: dirty-worktree`) |
-| Source branch deleted / moving ref | Sources applied by sha; a vanished ref yields `could-not-run: source-missing` |
+| Dirty worktree / pre-existing `MERGE_HEAD` | Refuse to start (`could-not-run: dirty-worktree`); a worktree that is dirty only because the frozen content is non-canonical under attributes the content itself declares is its own case, naming the paths, never `dirty-worktree` |
+| Source branch deleted / moving ref | A ref that does not resolve at freeze time refuses the request (409, no run created); after the freeze, sources are applied by their recorded shas — a sha that cannot be fetched reports `merge-failed` |
 | Commands changed vs base | `nothing-to-check: commands-changed-vs-base` + diff; nothing executes |
 | No commands | `nothing-to-check: no-commands`; never green |
 | A command times out | Kill the group; that command `could-not-run: timeout`; remaining commands `not-run`; the verdict is never `passed` |
@@ -448,13 +689,16 @@ record schema.
 | Foreign subject (author not the local user) | Preview only (`could-not-run: foreign-subject-needs-ack` + `preview`), until a matching `acknowledge.digest` |
 | Ack digest does not match the recomputed subject | Preview again; nothing executes |
 | Base has no `package-lock.json` / no `package.json` | `npm install` / no install step; recorded, never guessed |
-| Install fails (bad lockfile, registry down) | `could-not-run: install-failed`; gate commands `not-run`; never green |
+| Install fails (bad lockfile, registry down) | An install that executed and failed yields `could-not-run: install-failed`; an install that did not run names its cause (`dry-run`, `timeout`, `cancelled`, `unsupported-platform`); gate commands `not-run`; never green |
 | Zero eligible sources | Subject is the base alone, `sources: []`; the gate still runs and says so |
 | Sources move after the check | `stale` at read time (source sha or base sha differs); the stored verdict text is not rewritten |
-| Check worktree reclaimed by retention | The verdict stands; staleness falls back to comparing source shas |
+| Check worktree reclaimed by retention | The verdict stands; `stale` compares the recorded pins and never re-derives the tree |
 | Project at `maxParallel` | The check queues like any run; a second *landing* check for the same project is refused 409 |
 | Parent cancelled while the check runs | The check is its own run and finishes; nothing merges |
 | `landingCheck` on an older record / unknown keys | Optional + passthrough; the index parse never drops a run |
+| Crash / restart at any point | Recovery per the invariants: rematerialize without `treeSha`, resume with `treeSha` and no verdict, settle with a verdict; every terminal run carries exactly one verdict |
+| A pinned command's intermediate file changes, or a config a pinned tool reads changes | The executed closure is drift (`nothing-to-check: commands-changed-vs-base`); read-only inputs are recorded unresolved, never silently covered |
+| Terminal check run with no verdict | A record bug: never green, read as 'the check concluded nothing' |
 
 ## 📝 Acceptance Criteria for PRs 2–6
 
@@ -483,14 +727,20 @@ are named.
 **PR 3 — S2, command policy.** The engine can resolve a command list without
 executing anything: (a) precedence explicit → `.ai/agentic.config.json` →
 `package.json`, each read from the frozen base and recorded with its `source`;
-(b) a digest over the resolved list **and** resolved script bodies; (c) drift
-against base yields `nothing-to-check: commands-changed-vs-base` with the diff and
+(b) a digest over the resolved list **and** the executed entry-point closure — the
+resolved script bodies, the local files those bodies execute (manifest-relative), the
+workspace topology and the build-file text; (c) drift against base yields
+`nothing-to-check: commands-changed-vs-base` with the diff and
 executes nothing; (d) an absent/empty source degrades to `no-commands`, naming every
-source consulted; (e) `Makefile` targets are surfaced, never run; (f) no command string from the
-candidate tree is ever executed; (g) the install argv is resolved from the frozen
+source consulted; (e) `Makefile` targets are surfaced, never run; (f) no command string
+from the candidate tree is ever executed **and no file the candidate supplies is
+executed as part of the plan unless the frozen base contains it at the same pinned
+identity (any difference is drift)**; (g) the install argv is resolved from the frozen
 base's manifest (ci vs install vs none) and recorded; (h) this repo's own list is
 reordered to the measured cheap-first order in `.ai/agentic.config.json` and
-`SDLC.md:83-93` in the same commit.
+`SDLC.md:83-93` in the same commit; (i) every repository-controlled input the plan
+only reads (tool configuration, package-manager configuration) is modelled and
+recorded on the verdict as unresolved, never silently covered.
 
 **PR 4 — S3+S4, core.** The engine freezes, merges and records: (a) candidate
 derivation includes the empty-child regression test (tip == fork point must not read
@@ -501,8 +751,14 @@ regression test pins that the parent's own commits are in the subject); (b2) zer
 eligible sources yields a base-only subject with `sources: []`; (c) the tree sha is
 the identity and is recomputed at read for `stale`; (d) conflicts abort with the
 U-file list and no commands; (d2) the install step runs first under the timeout/kill
-rules and its failure is never green; (e) the route is chained, zod-validated as middleware, and covered by
-route parity, typed-bodies and the BC route inventory; (f) `cez task land-check`
+rules and its failure is never green; (d3) crash/restart at every durable stage ends
+with exactly one verdict and the status mapping of the lifecycle invariant; each case
+is proven red without its guard; (d4) every request carrying `acknowledge.digest`
+compares it whatever the subject's provenance, and a request that omits the previewed
+inputs re-previews instead of running; (e) the route is chained, zod-validated as
+middleware, and covered by route parity, typed-bodies and the BC route inventory; the
+three freeze refusals (invoking branch, explicit source, ledger-derived source) answer
+409 and create no run; (f) `cez task land-check`
 works from inside a task and exits 2 with the dispatch message when `CEZ_API_URL` is
 unset (the existing convention, `dispatch/task-cli.ts`); (g) the `landingCheck`
 record field is additive and the index parse never drops a run; (h) the dispatch
@@ -512,7 +768,9 @@ prompt names the verb in one sentence, and its test pins it.
 the tail of the output; (b) a chip renders on the task row for every verdict state,
 including `stale`; (c) `nothing-to-check` and `could-not-run` never render with the
 success tone; (d) the invoking run links to the check run; (e) screenshots attached
-to the PR.
+to the PR; (f) the card renders the record's unresolved-input notes and the preview's
+digest; a green never reads as covering them; (g) the acknowledge control repeats the
+previewed request's inputs; a terminal check with no verdict renders neutral.
 
 **PR 6 — S6, docs.** (a) `docs/reference.md` gains a "Landing check" section (after
 the workflow format) stating the subject, the verdict states, "a check that could
@@ -555,10 +813,12 @@ Six PRs against `main`, stacked in order. PR 1 is this document (design-only).
   ordering plus stop-at-first-failure is the mitigation; the ordering edit itself is
   owned by PR 3 and lands in `.ai/agentic.config.json` and `SDLC.md:83-93` together,
   per `SDLC.md:93`.
-- **The gate can be disarmed by the tree it checks** — unless the commands are
-  pinned. Base pinning (list and resolved bodies) is the mitigation, and a drift
-  verdict is visible rather than silent. Lifecycle hooks (`pre*` scripts) are part of
-  the resolved-body digest, so a changed hook shows as drift.
+- **The gate can be disarmed by the tree it checks** — the mitigation is base pinning
+  over the *executed entry-point closure* (list, bodies, executed files, workspace
+  topology, build-file text: any difference is drift and nothing runs), plus recording
+  the repository-controlled inputs that are only read (tool and package-manager
+  configuration) as unresolved on the verdict. A green means "the base's gate entry
+  points ran against this tree"; it never claims the unresolved inputs are covered.
 - **Greens decay.** Nothing re-runs a verdict automatically; `stale` at read time is
   the honest marker, and re-running is one command. No CI watcher, no events.
 - **Two construction-site trap.** `runCheckStep` has a single caller today
@@ -615,13 +875,13 @@ Written in `--autonomous` mode; each default is the most reversible option.
 
 | # | Question | Chosen default | Why |
 | --- | --- | --- | --- |
-| A1 | Which record is authoritative? | The **check run's own record**; the invoking run gets a pointer (`landingCheck.ofRunId` on the check, and the check id visible from the parent row) | The check is an ordinary run: NDJSON, SSE, cancel, retention, prune and the check card come free; a second source of truth would need a reconciliation rule |
+| A1 | Which record is authoritative? | The **check run's own record**; the invoking run gets a pointer (`landingCheck.ofRunId` on the check, and the check id visible from the parent row) | The check is an ordinary run: NDJSON, SSE, cancel, retention, prune and the check card come free; **the persistent lifecycle and recovery do not** — a landing check has no agent session to resume, so its recovery decisions are specified in the invariants |
 | A2 | Order source | A **new read-only reader over `ledger.jsonl`** (`packages/cezar/src/dispatch/tree-fs.ts:161-163`), with an explicit list taking precedence | `childrenOf()` returns `createdAt` descending (`packages/cezar/src/runs/store.ts:834`) — the wrong order; the ledger is the engine's own chronological record; the reader is small and writes nothing |
 | A3 | Serialization | One ordinary `maxParallel` slot, **one landing check per project at a time** (a second request is 409) | Four concurrent test suites thrash 3–4×; a full gate is ~7 minutes; a 409 is less machinery than a queue and avoids the #3144 run-stacking shape |
 | A4 | win32 / missing shell | `could-not-run: unsupported-platform` with the reason recorded | `bash -lc` is already broken there; a loud, honest non-green beats a false red |
 | A5 | Does the verdict gate anything? | No — evidence only | Every blocking path would change somebody's default landing flow; the natural ceiling for later work is GitHub status publication, explicitly a non-goal here |
 | A6 | Dry run | Skip with `could-not-run: dry-run`, never green | Keeps the offline demo honest; `README.md:140` promises a look-around under `CEZ_DRY_RUN=1` |
-| A7 | Staleness | Computed at read; the stored verdict text is never rewritten | A verdict records what was observed, not a live claim |
+| A7 | Staleness | Computed at read from the recorded pins; the stored verdict text is never rewritten | A verdict records what was observed, not a live claim |
 | A8 | Conflict handling | Stop, record, abort, run nothing; no agent resolution in v1 | An agent-resolved conflict has no recorded provenance and would silently redefine the subject |
 | A9 | Multi-repo / submodules / LFS | Out of scope, named here | The tooling has no cross-repo subject |
 | A10 | Visibility of the check run | An ordinary visible run, titled `Landing check — <parent>` | Hiding it would need a new lifecycle; a visible record is auditable and cancelable |
