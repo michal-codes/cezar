@@ -18,9 +18,10 @@
  * The iron rule of this module: **it executes nothing**. The only subprocesses it
  * ever spawns are fixed-argv `git` READS — `rev-parse` (one probe, to tell "no
  * such tree" from "this base is not readable"), `show <sha>:<path>` (the
- * frozen-base read), and `ls-tree` (one whole-tree listing, reached only when a
- * `-w` delegation makes the root `workspaces` globs matter) — no shell, and never
- * a string from either tree as a command. A caller (PR 4's core) hands `commands`
+ * frozen-base read), `ls-tree` (one whole-tree listing of the BASE, reached only
+ * when the root `workspaces` globs matter) and `ls-files` (one listing of the
+ * CANDIDATE working tree, tracked plus untracked-not-ignored, for the candidate's
+ * own glob set) — no shell, and never a string from either tree as a command. A caller (PR 4's core) hands `commands`
  * to `runCheckCommand`; a `nothing-to-check` or `could-not-run` resolution never
  * yields a command to run at all.
  *
@@ -48,15 +49,22 @@
  * globs — because npm reads that field from the CANDIDATE at run time: a candidate
  * that moves the globs redirects a `-w <name>` delegation to another, unpinned
  * manifest while every pinned body stays byte-identical, so the globs are compared
- * in the drift check like any pinned body.
+ * in the drift check like any pinned body. PR 3.4 adds the manifest-path SET each
+ * tree's OWN globs resolve to, because npm reads the globs AND the directory
+ * listing from the candidate: a manifest the candidate ADDS inside an unchanged
+ * glob is a body `--workspaces` runs that the frozen base's path list never named.
  *
- * The npm scan behind all of it (PR 3.3) skips the GLOBAL FLAGS npm accepts before
- * the verb (`npm --silent run inner`, `npm --loglevel=error test`) and records any
- * `npm …` segment it still cannot resolve — a bare `npm run`, a `npm ci` inside a
- * script body — as a dynamic note instead of continuing silently. What cannot be
- * resolved statically — `npm run "$TARGET"`, a chain past the depth bound, a
- * delegation whose target the tree does not declare — is recorded in `notes`,
- * never guessed at.
+ * The npm scan behind all of it (PR 3.3, tightened by PR 3.4) models the GLOBAL
+ * FLAGS npm accepts around the verb (`npm --silent run inner`,
+ * `npm --loglevel=error test`) and the workspace flags (`-w`/`--workspace`/`-ws`,
+ * `--ws` — an abbreviation npm 11 accepts — and `--workspaces`, all measured
+ * against npm 11.19.0), and it stops at `--`, where npm hands the rest to the
+ * script: a forwarded `-w` is an ARGUMENT, so the ROOT body is what gets pinned.
+ * A flag it does not model is recorded as a dynamic note for the whole segment —
+ * never silently skipped, because npm's abbreviation surface is open-ended. What
+ * cannot be resolved statically — `npm run "$TARGET"`, a chain past the depth
+ * bound, a delegation whose target the tree does not declare — is recorded in
+ * `notes`, never guessed at.
  *
  * And what "cannot be read" means — the F3 lesson. `git show` exits 128 when the
  * path is not in that tree; that is absence. Every other failure (ENOBUFS on a
@@ -130,7 +138,36 @@ const PLAUSIBLE_SCRIPT_NAME = /^[A-Za-z0-9_:.+-][A-Za-z0-9_:.@+-]*$/;
  * against npm 11: `npm -l` is NOT one of them (it prints usage; the token after it
  * is read as the command), so it is deliberately absent.
  */
-const NPM_VALUE_FLAGS = new Set(['--prefix', '--loglevel', '--registry', '--userconfig', '--cache']);
+const NPM_VALUE_FLAGS = new Set(['--loglevel', '--registry', '--userconfig', '--cache']);
+
+/**
+ * npm's global flags this scan treats as self-contained and inert: one token, no
+ * separate value, and no change to WHICH manifest or script a segment runs
+ * (logging and output only). Deliberately short — npm's option surface is
+ * open-ended. npm 11.19.0 accepts `--ws` as an abbreviation of `--workspaces`
+ * (measured: it runs the script in every workspace), warns "Unknown cli config"
+ * for `--work`/`--works`/`--worksp` and runs the root, and value flags can take a
+ * separate token. An option this list does not model is therefore recorded as
+ * dynamic, never silently skipped.
+ */
+const NPM_PLAIN_GLOBAL_FLAGS = new Set([
+  '--silent',
+  '-s',
+  '--quiet',
+  '-q',
+  '--verbose',
+  '-d',
+  '--foreground-scripts',
+  '--if-present',
+  '--dry-run',
+  '--json',
+  '--color',
+  '--no-color',
+  '--progress',
+  '--no-progress',
+  '--unicode',
+  '--no-unicode',
+]);
 
 /**
  * The digest payload's shape version. v1 pinned only the bodies a list directly
@@ -275,6 +312,15 @@ interface WorkspaceIndex {
 /** Every path in one tree, or why the listing could not be read. */
 type TreePathListing = { kind: 'paths'; paths: string[] } | { kind: 'error'; message: string };
 
+/**
+ * The manifest paths one tree's OWN `"workspaces"` globs resolve to — the set npm
+ * runs under `-ws`/`--ws`/`--workspaces` at run time. `none` when the tree declares
+ * no globs; `error` when the listing the globs are matched against could not be read
+ * (a read that did not happen is never absence, so the drift rule refuses rather
+ * than assuming the base's set still holds).
+ */
+type WorkspaceGlobPaths = { kind: 'paths'; paths: string[] } | { kind: 'none' } | { kind: 'error'; message: string };
+
 /** Everything one tree resolves to; base and candidate are built the same way. */
 interface TreePlan {
   label: string;
@@ -301,6 +347,14 @@ interface TreePlan {
   notes: string[];
   /** The workspace manifest paths this tree resolved; the candidate reads exactly these. */
   workspaceManifestPaths: string[];
+  /**
+   * The manifest paths this tree's own `"workspaces"` globs resolve to. Resolved for
+   * the base AND for the candidate, because npm reads the globs and the directory
+   * listing from the CANDIDATE at run time: a manifest the candidate adds inside an
+   * unchanged glob is a body `--workspaces` runs while the frozen base's path list
+   * never named it. Compared as a SET by the drift rule; not part of the digest.
+   */
+  workspaceGlobPaths: WorkspaceGlobPaths;
 }
 
 interface FrozenBase {
@@ -409,6 +463,19 @@ function readWorkingFile(repoRoot: string, path: string): TreeFile {
     const code = (err as NodeJS.ErrnoException).code;
     return code === 'ENOENT' || code === 'EISDIR' ? { kind: 'absent' } : { kind: 'error', message: (err as Error).message };
   }
+}
+
+/**
+ * List the CANDIDATE tree: everything git tracks plus the untracked files git does
+ * not ignore — the working tree as npm sees it, without walking `node_modules`. A
+ * FIXED argv; no path from either tree reaches git. A listing that did not happen is
+ * a value, never absence.
+ */
+function listWorkingPaths(repoRoot: string): TreePathListing {
+  const ls = git(repoRoot, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']);
+  return ls.ok
+    ? { kind: 'paths', paths: ls.stdout.split('\0').filter((path) => path !== '') }
+    : { kind: 'error', message: `git ls-files could not be read (${readFailureReason(ls)})` };
 }
 
 /**
@@ -561,13 +628,22 @@ function npmSegmentLabel(tokens: readonly string[], start: number): string {
 
 /**
  * One npm workspace flag, with the token index to resume at. `-w x`,
- * `--workspace x`, `--workspace=x` and `-w=x` name one workspace; `-ws` /
- * `--workspaces` names every workspace. A workspace flag whose value is missing
- * is not a flag (it is left for the ordinary flag-skipping).
+ * `--workspace x`, `--workspace=x` and `-w=x` name one workspace; `-ws`, `--ws`
+ * and `--workspaces` name every workspace — npm 11.19.0 accepts `--ws` as an
+ * abbreviation and runs the script in every workspace for it (measured; `--work`,
+ * `--works` and `--worksp` are Unknown-config warnings that run the root). A
+ * workspace flag whose value is missing is not a flag (it is left for the
+ * ordinary flag-skipping), and npm's boolean coercion makes only the exact value
+ * `false` turn the all-workspaces form off (`--ws=0` still runs every workspace,
+ * measured) — a false value is consumed WITHOUT a delegation: the root script runs.
  */
-function parseWorkspaceFlag(tokens: readonly string[], index: number): { delegation: Omit<WorkspaceDelegation, 'script'>; next: number } | undefined {
+function parseWorkspaceFlag(
+  tokens: readonly string[],
+  index: number,
+): { delegation?: Omit<WorkspaceDelegation, 'script'>; next: number } | undefined {
   const token = unquote(tokens[index] ?? '');
-  if (token === '-ws' || token === '--workspaces') return { delegation: {}, next: index + 1 };
+  const all = /^(?:-ws|--ws|--workspaces)(?:=(.*))?$/.exec(token);
+  if (all) return all[1] === 'false' ? { next: index + 1 } : { delegation: {}, next: index + 1 };
   const match = /^(?:-w|--workspace)(?:=(.+))?$/.exec(token);
   if (!match) return undefined;
   const inline = match[1];
@@ -578,6 +654,48 @@ function parseWorkspaceFlag(tokens: readonly string[], index: number): { delegat
 }
 
 /**
+ * `--include-workspace-root`, npm's "run the root script as well" option. With a
+ * workspace selection it makes the ROOT script run alongside the delegated ones
+ * (measured against npm 11.19.0: `run inner --ws --include-workspace-root` prints
+ * the root body too), so such a segment pins the root body as well. npm's boolean
+ * coercion again: only the exact value `false` turns it off.
+ */
+function parseIncludeWorkspaceRoot(token: string): boolean | undefined {
+  const match = /^--include-workspace-root(?:=(.*))?$/.exec(token);
+  return match ? match[1] !== 'false' : undefined;
+}
+
+/** Whether a `--prefix` value names the very tree this plan reads (`.` or `./`). */
+function isSameTreePrefix(value: string): boolean {
+  return value.trim().replace(/\/+$/, '') === '.';
+}
+
+/**
+ * One npm global flag, as the number of tokens it consumes: `1` for a
+ * self-contained flag, `2` for one that takes the NEXT token as its value, and
+ * `undefined` for a flag this scan does not model. `undefined` is not "skip it":
+ * an unmodelled flag can be an abbreviation of a workspace flag, take a value of
+ * its own, or move the tree npm resolves in, so the caller records the segment as
+ * dynamic instead of pinning a body npm may not run.
+ */
+function npmGlobalFlagTokens(tokens: readonly string[], index: number): number | undefined {
+  const token = unquote(tokens[index] ?? '');
+  const equals = token.indexOf('=');
+  const name = equals === -1 ? token : token.slice(0, equals);
+  if (name === '--prefix') {
+    // `--prefix <dir>` runs npm's command in another tree; only a prefix that names
+    // THIS directory can be pinned against this plan.
+    if (equals !== -1) return isSameTreePrefix(token.slice(equals + 1)) ? 1 : undefined;
+    const value = tokens[index + 1] === undefined ? undefined : unquote(tokens[index + 1]!);
+    if (value === undefined) return undefined;
+    return isSameTreePrefix(value) ? 2 : undefined;
+  }
+  if (NPM_VALUE_FLAGS.has(name)) return equals === -1 ? 2 : 1;
+  if (NPM_PLAIN_GLOBAL_FLAGS.has(name)) return 1;
+  return undefined;
+}
+
+/**
  * Every npm script a piece of shell text references, ANYWHERE in it: the head of
  * a simple command (`npm test`), the tail of a compound one (`a && npm run b`),
  * and every hop of a script body. A name that is not a plain identifier
@@ -585,9 +703,13 @@ function parseWorkspaceFlag(tokens: readonly string[], index: number): { delegat
  * flag changes WHERE the script resolves (`npm run build -w @scope/pkg` runs the
  * workspace's `build`, not the root's), so such a segment yields a delegation and
  * never a same-manifest name. GLOBAL flags between `npm` and the verb do not hide
- * the verb (`npm --silent run inner`, `npm --loglevel=error test`), and a segment
- * whose verb still cannot be resolved is reported as dynamic rather than skipped,
- * so an unpinned npm invocation is never silent.
+ * the verb when this scan models them (`npm --silent run inner`,
+ * `npm --loglevel=error test`); an UNMODELLED one is reported as dynamic rather
+ * than skipped, because npm's abbreviation surface is open-ended (`--ws` IS
+ * `--workspaces` in npm 11) and a flag of unknown arity can hide the verb. `--` is
+ * npm's own end-of-options where it stops parsing: before the verb it is consumed,
+ * after the verb everything is forwarded — including a `-w` that is then an
+ * ARGUMENT to the root script, not a delegation.
  */
 function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const names: string[] = [];
@@ -596,23 +718,45 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
   for (const tokens of shellSegments(text)) {
     for (let i = 0; i < tokens.length; i += 1) {
       if (unquote(tokens[i] ?? '') !== 'npm') continue;
-      // A workspace flag is a delegation; any other `-`-token before the verb is a
-      // global npm flag and is skipped, with one more token for the five that take
-      // a separate value. The first token that is neither is the verb.
+      // A workspace flag is a delegation; npm's own `--` ends the tokens npm parses;
+      // the global flags this scan models are skipped (`1` token, `2` when the flag
+      // takes a separate value). ANY other `-`-token is unmodelled: the whole
+      // segment is recorded as dynamic, never skipped, so no body is pinned behind a
+      // flag whose meaning (or arity) is a guess.
       const targets: Omit<WorkspaceDelegation, 'script'>[] = [];
+      // `--include-workspace-root` makes the ROOT script run alongside the delegated
+      // ones, so such a segment pins the root body too.
+      let rootScript = false;
+      let unmodelled = false;
       let cursor = i + 1;
       while (cursor < tokens.length) {
         const workspaceFlag = parseWorkspaceFlag(tokens, cursor);
         if (workspaceFlag) {
-          targets.push(workspaceFlag.delegation);
+          if (workspaceFlag.delegation) targets.push(workspaceFlag.delegation);
           cursor = workspaceFlag.next;
           continue;
         }
-        const globalFlag = unquote(tokens[cursor]!);
-        if (!globalFlag.startsWith('-')) break;
-        cursor += NPM_VALUE_FLAGS.has(globalFlag) ? 2 : 1;
+        const token = unquote(tokens[cursor]!);
+        if (token === '--') {
+          // npm's end-of-options BEFORE the verb: the verb still follows.
+          cursor += 1;
+          continue;
+        }
+        if (!token.startsWith('-')) break;
+        const includeRoot = parseIncludeWorkspaceRoot(token);
+        if (includeRoot !== undefined) {
+          if (includeRoot) rootScript = true;
+          cursor += 1;
+          continue;
+        }
+        const consumed = npmGlobalFlagTokens(tokens, cursor);
+        if (consumed === undefined) {
+          unmodelled = true;
+          break;
+        }
+        cursor += consumed;
       }
-      const verb = tokens[cursor] === undefined ? undefined : unquote(tokens[cursor]!);
+      const verb = unmodelled || tokens[cursor] === undefined ? undefined : unquote(tokens[cursor]!);
       let after = cursor + 1;
       let script: string | undefined;
       if (verb === 'test') {
@@ -621,17 +765,39 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
         while (after < tokens.length) {
           const flag = parseWorkspaceFlag(tokens, after);
           if (flag) {
-            targets.push(flag.delegation);
+            if (flag.delegation) targets.push(flag.delegation);
             after = flag.next;
             continue;
           }
-          if (unquote(tokens[after]!).startsWith('-')) {
+          const token = unquote(tokens[after]!);
+          // npm's end-of-options before the script NAME: `npm run -- inner` runs
+          // `inner` (it is not part of the script's arguments).
+          if (token === '--') {
             after += 1;
             continue;
           }
-          script = unquote(tokens[after]!);
+          if (token.startsWith('-')) {
+            const includeRoot = parseIncludeWorkspaceRoot(token);
+            if (includeRoot !== undefined) {
+              if (includeRoot) rootScript = true;
+              after += 1;
+              continue;
+            }
+            const consumed = npmGlobalFlagTokens(tokens, after);
+            if (consumed === undefined) {
+              unmodelled = true;
+              break;
+            }
+            after += consumed;
+            continue;
+          }
+          script = token;
           after += 1;
           break;
+        }
+        if (unmodelled) {
+          dynamic.push(npmSegmentLabel(tokens, i));
+          continue;
         }
         if (script === undefined) {
           // `npm run` with nothing to run: nothing is pinned, and nothing about that
@@ -639,6 +805,9 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
           dynamic.push(npmSegmentLabel(tokens, i));
           continue;
         }
+      } else if (unmodelled) {
+        dynamic.push(npmSegmentLabel(tokens, i));
+        continue;
       } else {
         // Not a verb this scan resolves (`npm ci`, `npm start`, a bare `npm …`): the
         // segment is recorded, never skipped — a body can run it, and nothing here
@@ -646,17 +815,41 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
         dynamic.push(npmSegmentLabel(tokens, i));
         continue;
       }
-      // Workspace flags may also follow the script name.
+      // npm's own flags may also follow the script name — up to `--`, after which
+      // every token belongs to the script: `npm test -- -w @scope/a` runs the ROOT
+      // `test` and forwards `-w @scope/a` to it as an argument.
       for (let k = after; k < tokens.length; k += 1) {
         const flag = parseWorkspaceFlag(tokens, k);
-        if (!flag) continue;
-        targets.push(flag.delegation);
-        if (flag.next > k + 1) k = flag.next - 1;
+        if (flag) {
+          if (flag.delegation) targets.push(flag.delegation);
+          if (flag.next > k + 1) k = flag.next - 1;
+          continue;
+        }
+        const token = unquote(tokens[k]!);
+        if (token === '--') break;
+        if (!token.startsWith('-')) continue;
+        const includeRoot = parseIncludeWorkspaceRoot(token);
+        if (includeRoot !== undefined) {
+          if (includeRoot) rootScript = true;
+          continue;
+        }
+        const consumed = npmGlobalFlagTokens(tokens, k);
+        if (consumed === undefined) {
+          unmodelled = true;
+          break;
+        }
+        k += consumed - 1;
+      }
+      if (unmodelled) {
+        dynamic.push(npmSegmentLabel(tokens, i));
+        continue;
       }
       if (!PLAUSIBLE_SCRIPT_NAME.test(script)) {
         dynamic.push(`npm ${verb} ${script}`);
       } else if (targets.length) {
         for (const target of targets) delegations.push({ ...target, script });
+        // `--include-workspace-root`: npm runs the root body alongside them.
+        if (rootScript) names.push(script);
       } else {
         names.push(script);
       }
@@ -797,6 +990,24 @@ function workspaceManifestPaths(allPaths: readonly string[], globs: readonly str
     }
   }
   return dedupe(included.filter((path) => !excluded.has(path))).sort();
+}
+
+/**
+ * The manifest paths one tree's own `"workspaces"` globs resolve to, from that
+ * tree's listing. A globbed DIRECTORY npm would run but the tree declares no glob
+ * for is invisible here by design: npm only runs what its globs match.
+ */
+function resolveWorkspaceGlobPaths(sources: TreeSources, manifest: ParseResult<ParsedManifest>): WorkspaceGlobPaths {
+  if (!manifest.ok) return { kind: 'none' };
+  const globs = normalizeWorkspaceGlobs(manifest.value?.workspaces);
+  if (globs.length === 0) return { kind: 'none' };
+  const listing = sources.listPaths?.();
+  if (!listing) return { kind: 'error', message: `${PACKAGE_JSON_PATH} declares "workspaces" but this tree cannot be listed to match them` };
+  if (listing.kind === 'error') return { kind: 'error', message: listing.message };
+  // A path the listing carries but the tree no longer has (a tracked-but-deleted
+  // manifest) is not a manifest npm would run.
+  const paths = workspaceManifestPaths(listing.paths, globs).filter((path) => sources.read(path).kind !== 'absent');
+  return { kind: 'paths', paths };
 }
 
 /**
@@ -1285,6 +1496,12 @@ function planFromSources(sources: TreeSources): TreePlan {
       : `install (${label}): ${install.argv.join(' ')} — ${install.file} present`,
   );
 
+  // The manifest-path SET this tree's own globs resolve to. npm reads the globs AND
+  // the listing from the candidate at run time, so a manifest the candidate ADDS
+  // inside an unchanged glob is a body `--workspaces` runs that the frozen base's
+  // path list never named.
+  const workspaceGlobPaths = resolveWorkspaceGlobPaths(sources, manifest);
+
   if (malformed) {
     return {
       label,
@@ -1299,6 +1516,7 @@ function planFromSources(sources: TreeSources): TreePlan {
       malformed,
       notes,
       workspaceManifestPaths: [],
+      workspaceGlobPaths,
     };
   }
 
@@ -1330,6 +1548,7 @@ function planFromSources(sources: TreeSources): TreePlan {
     malformed,
     notes,
     workspaceManifestPaths: pinned.workspaceManifestPaths,
+    workspaceGlobPaths,
   };
 }
 
@@ -1425,6 +1644,20 @@ function renderPlanDiff(base: TreePlan, candidate: TreePlan): string {
       ),
     );
   }
+  // The manifest-path SET each tree's own globs resolve to — npm runs every match
+  // under the all-workspaces flags, so a manifest the candidate ADDS inside an
+  // unchanged glob is a body that runs and the base's path list never pinned.
+  const baseGlobPaths = base.workspaceGlobPaths;
+  const candidateGlobPaths = candidate.workspaceGlobPaths;
+  if (baseGlobPaths.kind === 'paths' && candidateGlobPaths.kind === 'paths') {
+    if (baseGlobPaths.paths.join('\n') !== candidateGlobPaths.paths.join('\n')) {
+      sections.push(diffSection('workspace-manifests', baseGlobPaths.paths, candidateGlobPaths.paths));
+    }
+  } else if (baseGlobPaths.kind === 'paths' && candidateGlobPaths.kind === 'error') {
+    sections.push(diffSection('workspace-manifests', baseGlobPaths.paths, [`(candidate listing unreadable — ${candidateGlobPaths.message})`]));
+  } else if (baseGlobPaths.kind === 'error' && candidateGlobPaths.kind === 'paths') {
+    sections.push(diffSection('workspace-manifests', [`(base listing unreadable — ${baseGlobPaths.message})`], candidateGlobPaths.paths));
+  }
   if (base.commands.join('\n') !== candidate.commands.join('\n')) {
     sections.push(diffSection('commands', base.commands, candidate.commands));
   }
@@ -1518,6 +1751,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
       install: { kind: 'none', argv: [] },
       notes: [],
       workspaceManifestPaths: [],
+      workspaceGlobPaths: { kind: 'none' },
     };
     return {
       status: 'could-not-run',
@@ -1556,6 +1790,10 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
     // workspace manifests — read from the working tree, which is what turns a
     // neutered workspace script body into a drift line.
     workspaceManifestPaths: base.workspaceManifestPaths,
+    // ... and the candidate's OWN globs are matched against its OWN listing: npm
+    // reads the topology from the candidate, so an added workspace manifest is a
+    // body npm runs even when every pinned body stayed byte-identical.
+    listPaths: () => listWorkingPaths(options.repoRoot),
   });
 
   const diff = renderPlanDiff(base, candidate);

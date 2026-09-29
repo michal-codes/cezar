@@ -572,11 +572,14 @@ describe('check-commands — the command policy resolver', () => {
 
       const calls = mocked.mock.calls;
       expect(calls.length).toBeGreaterThan(0);
-      // The `-w` probe is what makes `ls-tree` run, so the new verb is covered too.
-      expect(calls.map(([, args]) => (Array.isArray(args) ? args[0] : undefined))).toContain('ls-tree');
+      // The `-w` probe is what makes `ls-tree` run and the candidate's own glob set
+      // is what makes `ls-files` run — both read-only, both fixed argv.
+      const verbs = calls.map(([, args]) => (Array.isArray(args) ? args[0] : undefined));
+      expect(verbs).toContain('ls-tree');
+      expect(verbs).toContain('ls-files');
       for (const [program, args] of calls) {
         expect(program).toBe('git');
-        expect(['rev-parse', 'show', 'ls-tree']).toContain(Array.isArray(args) ? args[0] : undefined);
+        expect(['rev-parse', 'show', 'ls-tree', 'ls-files']).toContain(Array.isArray(args) ? args[0] : undefined);
         expect(JSON.stringify(args)).not.toContain('POISON');
       }
       expect(existsSync(join(dir, 'POISON'))).toBe(false);
@@ -1040,6 +1043,199 @@ describe('check-commands — the command policy resolver', () => {
       // Still resolved (only argv files are pinned), but the residual is named.
       expect(resolution.status).toBe('resolved');
       expect(notes(resolution)).toContain('names the local script file scripts/run.sh — its body is not pinned');
+    });
+  });
+
+  describe('the `--` boundary, --ws and the candidate’s own manifest set (PR 3.4)', () => {
+    it('reads a forwarded -w as an argument: the ROOT script is pinned, and its neutering drifts (F1)', () => {
+      const files = (root: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --silent -- -w @scope/a', inner: root }),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+      });
+      baseSha = freeze(dir, files('echo ROOT-REAL'));
+      // npm 11.19.0 runs the ROOT `inner` here (`-w @scope/a` is forwarded as an
+      // argument); the resolver used to pin the workspace script and drop the root one.
+      candidate(dir, files('echo ROOT-NEUTERED'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:inner @@');
+      expect(resolution.diff).toContain('- echo ROOT-REAL');
+      expect(resolution.diff).toContain('+ echo ROOT-NEUTERED');
+      expect(notes(resolution)).not.toContain('workspace "@scope/a"');
+    });
+
+    it('reads a forwarded -w after the test verb the same way (F1)', () => {
+      const files = (test: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run probe']),
+        'package.json': workspaceRoot({ probe: 'npm test -- -w @scope/a', test }),
+        'packages/a/package.json': pkgNamed('@scope/a', { test: 'echo WS-A' }),
+      });
+      baseSha = freeze(dir, files('echo ROOT-TEST'));
+      candidate(dir, files('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:test @@');
+      expect(resolution.diff).toContain('+ exit 0');
+    });
+
+    it('pins the root script behind a `--` before the verb — npm consumes it (guard)', () => {
+      const files = (inner: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm -- run inner']),
+        'package.json': pkg({ inner }),
+      });
+      baseSha = freeze(dir, files('echo REAL'));
+      candidate(dir, files('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:inner @@');
+    });
+
+    it('recognizes --ws as npm’s abbreviation of --workspaces: a neutered workspace script drifts (F2)', () => {
+      const files = (second: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --ws', inner: 'echo ROOT' }),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+        'packages/b/package.json': pkgNamed('@scope/b', { inner: second }),
+      });
+      baseSha = freeze(dir, files('echo WS-B-REAL'));
+      // npm 11.19.0 runs `inner` in EVERY workspace for `--ws`; the resolver used to
+      // skip the token and pin only the root script, which npm does not run.
+      candidate(dir, files('echo WS-B-NEUTERED'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ workspace:packages/b/package.json#inner @@');
+      expect(notes(resolution)).toContain('npm --workspaces → packages/a/package.json, packages/b/package.json');
+    });
+
+    it('reads --ws=<anything but false> as every workspace — npm’s boolean coercion (guard)', () => {
+      const files = (second: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --ws=0', inner: 'echo ROOT' }),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+        'packages/b/package.json': pkgNamed('@scope/b', { inner: second }),
+      });
+      baseSha = freeze(dir, files('echo WS-B-REAL'));
+      candidate(dir, files('echo WS-B-NEUTERED'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ workspace:packages/b/package.json#inner @@');
+    });
+
+    it('treats a false workspace value as the root script — npm runs the root (guard)', () => {
+      const files = (root: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --ws=false', inner: root }),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+      });
+      baseSha = freeze(dir, files('echo ROOT-REAL'));
+      candidate(dir, files('echo ROOT-NEUTERED'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:inner @@');
+      expect(resolution.diff).not.toContain('workspace:');
+    });
+
+    it('records an unmodelled npm flag before the verb instead of skipping it silently', () => {
+      const files = (inner: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: 'npm --work run inner', inner }),
+      });
+      baseSha = freeze(dir, files('echo REAL'));
+      candidate(dir, files('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      // npm 11.19.0 warns "Unknown cli config" for `--work` and runs the root script;
+      // an unmodelled flag's arity is unknowable here, so the plan says what it is not
+      // pinning instead of guessing at the verb behind it.
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('dynamic npm-run reference');
+      expect(notes(resolution)).toContain('npm --work run inner');
+      expect(notes(resolution)).toContain('not pinned');
+    });
+
+    it('refuses a candidate that ADDS a workspace manifest under unchanged globs — npm --workspaces runs it (F3)', () => {
+      const files = (extra: boolean): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --workspaces' }, ['packages/*']),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+        ...(extra ? { 'packages/b/package.json': pkgNamed('@scope/b', { inner: 'echo WS-B-NEW' }) } : {}),
+      });
+      baseSha = freeze(dir, files(false));
+      // npm 11.19.0 runs the added manifest's `inner` under `--workspaces`; the plan
+      // read only the frozen base's manifest paths, so the addition was invisible.
+      candidate(dir, files(true));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.changedVsBase).toBe(true);
+      expect(resolution.diff).toContain('@@ workspace-manifests @@');
+      expect(resolution.diff).toContain('+ packages/b/package.json');
+      expect(commands(resolution)).toEqual([]);
+    });
+
+    it('does not refuse a manifest the globs do not name — the set is glob-resolved (guard)', () => {
+      const files = (extra: boolean): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --workspaces' }, ['packages/*']),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+        ...(extra ? { 'vendor/b/package.json': pkgNamed('@scope/b', { inner: 'echo WS-B' }) } : {}),
+      });
+      baseSha = freeze(dir, files(false));
+      candidate(dir, files(true));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+    });
+
+    it('pins the ROOT script too when --include-workspace-root runs it alongside the delegation', () => {
+      const files = (root: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm run inner --workspaces --include-workspace-root', inner: root }),
+        'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A' }),
+      });
+      baseSha = freeze(dir, files('echo ROOT-REAL'));
+      // npm 11.19.0 runs ROOT *and* every workspace for this pair; pinning only the
+      // workspace left the root body unpinned.
+      candidate(dir, files('echo ROOT-NEUTERED'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:inner @@');
+    });
+
+    it('records a --prefix that names another tree instead of pinning this tree’s body', () => {
+      const files = (inner: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: 'npm --prefix ./other run inner', inner }),
+      });
+      baseSha = freeze(dir, files('echo REAL'));
+      candidate(dir, files('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('dynamic npm-run reference');
+      expect(notes(resolution)).toContain('not pinned');
     });
   });
 
