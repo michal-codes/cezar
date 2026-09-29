@@ -78,17 +78,28 @@ export type LandingDerivation =
   | { status: 'could-not-run'; reason: 'source-missing'; detail: string };
 
 /** A caller-supplied `git` invocation, already bound to a working directory. Same shape as
- *  `git-diff-base.ts`'s runner, widened with stderr because the merge loop reports it. */
-export type LandingGit = (args: string[]) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
+ *  `git-diff-base.ts`'s runner, widened with stderr because the merge loop reports it — and with
+ *  an optional env, which is how the merge loop pins the commits it creates (see
+ *  `landingMergeEnv`). */
+export type LandingGit = (
+  args: string[],
+  env?: Record<string, string>,
+) => Promise<{ ok: boolean; stdout: string; stderr: string }>;
 
 /** A `git` runner bound to `cwd`. Never throws — every caller branches on `ok`. */
 export function gitIn(cwd: string): LandingGit {
-  return (args) =>
+  return (args, env) =>
     new Promise((resolve) => {
       execFile(
         'git',
         args,
-        { cwd, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' },
+        {
+          cwd,
+          maxBuffer: 32 * 1024 * 1024,
+          encoding: 'utf8',
+          // Spread, never replace: git needs PATH, HOME and its own GIT_* vars from the host.
+          ...(env ? { env: { ...process.env, ...env } } : {}),
+        },
         (err, stdout, stderr) => resolve({ ok: !err, stdout: stdout ?? '', stderr: stderr ?? '' }),
       );
     });
@@ -336,8 +347,44 @@ export interface MaterializeLandingSubjectOptions {
 }
 
 /**
+ * The identity and date every merge commit of ONE materialization is stamped with, read from the
+ * frozen BASE commit: its author and committer identities, and its committer date.
+ *
+ * `git merge --no-ff` would otherwise stamp each commit with the operator's current identity and
+ * the current time, so the same subject would materialize to a different commit on every run —
+ * and the acknowledgement digest binds the materialized head, so a foreign preview's digest could
+ * never match the run that acks it. Pinning the stamp makes the subject a pure function of
+ * (base, sources, order): same content, same tree, same head, same digest.
+ *
+ * `undefined` when the base cannot be read — the merge loop then runs as git would by default,
+ * and a base that cannot be read fails on its own.
+ */
+const MERGE_STAMP_FORMAT = '%an%x09%ae%x09%cn%x09%ce%x09%cI';
+
+async function landingMergeEnv(git: LandingGit, baseSha: string): Promise<Record<string, string> | undefined> {
+  const read = await git(['log', '-1', `--format=${MERGE_STAMP_FORMAT}`, baseSha]);
+  if (!read.ok) return undefined;
+  const [authorName = '', authorEmail = '', committerName = '', committerEmail = '', date = ''] = read.stdout
+    .trim()
+    .split('\t');
+  if (!date) return undefined;
+  return {
+    GIT_AUTHOR_NAME: authorName,
+    GIT_AUTHOR_EMAIL: authorEmail,
+    GIT_AUTHOR_DATE: date,
+    GIT_COMMITTER_NAME: committerName || authorName,
+    GIT_COMMITTER_EMAIL: committerEmail || authorEmail,
+    GIT_COMMITTER_DATE: date,
+  };
+}
+
+/**
  * Materialize the subject: `git merge --no-ff <sha>` for each source, in order, in the check
  * run's own worktree.
+ *
+ * The commits it creates are REPRODUCIBLE — identity, date and no-signing are pinned to the
+ * frozen base (`landingMergeEnv`) — so the same subject yields the same head on a later run, which
+ * is what the acknowledgement digest binds.
  *
  * Three guards, each closing a measured way for the check to lie about what it checked:
  *  - a CLEAN PRECONDITION (a dirty, non-overlapping tracked file merges silently — the verdict
@@ -372,8 +419,23 @@ export async function materializeLandingSubject(options: MaterializeLandingSubje
     }
   }
 
+  const mergeEnv = await landingMergeEnv(git, options.baseSha);
   for (const source of options.sources) {
-    const merge = await git(['merge', '--no-ff', '--no-edit', '-m', `Landing check: merge ${source.ref} (${source.sha.slice(0, 8)})`, source.sha]);
+    const merge = await git(
+      [
+        // A GPG signature embeds a signing time, so a signed commit could never be reproduced:
+        // the same subject is the same commit only while these synthetic merges are unsigned.
+        '-c',
+        'commit.gpgsign=false',
+        'merge',
+        '--no-ff',
+        '--no-edit',
+        '-m',
+        `Landing check: merge ${source.ref} (${source.sha.slice(0, 8)})`,
+        source.sha,
+      ],
+      mergeEnv,
+    );
     if (!merge.ok) {
       const conflicts = await git(['diff', '--name-only', '--diff-filter=U']);
       const files = conflicts.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
@@ -433,8 +495,10 @@ export interface LandingResultEntry {
   finishedAt?: string;
 }
 
-/** The seam's six statuses as the record's four, with the reason that keeps the difference. */
-export function landingResultOf(status: CheckOutcomeStatus, exitCode: number, startedAt: string, finishedAt?: string): Pick<LandingResultEntry, 'outcome'> & { reason?: string } {
+/** The seam's six statuses as the record's four, with the reason that keeps the difference. The
+ *  status alone carries it: the exit code and the timestamps are recorded by the caller, and this
+ *  mapping never read them. */
+export function landingResultOf(status: CheckOutcomeStatus): Pick<LandingResultEntry, 'outcome'> & { reason?: string } {
   switch (status) {
     case 'passed':
       return { outcome: 'passed' };
@@ -556,8 +620,9 @@ export async function detectForeignSubject(options: {
 }
 
 /** The canonical digest's version. Bump it when the shape below changes: an old preview's digest
- *  must never match a digest computed under a new shape, or a stale ack would unlock a run. */
-export const LANDING_SUBJECT_DIGEST_VERSION = 1;
+ *  must never match a digest computed under a new shape, or a stale ack would unlock a run.
+ *  2 — `headSha` joined the canonical form (PR 4.2). */
+export const LANDING_SUBJECT_DIGEST_VERSION = 2;
 
 export interface LandingSubjectDigestInput {
   baseRef: string;
@@ -565,6 +630,9 @@ export interface LandingSubjectDigestInput {
   sources: readonly LandingSource[];
   /** The materialized subject's tree — the verdict's identity, and the digest's anchor. */
   treeSha: string;
+  /** The commit that tree was checked out from. Stable across materializations because the merge
+   *  loop pins its metadata to the frozen base; see `materializeLandingSubject`. */
+  headSha: string;
   /** The resolved plan's digest (`check-commands.ts`), so a moved PLAN re-previews too. */
   commandsDigest: string;
   /** `npm ci` / `npm install`, when the frozen base declares a manifest. */
@@ -576,9 +644,12 @@ export interface LandingSubjectDigestInput {
  * frozen subject. Two properties are the whole point, and both are properties of this function:
  *
  *  - Stable — the same subject digests identically on a later run. The key order is fixed here
- *    (JSON.stringify preserves insertion order), the tree sha is the materialized result (merge
- *    commits carry metadata, trees do not), and every semantic input — the pinned sources, the
- *    resolved plan, the install argv — is inside.
+ *    (JSON.stringify preserves insertion order), and every semantic input — the pinned sources,
+ *    the materialized tree AND head, the resolved plan, the install argv — is inside. The head is
+ *    in the digest only because it is stable: `materializeLandingSubject` pins the merge commits'
+ *    identity and date to the frozen base, so a later materialization of the same (base, sources)
+ *    produces the same commit — without that pinning, this field would make every preview's digest
+ *    unmatchable by the run that acks it.
  *  - Moving with the subject — a new commit on a source, a new base, a different tree or a changed
  *    plan all produce a different digest, so an old acknowledgement previews again instead of
  *    running.
@@ -590,6 +661,7 @@ export function landingSubjectDigest(input: LandingSubjectDigestInput): { versio
     baseSha: input.baseSha,
     sources: input.sources.map((source) => ({ ref: source.ref, sha: source.sha })),
     treeSha: input.treeSha,
+    headSha: input.headSha,
     commandsDigest: input.commandsDigest,
     installArgv: [...(input.installArgv ?? [])],
   });

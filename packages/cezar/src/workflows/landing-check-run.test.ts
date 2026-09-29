@@ -515,3 +515,180 @@ posix('an early break records the commands it never ran (D2)', () => {
     expect(existsSync(join(final?.worktreePath as string, 'second-ran.txt'))).toBe(false);
   }, 60_000);
 });
+
+posix('a restart after materialization (PR 4.2)', () => {
+  /**
+   * Rewind a check run's record to the shape a crash between materialization and the verdict
+   * leaves: the subject is on the record and in the check worktree, the gate steps exist, an
+   * interrupted attempt may have recorded some results — and `verdict` is missing. A crash cannot
+   * be staged in-process, so a dry-run attempt (which materializes the subject and stops AT the
+   * gate) stands in for the interrupted one and a NEW manager recovers the run, which is the path
+   * the previous process never got to write.
+   */
+  const rewind = (runId: string, results?: NonNullable<RunRecord['landingCheck']>['results']): void => {
+    const check = store.getRun(runId)?.landingCheck as NonNullable<RunRecord['landingCheck']>;
+    const crashed = { ...check };
+    delete crashed.verdict;
+    delete crashed.reason;
+    delete crashed.results;
+    store.updateRun(runId, {
+      status: 'running',
+      finishedAt: undefined,
+      currentStepId: undefined,
+      landingCheck: results ? { ...crashed, results } : crashed,
+    });
+  };
+
+  it('re-initialises the recorder: a crash after materialization still ends with a verdict', async () => {
+    await commit(
+      '.ai/agentic.config.json',
+      `${JSON.stringify({ version: 1, validation: { commands: ['echo first > gate-1.txt', 'echo second > gate-2.txt'] } })}\n`,
+      'base',
+    );
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    const parentSha = await commit('b.txt', 'parent\n', 'parent work');
+    const startedAt = new Date().toISOString();
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/child', parentSha);
+    await commit('c.txt', 'child\n', 'child work');
+    await git(repoRoot, 'checkout', '-q', 'cez/parent');
+
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+    const child = mkRun({ title: 'child', branch: 'cez/child', parentId: parent.id, baseBranch: 'cez/parent', startedAt });
+    appendLedger(dataDir, parent.id, { type: 'dispatch', runId: child.id, parentRunId: parent.id });
+
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    // A crash cannot be staged in-process, so the first attempt IS a dry run: it materializes the
+    // subject and stops AT the gate — the record a crash between materialization and the verdict
+    // leaves, with no gate artifact and no autosave commit on top of the subject.
+    await withEnv({ CEZ_DRY_RUN: '1' }, async () => {
+      await settle(started.runId);
+    });
+    const dry = store.getRun(started.runId);
+    expect(dry?.landingCheck?.verdict).toBe('could-not-run');
+    expect(dry?.landingCheck?.reason).toBe('dry-run');
+    const treeSha = dry?.landingCheck?.subject.treeSha as string;
+    const interrupted = dry?.landingCheck?.results?.[0];
+    expect(interrupted).toBeDefined(); // the interrupted attempt really recorded one
+    manager.dispose();
+
+    // The crash: the subject is materialized, ONE result of the interrupted attempt is recorded,
+    // and no verdict was ever written.
+    rewind(started.runId, interrupted ? [interrupted] : undefined);
+
+    manager = new RunManager(store, repoRoot);
+    await manager.recover();
+    await settle(started.runId);
+
+    const revived = store.getRun(started.runId);
+    expect(revived?.landingCheck?.subject.treeSha).toBe(treeSha); // the same subject was re-checked
+    expect(revived?.landingCheck?.verdict).toBe('passed');
+    expect(revived?.status).toBe('done');
+    expect(revived?.landingCheck?.results?.map((entry) => [entry.command, entry.outcome])).toEqual([
+      ['echo first > gate-1.txt', 'passed'],
+      ['echo second > gate-2.txt', 'passed'],
+    ]);
+    // The interrupted attempt's entry is REPLACED, not merged into this attempt's list: one list
+    // describes one pass, and a merged list would mix two attempts' outcomes into one verdict.
+    expect(revived?.landingCheck?.results?.[0]?.startedAt).not.toBe(interrupted?.startedAt);
+  }, 120_000);
+
+  it('a landing check reaching the end of the loop with nothing recorded still gets a verdict', async () => {
+    await commit('.ai/agentic.config.json', `${JSON.stringify({ version: 1, validation: { commands: ['echo gate-ok > gate-ran.txt'] } })}\n`, 'base');
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    const parentSha = await commit('b.txt', 'parent\n', 'parent work');
+    const startedAt = new Date().toISOString();
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/child', parentSha);
+    await commit('c.txt', 'child\n', 'child work');
+    await git(repoRoot, 'checkout', '-q', 'cez/parent');
+
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+    const child = mkRun({ title: 'child', branch: 'cez/child', parentId: parent.id, baseBranch: 'cez/parent', startedAt });
+    appendLedger(dataDir, parent.id, { type: 'dispatch', runId: child.id, parentRunId: parent.id });
+
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    await withEnv({ CEZ_DRY_RUN: '1' }, async () => {
+      await settle(started.runId);
+    });
+    expect(store.getRun(started.runId)?.landingCheck?.subject.treeSha).toMatch(/^[0-9a-f]{40}$/);
+    manager.dispose();
+
+    // The crash window: materialized, plan resolved, but the workflow record holds no gate steps
+    // yet (the process died while the install step was still running, before the steps were
+    // added). Re-running that record executes nothing — and must still record a non-green verdict
+    // rather than leaving `verdict` undefined.
+    const def = store.getRun(started.runId)?.workflowDef as NonNullable<RunRecord['workflowDef']>;
+    rewind(started.runId);
+    store.updateRun(started.runId, { workflowDef: { ...def, steps: [] } });
+
+    manager = new RunManager(store, repoRoot);
+    await manager.recover();
+    await settle(started.runId);
+
+    const revived = store.getRun(started.runId);
+    expect(revived?.landingCheck?.verdict).toBe('could-not-run');
+    expect(revived?.landingCheck?.reason).toBe('no-results');
+    // A non-green verdict is never a green run: the status matches the verdict.
+    expect(revived?.status).toBe('failed');
+    expect(existsSync(join(revived?.worktreePath as string, 'gate-ran.txt'))).toBe(false);
+  }, 120_000);
+
+  it('never runs the gate when the resumed worktree no longer holds the subject', async () => {
+    await commit('.ai/agentic.config.json', `${JSON.stringify({ version: 1, validation: { commands: ['echo gate-ok > gate-ran.txt'] } })}\n`, 'base');
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    const parentSha = await commit('b.txt', 'parent\n', 'parent work');
+    const startedAt = new Date().toISOString();
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/child', parentSha);
+    await commit('c.txt', 'child\n', 'child work');
+    await git(repoRoot, 'checkout', '-q', 'cez/parent');
+
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+    const child = mkRun({ title: 'child', branch: 'cez/child', parentId: parent.id, baseBranch: 'cez/parent', startedAt });
+    appendLedger(dataDir, parent.id, { type: 'dispatch', runId: child.id, parentRunId: parent.id });
+
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    await settle(started.runId);
+    const record = store.getRun(started.runId);
+    expect(record?.landingCheck?.verdict).toBe('passed');
+    manager.dispose();
+
+    // The subject is no longer anywhere: the worktree is gone AND the check's own branch was
+    // rewound to the frozen base. Re-creating the worktree would hand the gate the BASE ALONE —
+    // and a passing gate would then be recorded as a green verdict about a subject never checked.
+    rmSync(record?.worktreePath as string, { recursive: true, force: true });
+    await git(repoRoot, 'worktree', 'prune');
+    await git(repoRoot, 'branch', '-f', record?.branch as string, record?.landingCheck?.subject.baseSha as string);
+    rewind(started.runId);
+
+    manager = new RunManager(store, repoRoot);
+    await manager.recover();
+    await settle(started.runId);
+
+    const revived = store.getRun(started.runId);
+    expect(revived?.landingCheck?.verdict).toBe('could-not-run');
+    expect(revived?.landingCheck?.reason).toBe('worktree-lost');
+    expect(revived?.status).toBe('failed');
+    // The base alone was never gated: the marker the command would have written is absent.
+    expect(existsSync(join(revived?.worktreePath as string, 'gate-ran.txt'))).toBe(false);
+  }, 120_000);
+
+  it('says plainly on the check run that the gate is not a sandbox', async () => {
+    const { parent } = await parentAndChild();
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    await settle(started.runId);
+    expect(store.getRun(started.runId)?.landingCheck?.verdict).toBe('passed');
+
+    const said = events(started.runId).filter(
+      (event) => event.type === 'note' && String(event.message).includes('not a sandbox'),
+    );
+    expect(said).toHaveLength(1);
+    expect(String(said[0]?.message)).toContain('runs this repository');
+  }, 60_000);
+});
