@@ -33,17 +33,27 @@
  * `nothing-to-check` is not green and `commands` is empty on every non-`resolved`
  * status, so a caller that ignores `status` still has nothing to execute.
  *
- * What the pinned plan covers — the F1 lesson, extended by PR 3.2. Pinning the
- * bodies a list *directly* names is close to vacuous in a repo whose gate is a
- * set of thin delegating stubs (`typecheck` -> `npm run typecheck:server` ->
- * `-w @scope/pkg` -> the workspace's body), so the digest covers the TRANSITIVE
+ * What the pinned plan covers — the F1 lesson, extended by PR 3.2 and PR 3.3.
+ * Pinning the bodies a list *directly* names is close to vacuous in a repo whose
+ * gate is a set of thin delegating stubs (`typecheck` -> `npm run typecheck:server`
+ * -> `-w @scope/pkg` -> the workspace's body), so the digest covers the TRANSITIVE
  * CLOSURE of npm-run references (bounded depth, cycle-safe, `pre*`/`post*` hooks
  * included), the local script files an argv names (best effort: an argv-position
  * token that exists in the tree), the Makefile when a make command makes it a
  * body, and — PR 3.2 — the WORKSPACE MANIFESTS a `-w`/`--workspace`/`--workspaces`
  * delegation addresses: resolved through the root `workspaces` globs, read from
- * the same tree, pinned recursively with the manifest path recorded. What cannot
- * be resolved statically — `npm run "$TARGET"`, a chain past the depth bound, a
+ * the same tree, pinned recursively with the manifest path recorded. PR 3.3 adds
+ * the TOPOLOGY those manifests were resolved through — the root `"workspaces"`
+ * globs — because npm reads that field from the CANDIDATE at run time: a candidate
+ * that moves the globs redirects a `-w <name>` delegation to another, unpinned
+ * manifest while every pinned body stays byte-identical, so the globs are compared
+ * in the drift check like any pinned body.
+ *
+ * The npm scan behind all of it (PR 3.3) skips the GLOBAL FLAGS npm accepts before
+ * the verb (`npm --silent run inner`, `npm --loglevel=error test`) and records any
+ * `npm …` segment it still cannot resolve — a bare `npm run`, a `npm ci` inside a
+ * script body — as a dynamic note instead of continuing silently. What cannot be
+ * resolved statically — `npm run "$TARGET"`, a chain past the depth bound, a
  * delegation whose target the tree does not declare — is recorded in `notes`,
  * never guessed at.
  *
@@ -113,13 +123,25 @@ const SEGMENT_WRAPPERS = new Set(['env', 'command', 'exec', 'nohup', 'time', 'su
 const PLAUSIBLE_SCRIPT_NAME = /^[A-Za-z0-9_:.+-][A-Za-z0-9_:.@+-]*$/;
 
 /**
+ * npm's global flags that consume the NEXT token as a value when they precede the
+ * verb in their separate form (`npm --loglevel error run inner`). The `=` form
+ * carries its value inline and skips one token, like any other flag. Verified
+ * against npm 11: `npm -l` is NOT one of them (it prints usage; the token after it
+ * is read as the command), so it is deliberately absent.
+ */
+const NPM_VALUE_FLAGS = new Set(['--prefix', '--loglevel', '--registry', '--userconfig', '--cache']);
+
+/**
  * The digest payload's shape version. v1 pinned only the bodies a list directly
  * named; v2 added the transitive npm-run closure and the argv script files; v3
  * (PR 3.2) adds the workspace manifests behind `-w`/`--workspace`/`--workspaces`
- * delegations. A payload change means a version bump — the digest is compared
- * across runs, never persisted, but PR 4 and the review read this number.
+ * delegations; v4 (PR 3.3) adds the root `"workspaces"` globs those delegations
+ * resolve against — the topology npm reads from the CANDIDATE at run time, so a
+ * candidate that moves it can redirect a delegation without moving any pinned
+ * body. A payload change means a version bump — the digest is compared across
+ * runs, never persisted, but PR 4 and the review read this number.
  */
-export const CHECK_PLAN_DIGEST_VERSION = 3;
+export const CHECK_PLAN_DIGEST_VERSION = 4;
 
 /** How much of a drift diff is kept. A moved body is the interesting part, and a
  *  manifest diff cannot usefully exceed this. */
@@ -259,6 +281,14 @@ interface TreePlan {
   commands: string[];
   /** The npm-run closure: referenced scripts, their hooks, the hooks of the chain, sorted by name. */
   scripts: ScriptBody[];
+  /**
+   * The root manifest's declared `"workspaces"` globs, normalized — the topology npm
+   * resolves every `-w` selector against AT RUN TIME. It is read from the candidate,
+   * while the plan pins the frozen base's, so a candidate that moves it redirects a
+   * delegation to another manifest without moving a single pinned body. Compared as
+   * its own drift section for exactly that reason.
+   */
+  workspaces: string[];
   /** Workspace script bodies reached through `-w` delegations, sorted by manifest then name. */
   workspaceScripts: WorkspaceScriptBody[];
   /** Local script files named in argv, sorted by path. */
@@ -519,6 +549,16 @@ interface NpmScriptRefs {
 }
 
 /**
+ * The `npm …` segment a dynamic note names, verbatim from the npm token on — capped
+ * so one long command cannot flood the notes. The notes carry it so a reader can see
+ * WHICH invocation was left unpinned.
+ */
+function npmSegmentLabel(tokens: readonly string[], start: number): string {
+  const shown = tokens.slice(start).map((token) => unquote(token));
+  return shown.length > 8 ? `${shown.slice(0, 8).join(' ')} …` : shown.join(' ');
+}
+
+/**
  * One npm workspace flag, with the token index to resume at. `-w x`,
  * `--workspace x`, `--workspace=x` and `-w=x` name one workspace; `-ws` /
  * `--workspaces` names every workspace. A workspace flag whose value is missing
@@ -543,7 +583,10 @@ function parseWorkspaceFlag(tokens: readonly string[], index: number): { delegat
  * (`npm run "$TARGET"`) is reported as dynamic instead of guessed at. A workspace
  * flag changes WHERE the script resolves (`npm run build -w @scope/pkg` runs the
  * workspace's `build`, not the root's), so such a segment yields a delegation and
- * never a same-manifest name.
+ * never a same-manifest name. GLOBAL flags between `npm` and the verb do not hide
+ * the verb (`npm --silent run inner`, `npm --loglevel=error test`), and a segment
+ * whose verb still cannot be resolved is reported as dynamic rather than skipped,
+ * so an unpinned npm invocation is never silent.
  */
 function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const names: string[] = [];
@@ -552,15 +595,21 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
   for (const tokens of shellSegments(text)) {
     for (let i = 0; i < tokens.length; i += 1) {
       if (unquote(tokens[i] ?? '') !== 'npm') continue;
-      // Only workspace flags may precede the verb; any other leading token keeps
-      // the original parse (it must be the verb itself).
+      // A workspace flag is a delegation; any other `-`-token before the verb is a
+      // global npm flag and is skipped, with one more token for the five that take
+      // a separate value. The first token that is neither is the verb.
       const targets: Omit<WorkspaceDelegation, 'script'>[] = [];
       let cursor = i + 1;
       while (cursor < tokens.length) {
-        const flag = parseWorkspaceFlag(tokens, cursor);
-        if (!flag) break;
-        targets.push(flag.delegation);
-        cursor = flag.next;
+        const workspaceFlag = parseWorkspaceFlag(tokens, cursor);
+        if (workspaceFlag) {
+          targets.push(workspaceFlag.delegation);
+          cursor = workspaceFlag.next;
+          continue;
+        }
+        const globalFlag = unquote(tokens[cursor]!);
+        if (!globalFlag.startsWith('-')) break;
+        cursor += NPM_VALUE_FLAGS.has(globalFlag) ? 2 : 1;
       }
       const verb = tokens[cursor] === undefined ? undefined : unquote(tokens[cursor]!);
       let after = cursor + 1;
@@ -583,8 +632,17 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
           after += 1;
           break;
         }
-        if (script === undefined) continue;
+        if (script === undefined) {
+          // `npm run` with nothing to run: nothing is pinned, and nothing about that
+          // is silent any more.
+          dynamic.push(npmSegmentLabel(tokens, i));
+          continue;
+        }
       } else {
+        // Not a verb this scan resolves (`npm ci`, `npm start`, a bare `npm …`): the
+        // segment is recorded, never skipped — a body can run it, and nothing here
+        // pins what it would do.
+        dynamic.push(npmSegmentLabel(tokens, i));
         continue;
       }
       // Workspace flags may also follow the script name.
@@ -674,6 +732,25 @@ function manifestDirectory(manifestPath: string): string {
 /** Strip `./` and trailing slashes from a workspace glob or a `-w <path>` selector. */
 function normalizeWorkspacePath(value: string): string {
   return value.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
+/**
+ * The root `"workspaces"` value as the digest and the drift diff compare it:
+ * declaration order, `./`/trailing slashes normalized, blanks dropped, `!`-negation
+ * kept, duplicates collapsed (npm matches a repeated glob twice and resolves the
+ * same set). npm reads this field from the CANDIDATE at run time, so a candidate
+ * that moves it has moved what every `-w` selector means even when the pinned
+ * bodies are byte-identical.
+ */
+function normalizeWorkspaceGlobs(globs: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const raw of globs ?? []) {
+    const trimmed = raw.trim();
+    const negated = trimmed.startsWith('!');
+    const pattern = normalizeWorkspacePath(negated ? trimmed.slice(1) : trimmed);
+    if (pattern) out.push(`${negated ? '!' : ''}${pattern}`);
+  }
+  return dedupe(out);
 }
 
 /** npm workspace globs are simple: `?`/`*` stay inside one segment, `**` crosses. */
@@ -907,6 +984,7 @@ function collectPinnedBodies(input: ClosureInput): ClosureResult {
   for (const path of filePaths) visitFile(path, 1);
   for (const command of commandRoots) {
     const refs = extractNpmScriptRefs(command);
+    for (const dynamic of refs.dynamic) note(`${command}: dynamic npm-run reference (${dynamic}) — not pinnable, and not pinned`);
     for (const name of refs.names) {
       if (!visitScript(PACKAGE_JSON_PATH, name, 1)) {
         notes.push(`${command}: the frozen base resolves no "${name}" script — the argv is pinned, its body is not`);
@@ -1190,6 +1268,9 @@ function planFromSources(sources: TreeSources): TreePlan {
 
   const install = resolveInstall(sources);
   if (install.error) malformed ??= { reason: 'unreadable-source', detail: install.error };
+  // The topology npm resolves `-w` selectors against — carried even when no
+  // delegation resolved a manifest, because the drift rule compares it either way.
+  const workspaceGlobs = normalizeWorkspaceGlobs(manifest.value?.workspaces);
   notes.push(
     install.kind === 'none'
       ? `install (${label}): nothing to install (no ${PACKAGE_JSON_PATH} and no ${PACKAGE_LOCK_PATH})`
@@ -1201,6 +1282,7 @@ function planFromSources(sources: TreeSources): TreePlan {
       label,
       source,
       commands: [],
+      workspaces: workspaceGlobs,
       scripts: [],
       workspaceScripts: [],
       files: [],
@@ -1231,6 +1313,7 @@ function planFromSources(sources: TreeSources): TreePlan {
     label,
     source,
     commands,
+    workspaces: workspaceGlobs,
     scripts: pinned.scripts,
     workspaceScripts: pinned.workspaceScripts,
     files: pinned.files,
@@ -1257,18 +1340,23 @@ function resolveInstall(sources: TreeSources): TreePlan['install'] {
  * Identity of the plan that would run: the ordered list, the resolved closure
  * (referenced scripts, their hooks, the whole npm-run chain), the local script
  * files named in argv, the workspace script bodies behind `-w` delegations (with
- * the manifest path that defines each), and the Makefile text when a make command
- * makes it a body. Deterministic — sorted bodies, no timestamps. Exactly what the
- * drift rule compares. `CHECK_PLAN_DIGEST_VERSION` is the shape version (v1 pinned
- * only directly referenced bodies; v2 added the closure and argv files; v3 adds
- * the workspace manifests) — bump it whenever the payload changes.
+ * the manifest path that defines each), the root `"workspaces"` globs every such
+ * delegation resolves against (v4), and the Makefile text when a make command makes
+ * it a body. Deterministic — sorted bodies, no timestamps. Exactly what the drift
+ * rule compares. `CHECK_PLAN_DIGEST_VERSION` is the shape version (v1 pinned only
+ * directly referenced bodies; v2 added the closure and argv files; v3 added the
+ * workspace manifests; v4 adds the workspace globs) — bump it whenever the payload
+ * changes.
  */
-function planDigest(plan: Pick<TreePlan, 'source' | 'commands' | 'scripts' | 'workspaceScripts' | 'files' | 'makefile'>): string {
+function planDigest(
+  plan: Pick<TreePlan, 'source' | 'commands' | 'scripts' | 'workspaces' | 'workspaceScripts' | 'files' | 'makefile'>,
+): string {
   const payload = {
     version: CHECK_PLAN_DIGEST_VERSION,
     source: plan.source,
     commands: plan.commands,
     scripts: plan.scripts.map(({ name, body }) => ({ name, body })),
+    workspaces: plan.workspaces,
     workspaceScripts: plan.workspaceScripts.map(({ manifest, name, body }) => ({ manifest, name, body })),
     files: plan.files.map(({ path, text }) => ({ path, text })),
     makefile: plan.makefile.pinned ? plan.makefile.text : null,
@@ -1288,6 +1376,25 @@ const MISSING_BASE = '(no such script in the frozen base)';
 const MISSING_CANDIDATE = '(no such script in the candidate)';
 
 /**
+ * A candidate that moved the root `"workspaces"` globs moved what every `-w`
+ * delegation resolves to AT RUN TIME (npm reads that field from the candidate),
+ * while this plan resolved the frozen base's. A base note claiming a delegated body
+ * "is pinned" is then a claim about a manifest npm will not run, so the two wording
+ * forms that carry it are restated; every other note is returned untouched. Called
+ * only when the two topologies differ.
+ */
+function demoteDelegationPins(notes: readonly string[]): string[] {
+  const marker = ' — the delegated "';
+  const tail = '" script is pinned';
+  return notes.map((note) => {
+    const at = note.indexOf(marker);
+    if (at === -1 || !note.endsWith(tail)) return note;
+    const script = note.slice(at + marker.length, note.length - tail.length);
+    return `${note.slice(0, at + marker.length)}${script}" script is NOT pinned at run time: the candidate moved the root manifest's "workspaces" globs, and npm resolves this delegation against the candidate's topology, not the frozen base's`;
+  });
+}
+
+/**
  * The drift diff, and the drift predicate in one: a non-empty diff means the
  * candidate moved the pinned plan (or cannot be resolved), so nothing may run.
  * Rendering and deciding in one function is deliberate — a separate boolean is
@@ -1297,6 +1404,18 @@ function renderPlanDiff(base: TreePlan, candidate: TreePlan): string {
   const sections: string[] = [];
   if (candidate.malformed) {
     sections.push(diffSection('source', [base.source], [`unreadable — ${candidate.malformed.detail}`]));
+  }
+  // The topology npm resolves `-w` selectors against, first because it steers
+  // everything below it: with the globs moved, an identical `workspace:` section
+  // would be pinning manifests npm will not run.
+  if (base.workspaces.join('\n') !== candidate.workspaces.join('\n')) {
+    sections.push(
+      diffSection(
+        'workspaces',
+        base.workspaces.map((glob) => JSON.stringify(glob)),
+        candidate.workspaces.map((glob) => JSON.stringify(glob)),
+      ),
+    );
   }
   if (base.commands.join('\n') !== candidate.commands.join('\n')) {
     sections.push(diffSection('commands', base.commands, candidate.commands));
@@ -1383,6 +1502,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
       label: `base ${shortSha(options.baseSha)}`,
       source: 'none',
       commands: [],
+      workspaces: [],
       scripts: [],
       workspaceScripts: [],
       files: [],
@@ -1431,7 +1551,12 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
   });
 
   const diff = renderPlanDiff(base, candidate);
-  const notes = [...base.notes];
+  // The candidate's root `"workspaces"` globs are what npm resolves `-w` against at
+  // run time; when they differ from the base's, a base note that says a delegated
+  // body is pinned has to be restated (see demoteDelegationPins) — the diff below
+  // already refuses the run either way.
+  const topologyMoved = base.workspaces.join('\n') !== candidate.workspaces.join('\n');
+  const notes = topologyMoved ? demoteDelegationPins(base.notes) : [...base.notes];
   const digest = planDigest(base);
   const makefile = { present: base.makefile.present, targets: base.makefile.targets };
   const install = installPlan(base, baseLabel);
@@ -1477,6 +1602,11 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
       diff,
       notes: [
         ...notes,
+        ...(topologyMoved
+          ? [
+              `candidate (working tree): root ${PACKAGE_JSON_PATH} "workspaces" changed: ${JSON.stringify(base.workspaces)} → ${JSON.stringify(candidate.workspaces)} — npm resolves -w delegations against the candidate's topology, so the base's pin does not cover what runs`,
+            ]
+          : []),
         `candidate (working tree): ${candidate.malformed ? candidate.malformed.detail : `${candidate.commands.length} command(s) resolved from ${candidate.source}`}`,
         'commands-changed-vs-base: the candidate moved the pinned plan — nothing was run',
       ],

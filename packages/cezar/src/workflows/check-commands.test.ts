@@ -349,7 +349,7 @@ describe('check-commands — the command policy resolver', () => {
       expect(resolve(dir, baseSha).digest).toBe(resolve(dir, baseSha).digest);
     });
 
-    it('changes when a WORKSPACE script body changes — the delegation is in the payload (v3)', () => {
+    it('changes when a WORKSPACE script body changes — the delegation is in the payload', () => {
       const files = (workspace: Record<string, string>): Record<string, string> => ({
         '.ai/agentic.config.json': config(['npm run test:unit']),
         'package.json': workspaceRoot({ 'test:unit': 'npm run test:unit -w @acme/pkg' }),
@@ -362,7 +362,23 @@ describe('check-commands — the command policy resolver', () => {
 
       expect(first.digest).not.toBe(second.digest);
       // The payload version is the contract for every consumer that compares digests.
-      expect(CHECK_PLAN_DIGEST_VERSION).toBe(3);
+      expect(CHECK_PLAN_DIGEST_VERSION).toBe(4);
+    });
+
+    it('changes when the base\'s root "workspaces" globs change — the topology is in the payload (v4)', () => {
+      const files = (workspaces: string[]): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run test:unit']),
+        'package.json': workspaceRoot({ 'test:unit': 'npm run test:unit -w @acme/pkg' }, workspaces),
+        'packages/pkg/package.json': pkgNamed('@acme/pkg', { 'test:unit': 'vitest run' }),
+      });
+      baseSha = freeze(dir, files(['packages/*']));
+      const first = resolve(dir, baseSha);
+      // `vendor/*` matches no manifest, so every pinned body is identical — only the
+      // topology moved, and it must move the digest too.
+      baseSha = freeze(dir, files(['packages/*', 'vendor/*']), 'topology moved');
+      const second = resolve(dir, baseSha);
+
+      expect(first.digest).not.toBe(second.digest);
     });
   });
 
@@ -856,6 +872,160 @@ describe('check-commands — the command policy resolver', () => {
 
       expect(resolution.status).toBe('resolved');
       expect(notes(resolution)).not.toContain('packages/pkg/package.json');
+    });
+  });
+
+  describe('the workspace topology and the npm flag scan (PR 3.3)', () => {
+    /** The redirect probe: one delegation name, resolvable to two different manifests. */
+    const redirected = (workspaces: string[], builds: { a?: string; vendor?: string }): Record<string, string> => ({
+      '.ai/agentic.config.json': config(['npm run build']),
+      'package.json': workspaceRoot({ build: 'npm run build -w @scope/a' }, workspaces),
+      ...(builds.a === undefined ? {} : { 'packages/a/package.json': pkgNamed('@scope/a', { build: builds.a }) }),
+      ...(builds.vendor === undefined ? {} : { 'vendor/a/package.json': pkgNamed('@scope/a', { build: builds.vendor }) }),
+    });
+
+    it('refuses when the candidate moves the root "workspaces" globs — the redirect is drift, not a valid pin', () => {
+      baseSha = freeze(dir, redirected(['packages/*'], { a: 'echo REAL' }));
+      // Every pinned body stays byte-identical; only the topology moves, so npm now
+      // resolves `-w @scope/a` to vendor/a — a manifest the frozen base never pinned.
+      candidate(dir, redirected(['vendor/*'], { vendor: 'exit 0' }));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.changedVsBase).toBe(true);
+      expect(commands(resolution)).toEqual([]);
+      expect(resolution.diff).toContain('@@ workspaces @@');
+      expect(resolution.diff).toContain('- "packages/*"');
+      expect(resolution.diff).toContain('+ "vendor/*"');
+      // The base's delegation note must not read as a pin under a topology the candidate moved.
+      expect(notes(resolution)).not.toContain('script is pinned');
+      expect(notes(resolution)).toContain('is NOT pinned at run time');
+      expect(notes(resolution)).toContain('root package.json "workspaces" changed: ["packages/*"] → ["vendor/*"]');
+    });
+
+    it('treats a respelled glob as the same topology — guard', () => {
+      baseSha = freeze(dir, redirected(['packages/*'], { a: 'echo REAL' }));
+      const first = resolve(dir, baseSha);
+      // `./packages/*` resolves to the same manifests; normalization must not refuse it.
+      candidate(dir, redirected(['./packages/*'], { a: 'echo REAL' }));
+
+      const respelled = resolve(dir, baseSha);
+
+      expect(respelled.status).toBe('resolved');
+      expect(respelled.diff).toBe('');
+
+      // A repeated glob names the same set, and a respelled BASE is the same plan.
+      candidate(dir, redirected(['packages/*', 'packages/*'], { a: 'echo REAL' }));
+      expect(resolve(dir, baseSha).status).toBe('resolved');
+      baseSha = freeze(dir, redirected(['./packages/*'], { a: 'echo REAL' }), 'respelled base');
+      expect(resolve(dir, baseSha).digest).toBe(first.digest);
+    });
+
+    it('refuses a topology move even when no delegation is pinned — conservative by design', () => {
+      const root = (workspaces?: string[]): Record<string, string> => {
+        const manifest = { name: 'fixture', private: true, ...(workspaces ? { workspaces } : {}), scripts: { test: 'vitest run' } };
+        return { '.ai/agentic.config.json': config(['npm test']), 'package.json': `${JSON.stringify(manifest, null, 2)}\n` };
+      };
+      baseSha = freeze(dir, root(['packages/*']));
+
+      candidate(dir, root(['vendor/*', 'packages/*']));
+      const added = resolve(dir, baseSha);
+      expect(added.reason).toBe('commands-changed-vs-base');
+      expect(added.diff).toContain('@@ workspaces @@');
+      expect(added.diff).toContain('+ "vendor/*"');
+
+      candidate(dir, root());
+      const removed = resolve(dir, baseSha);
+      expect(removed.reason).toBe('commands-changed-vs-base');
+      expect(removed.diff).toContain('- "packages/*"');
+      expect(notes(removed)).toContain('root package.json "workspaces" changed: ["packages/*"] → []');
+    });
+
+    it('pins the inner script behind a leading global npm flag — the stub no longer hides it', () => {
+      for (const flag of ['--silent', '-s', '--loglevel=error']) {
+        const files = (inner: string): Record<string, string> => ({
+          '.ai/agentic.config.json': config(['npm test']),
+          'package.json': pkg({ test: `npm ${flag} run inner`, inner }),
+        });
+        baseSha = freeze(dir, files('echo REAL'), `base ${flag}`);
+        candidate(dir, files('exit 0'));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status, flag).toBe('nothing-to-check');
+        expect(resolution.reason, flag).toBe('commands-changed-vs-base');
+        expect(resolution.diff, flag).toContain('@@ script:inner @@');
+      }
+    });
+
+    it('pins the script behind a leading global flag on the test verb too', () => {
+      const files = (inner: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run probe']),
+        'package.json': pkg({ probe: 'npm --silent test', test: inner }),
+      });
+      baseSha = freeze(dir, files('echo REAL'));
+      candidate(dir, files('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ script:test @@');
+    });
+
+    it('skips the separate value of a value-taking global flag before the verb', () => {
+      const valueFlags = [
+        '--loglevel error',
+        '--prefix .',
+        '--registry http://127.0.0.1:1',
+        '--userconfig .npmrc',
+        '--cache /tmp/cez-npm-cache',
+      ];
+      for (const flag of valueFlags) {
+        const files = (inner: string): Record<string, string> => ({
+          '.ai/agentic.config.json': config(['npm test']),
+          'package.json': pkg({ test: `npm ${flag} run inner`, inner }),
+        });
+        baseSha = freeze(dir, files('echo REAL'), `base ${flag}`);
+        candidate(dir, files('exit 0'));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.reason, flag).toBe('commands-changed-vs-base');
+        expect(resolution.diff, flag).toContain('@@ script:inner @@');
+      }
+    });
+
+    it('records an npm segment it cannot resolve instead of continuing silently', () => {
+      for (const body of ['npm run', 'npm ci', 'npm --silent']) {
+        baseSha = freeze(
+          dir,
+          { '.ai/agentic.config.json': config(['npm test']), 'package.json': pkg({ test: body }) },
+          `base ${body}`,
+        );
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status, body).toBe('resolved');
+        expect(notes(resolution), body).toContain('dynamic npm-run reference');
+        expect(notes(resolution), body).toContain(body);
+        expect(notes(resolution), body).toContain('not pinned');
+      }
+    });
+
+    it('records a dynamic npm reference in the command list itself — it was silent before', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm run "$TARGET"']),
+        'package.json': pkg({ inner: 'echo REAL' }),
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('dynamic npm-run reference');
+      expect(notes(resolution)).toContain('$TARGET');
+      expect(notes(resolution)).toContain('not pinned');
     });
   });
 
