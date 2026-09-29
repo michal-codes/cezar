@@ -65,7 +65,12 @@
  * never silently skipped, because npm's abbreviation surface is open-ended. A
  * shell wrapper's `-c` string (`sh -c "npm run inner --ws"`) is scanned as a
  * nested command line by the same parser, and NAMED by the wrapper when it cannot
- * be modelled (PR 3.6) — the same never-silent rule, one hop deeper. What
+ * be modelled (PR 3.6) — the same never-silent rule, one hop deeper. PR 3.7
+ * widens which spellings reach that string: the shell is matched by BASENAME
+ * (`/bin/sh -c …`, `/usr/bin/sh -c …`), an `env` prefix is resolved to the COMMAND
+ * operand it runs (`env -u FOO /bin/sh -c …`, and `-S`/`--split-string`, whose
+ * string coreutils splits into the command and its arguments), and ONE `--`
+ * between `-c` and the string is skipped (`sh -c -- "npm run inner --ws"`). What
  * cannot be resolved statically — `npm run "$TARGET"`, a chain past the depth
  * bound, a delegation whose target the tree does not declare — is recorded in
  * `notes`, never guessed at.
@@ -129,7 +134,7 @@ const SCRIPT_FILE_EXTENSIONS = ['.sh', '.bash', '.zsh', '.ksh', '.mjs', '.cjs', 
 /** Interpreters whose first non-flag argument is itself the script to pin. */
 const SCRIPT_INTERPRETERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'node', 'tsx', 'deno', 'bun', 'python', 'python3', 'ruby', 'perl', 'pwsh', 'powershell']);
 
-/** Shells whose `-c <string>` argument is a command line this scan can read. */
+/** Shells whose `-c <string>` argument is a command line this scan can read; matched by BASENAME (`/bin/sh` is `sh`). */
 const SHELL_WRAPPERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh']);
 
 /** Shell flags that consume the NEXT token as a value: `-o option`, bash's `-O name` / `--rcfile file`. */
@@ -553,6 +558,13 @@ function unquote(token: string): string {
   return token;
 }
 
+/** The name a program token resolves by: `/bin/sh` → `sh`, `/usr/bin/env` → `env`. */
+function programBasename(token: string): string {
+  const program = unquote(token);
+  const slash = program.lastIndexOf('/');
+  return slash === -1 ? program : program.slice(slash + 1);
+}
+
 function dedupe(values: string[]): string[] {
   return [...new Set(values)];
 }
@@ -746,8 +758,10 @@ function npmGlobalFlagTokens(tokens: readonly string[], index: number): number |
 
 /**
  * The script string of a shell wrapper at `tokens[index]`, if these tokens spell
- * one: `sh -c "…"`, `bash -ec '…'`, `bash -o pipefail -c "…"`. The string is a
- * COMMAND LINE the wrapper hands to the shell, so `extractNpmScriptRefs` scans it
+ * one: `sh -c "…"`, `/bin/sh -c "…"` (the program is matched by BASENAME),
+ * `bash -ec '…'`, `bash -o pipefail -c "…"`, `sh -c -- "…"` (one leading `--` is
+ * the shell's end-of-options). The string is a COMMAND LINE the wrapper hands to
+ * the shell, so `extractNpmScriptRefs` scans it
  * like any other text — npm 11.19.0 runs the workspace bodies behind
  * `sh -c "npm run inner --ws"`, while a scan that only saw the wrapper token
  * pinned nothing AND said nothing. A wrapper without a `-c` string (`sh
@@ -757,13 +771,22 @@ function npmGlobalFlagTokens(tokens: readonly string[], index: number): number |
  * it as inert cannot hide npm.
  */
 function shellWrapperScript(tokens: readonly string[], index: number): string | undefined {
-  const program = unquote(tokens[index] ?? '');
+  // The program is matched by BASENAME: the shell a PATH names (`/bin/sh -c …`,
+  // `/usr/bin/sh -c …`) is the same shell as the bare `sh -c …`, and a verbatim
+  // check let its `-c` string go by unpinned AND unnamed (measured: npm 11.19.0
+  // runs the workspace bodies behind `/bin/sh -c "npm run inner --ws"`).
+  const program = programBasename(tokens[index] ?? '');
   if (!SHELL_WRAPPERS.has(program)) return undefined;
   for (let k = index + 1; k < tokens.length; k += 1) {
     const token = unquote(tokens[k]!);
     // `-c` may sit in any cluster (`-ec`, `-lc`), and flags may precede it.
     if (/^-[A-Za-z]*c[A-Za-z]*$/.test(token)) {
-      const script = tokens[k + 1];
+      // ONE `--` between `-c` and the string is the shell's own end-of-options
+      // (measured: `sh -c -- "npm run inner --ws"` runs the string, `sh -c --`
+      // exits 2, and a SECOND `--` is the string: `sh -c -- -- 'echo hi'` tries to
+      // run the command `--`) — skip one, so the string is the token after it.
+      const at = k + 1 < tokens.length && unquote(tokens[k + 1]!) === '--' ? k + 2 : k + 1;
+      const script = tokens[at];
       return script === undefined ? undefined : unquote(script);
     }
     // `-o option` / `+o option` / `-O name` / `--rcfile file` consume a value;
@@ -788,6 +811,98 @@ function shellWrapperScript(tokens: readonly string[], index: number): string | 
 function wrapperMayRunNpm(text: string): boolean {
   if (/[\\$`]/.test(text)) return true;
   return shellSegments(text).some((tokens) => tokens.some((token) => unquote(token) === 'npm'));
+}
+
+/** What one `env` invocation spells, as far as this scan models it. */
+type EnvArgv =
+  | { kind: 'program'; index: number }
+  | { kind: 'split'; text: string; rest: number };
+
+/**
+ * GNU coreutils `env`'s argv at `tokens[index]`, when the token at `index` names
+ * `env` (by BASENAME, so `/usr/bin/env` is `env` — measured against coreutils
+ * 9.4): `NAME=VALUE` assignments and the options this scan models are skipped to
+ * the COMMAND operand, returned as the token index the segment scan resumes at, so
+ * a command named by a PATH (`env /bin/sh -c …`) or sitting behind an option value
+ * (`env -u FOO /bin/sh -c …`) is read as the command rather than as an arbitrary
+ * token. `-S`/`--split-string` is the one option that is not a prefix: `env`
+ * SPLITS the string into the command and its arguments and APPENDS the rest of its
+ * argv as arguments (`env -S 'sh -c' 'npm run inner --ws'` runs the workspace
+ * bodies, measured), so it is returned as a command line plus the index its
+ * appended argv resumes at. getopt_long accepts an unambiguous PREFIX of a long
+ * option, so every abbreviation of `--split-string` (`--spl`, `--s` — measured on
+ * 9.4) splits too, and no other option starts with `s`.
+ *
+ * Anything else this scan does not model returns `undefined` and the ordinary
+ * segment scan continues over the whole segment: the spellings that make `env` run
+ * NO command at all (an unknown option and an ambiguous abbreviation exit 125,
+ * `--help`/`--version` exit 0 — all measured), and every remaining option
+ * (`--unset`, `--chdir`, `--debug`, `--ignore-environment`, …) leaves the command's
+ * tokens where the ordinary scan already finds them — an over-pin in the safe
+ * direction, never a silent skip.
+ */
+function envArgv(tokens: readonly string[], index: number): EnvArgv | undefined {
+  if (programBasename(tokens[index] ?? '') !== 'env') return undefined;
+  const tokenAt = (k: number): string | undefined => (k < tokens.length ? unquote(tokens[k]!) : undefined);
+  let k = index + 1;
+  while (k < tokens.length) {
+    const token = unquote(tokens[k]!);
+    if (token === '--') {
+      // env's own end-of-options: the COMMAND is the next token.
+      const program = k + 1;
+      return program < tokens.length ? { kind: 'program', index: program } : undefined;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+      k += 1;
+      continue;
+    }
+    if (token === '-') {
+      k += 1; // a mere `-` implies `-i`
+      continue;
+    }
+    if (token.startsWith('--')) {
+      const equals = token.indexOf('=');
+      const name = equals === -1 ? token : token.slice(0, equals);
+      const inline = equals === -1 ? undefined : unquote(token.slice(equals + 1));
+      if (name.length >= 3 && '--split-string'.startsWith(name)) {
+        const text = inline ?? tokenAt(k + 1);
+        if (text === undefined) return undefined;
+        return { kind: 'split', text, rest: inline === undefined ? k + 2 : k + 1 };
+      }
+      if (name === '--unset' || name === '--chdir') {
+        k += inline === undefined ? 2 : 1;
+        continue;
+      }
+      if (name === '--ignore-environment' || name === '--null' || name === '--debug') {
+        k += 1;
+        continue;
+      }
+      return undefined;
+    }
+    if (token.startsWith('-')) {
+      // A short-option cluster: `-i0`, `-iv`, `-iu FOO`, `-iS 'sh -c …'`, `-uFOO`.
+      let cursor = 1;
+      let next = k + 1;
+      while (cursor < token.length) {
+        const flag = token[cursor]!;
+        if (flag === 'i' || flag === '0' || flag === 'v') {
+          cursor += 1;
+          continue;
+        }
+        if (flag !== 'u' && flag !== 'C' && flag !== 'S') return undefined;
+        const attached = unquote(token.slice(cursor + 1));
+        const value = attached !== '' ? attached : tokenAt(k + 1);
+        if (value === undefined) return undefined;
+        if (flag === 'S') return { kind: 'split', text: value, rest: attached !== '' ? k + 1 : k + 2 };
+        next = attached !== '' ? k + 1 : k + 2;
+        cursor = token.length;
+      }
+      k = next;
+      continue;
+    }
+    return { kind: 'program', index: k };
+  }
+  return undefined;
 }
 
 /**
@@ -819,6 +934,37 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const delegations: WorkspaceDelegation[] = [];
   for (const tokens of shellSegments(text)) {
     for (let i = 0; i < tokens.length; i += 1) {
+      const env = envArgv(tokens, i);
+      if (env) {
+        if (env.kind === 'program') {
+          // Skip to the COMMAND `env` runs: everything in between is its options and
+          // assignments, never a command of its own — `env -u sh -c …` unsets a
+          // variable named `sh`, it does not run one. Resuming at the operand keeps
+          // the value tokens out of the wrapper check instead of reading them as
+          // shells.
+          i = env.index - 1;
+          continue;
+        }
+        // `env -S '…'` (and its long abbreviations): coreutils splits the string
+        // into the command and its arguments, so it reads as a command line — the
+        // same nested scan a `-c` string gets — with env's remaining argv appended
+        // (`env -S 'sh -c' 'npm run inner --ws'` runs the workspace bodies,
+        // measured). The raw tokens keep their quotes, so an appended argument that
+        // is one word for coreutils stays one word here.
+        const text = [env.text, ...tokens.slice(env.rest)].join(' ');
+        const nested = extractNpmScriptRefs(text);
+        if (nested.names.length || nested.delegations.length) {
+          names.push(...nested.names);
+          dynamic.push(...nested.dynamic);
+          delegations.push(...nested.delegations);
+        } else if (wrapperMayRunNpm(text)) {
+          dynamic.push(npmSegmentLabel(tokens, i));
+        }
+        // Everything after the split string is an ARGUMENT to the split command
+        // (measured: `env -S 'echo A' -u FOO B` prints `A -u FOO B`), so the scan
+        // stops where the command line ends.
+        break;
+      }
       const wrapperScript = shellWrapperScript(tokens, i);
       if (wrapperScript !== undefined) {
         // The wrapper hands this string to the shell, so npm runs what it spells.

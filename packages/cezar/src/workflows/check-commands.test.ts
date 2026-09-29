@@ -1684,6 +1684,155 @@ describe('check-commands — the command policy resolver', () => {
     });
   });
 
+  describe('shell program basenames, `env` prefixes and the `-c --` spelling (PR 3.7)', () => {
+    /**
+     * The 3.6 fixture, reused: a root `probe` body spells the invocation under
+     * test, a root `inner` body is what a wrapper can reach, and a workspace
+     * manifest is what a delegation resolves to. The base carries `echo ROOT-REAL`
+     * / `echo WS-A-REAL`; a candidate neuters one of them, so a plan that does not
+     * pin that body stays `resolved` while npm runs the neutered one.
+     */
+    const fixture = (probe: string, rootInner = 'echo ROOT-REAL', workspace: Record<string, string> = {}): Record<string, string> => ({
+      '.ai/agentic.config.json': config(['npm run probe']),
+      'package.json': workspaceRoot({ probe, inner: rootInner }),
+      'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A-REAL', ...workspace }),
+    });
+
+    /**
+     * The base runs WS-A through the spelling under test (measured against npm
+     * 11.19.0), so a candidate that neuters WS-A has moved what runs: the plan
+     * must pin the delegated body, not stay `resolved` on it.
+     */
+    const expectDelegationPinned = (probe: string): void => {
+      baseSha = freeze(dir, fixture(probe), `base ${probe}`);
+      candidate(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status, probe).toBe('nothing-to-check');
+      expect(resolution.reason, probe).toBe('commands-changed-vs-base');
+      expect(resolution.diff, probe).toContain('@@ workspace:packages/a/package.json#inner @@');
+    };
+
+    it('matches the shell by BASENAME — `/bin/sh -c` and `/usr/bin/sh -c` ran the string all along (F1r)', () => {
+      // npm 11.19.0: each spelling prints WS-A-REAL — the shell is found through
+      // PATH, so the program token is the PATH's last segment, not the literal `sh`
+      // the old verbatim check compared against.
+      for (const probe of [
+        '/bin/sh -c "npm run inner --ws"',
+        '/usr/bin/sh -c "npm run inner --ws"',
+        '/bin/bash -c "npm run inner --ws"',
+      ]) {
+        expectDelegationPinned(probe);
+      }
+    });
+
+    it('skips ONE `--` between `-c` and the string — bare and path forms, clusters included (F1s)', () => {
+      // npm 11.19.0: `sh -c -- "npm run inner --ws"` prints WS-A-REAL — the `--` is
+      // the shell's own end-of-options, not the string. (A SECOND `--` is the
+      // string: `sh -c -- -- 'echo hi'` tries to run the command `--`.)
+      for (const probe of [
+        'sh -c -- "npm run inner --ws"',
+        'bash -c -- "npm run inner --ws"',
+        'dash -c -- "npm run inner --ws"',
+        'sh -ec -- "npm run inner --ws"',
+        '/bin/sh -c -- "npm run inner --ws"',
+      ]) {
+        expectDelegationPinned(probe);
+      }
+    });
+
+    it('resolves an `env` prefix to its COMMAND operand — options, assignments and `--` skipped (F1r, env)', () => {
+      // coreutils 9.4 + npm 11.19.0: every spelling below runs the wrapper. `-i`
+      // is modelled as a prefix (the scan reads the COMMAND LINE; that an empty
+      // environment then cannot resolve npm on PATH is outside the argv model, and
+      // an over-pin is the safe direction).
+      for (const probe of [
+        '/usr/bin/env sh -c "npm run inner --ws"',
+        'env -i sh -c "npm run inner --ws"',
+        'env -u FOO /bin/sh -c "npm run inner --ws"',
+        'env FOO=bar /bin/sh -c "npm run inner --ws"',
+        'env -- /bin/sh -c "npm run inner --ws"',
+        'env -C . /bin/sh -c "npm run inner --ws"',
+      ]) {
+        expectDelegationPinned(probe);
+      }
+    });
+
+    it('reads `env -S`/`--split-string` as the command line coreutils splits it into (F1r, env)', () => {
+      // coreutils 9.4: `-S` splits the string into the command and its arguments
+      // and appends the rest of env's argv. `--spl`/`--s` are unambiguous
+      // getopt_long abbreviations of `--split-string` and split too. Last row:
+      // `env -S 'sh -c' 'npm run inner --ws'` completes the wrapper from the
+      // appended argv (measured: the workspace bodies run).
+      for (const probe of [
+        'env -S \'sh -c "npm run inner --ws"\'',
+        "env -S 'npm run inner --ws'",
+        'env --split-string="npm run inner --ws"',
+        "env --spl 'npm run inner --ws'",
+        "env -vS 'npm run inner --ws'",
+        "env -S 'sh -c' 'npm run inner --ws'",
+      ]) {
+        expectDelegationPinned(probe);
+      }
+    });
+
+    it('names a split string it cannot model — `env -S "$CMD"` — instead of going silent (F1r, env)', () => {
+      const probe = 'env -S "$CMD"';
+      baseSha = freeze(dir, fixture(probe));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(notes(resolution)).toContain('dynamic npm-run reference');
+      expect(notes(resolution)).toContain('not pinned');
+    });
+
+    it('leaves `env -S` with no npm in it alone — no note, no pin (guard)', () => {
+      const probe = "env -S 'echo hi'";
+      baseSha = freeze(dir, fixture(probe));
+      // coreutils 9.4: `env -S 'echo hi'` runs `echo hi` — nothing npm can run.
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).not.toContain('dynamic npm-run reference');
+    });
+
+    it('leaves `sh -c --` with nothing after the terminator alone — the shell exits 2 (guard)', () => {
+      const probe = 'sh -c --';
+      baseSha = freeze(dir, fixture(probe));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).not.toContain('dynamic npm-run reference');
+    });
+
+    it('leaves a PATH-named wrapper with no npm inside it alone (guard)', () => {
+      const probe = '/bin/sh -c "echo hi"';
+      baseSha = freeze(dir, fixture(probe));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).not.toContain('dynamic npm-run reference');
+    });
+
+    it('falls back to the ordinary token scan for an `env` option it does not model (guard)', () => {
+      const probe = 'env --bogus sh -c "npm run inner --ws"';
+      baseSha = freeze(dir, fixture(probe));
+      // coreutils 9.4: an unknown option exits 125 before any command runs, so
+      // nothing can hide behind it; the tokens are still read by the ordinary
+      // scan, which finds the wrapper — over-pinning, never a silent skip.
+      candidate(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+    });
+  });
+
   describe('the install lifecycle — npm 11’s full set (F2)', () => {
     for (const hook of ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare']) {
       it(`pins the lifecycle hook the install step runs: ${hook}`, () => {
