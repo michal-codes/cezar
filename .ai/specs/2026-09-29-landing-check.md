@@ -144,8 +144,10 @@ and a spec — which is why this PR files the `Implement:` tracking issue.
   retention and the worktree lifecycle come from the run machinery.
 - **The invoking run may still be running.** The dispatch parent is `running` when
   it calls this, so a live parent is not an error: the subject is frozen from its
-  committed branch tip at request time. The only `409` is a landing check already in
-  flight for the project (A3).
+  committed branch tip at request time. A second landing check for the project is
+  refused `409` (A3), and so is a request that cannot be frozen — the invoking run's
+  branch, an explicit source, or a ledger-derived source no longer resolves; a
+  refused freeze creates no check run.
 - `POST /runs/:id/pr` (`packages/cezar/src/server/server.ts:4753`) is untouched; no
   automatic hook fires from it in v1.
 - Invoked by the dispatch parent before its own `git merge --no-ff`: one sentence in
@@ -329,10 +331,10 @@ verdict states plainly that this is not a sandbox.
 
 ## 📐 Normative invariants and recovery semantics
 
-These properties are cross-cutting: the sections above define the mechanism, this section defines
-what MUST be true of it. Where the two disagree, this section wins. The per-PR lists under
-`## 📝 Acceptance Criteria for PRs 2–6` are sign-off lists; the cross-cutting scenarios at the end
-of this section MUST pass too.
+These properties are cross-cutting: the other sections of this document define the mechanism; this
+section defines what MUST be true of it. Where the two disagree, this section wins. The per-PR
+lists under `## 📝 Acceptance Criteria for PRs 2–6` are sign-off lists; the cross-cutting
+scenarios at the end of this section MUST pass too.
 
 ### Lifecycle and recovery
 
@@ -372,9 +374,11 @@ verdict about a subject that was never checked.
 **Invariant — every terminal check run carries exactly one verdict.** Every terminal landing-check
 run MUST carry exactly one verdict, and the run status MUST agree with it: the run settles `done`
 if and only if the verdict is `passed`; every other recorded verdict settles `failed`; a check
-cancelled before it concludes settles `cancelled` and records `could-not-run: cancelled`, keeping
-any verdict already written. A terminal check run with no verdict is a record bug, not a state: it
-MUST never render green, and every surface reads it as "the check concluded nothing". The three
+cancelled before it settles is `cancelled`; if no verdict was written yet it records
+`could-not-run: cancelled`, and a verdict already written is kept (the status reports what
+happened to the run; the verdict reports what was observed). A terminal check run with no verdict
+is a record bug, not a state: it MUST never render green, and every surface reads it as "the check
+concluded nothing". The three
 surfaces of one truth are the verdict (what was observed), the run status (what happened to the
 run) and `stale` (whether the subject still resolves).
 
@@ -519,8 +523,8 @@ install outcome and acknowledgement describe that same tree.
 | Idempotency + attempt ownership | A resume had to clear stored `results`/`reason`, or an interrupted pass settled the resumed check | 4.4 F3 `cdf55e40`; mutation-red `7bf339ca` |
 | Worktree must hold the subject | Without the `HEAD^{tree}` guard a re-created worktree would have gated the base alone | 4.2 review `ad261afb` |
 | Terminal completeness | A crash between `startRun` and the subject write settles `done` with no verdict; a queued cancel writes no verdict | R2 probe (`7e823ab8`) |
-| Executed entry-point closure | Seven review rounds on the npm scan (`--`, quotes, last-wins, wrappers, `env`) plus body-named script files, tool config and `.npmrc` that flip the gate with an identical digest | PR 3 `47964775`…`2cb0544a`; R3 `30c00058` |
-| Acknowledgement binding | Digest v2 binds the head sha; the cockpit's digest-only ack can be silently dropped and a different subject ran green | 5.1 `10a57e2c`; R4 `d0172af2` |
+| Executed entry-point closure | Repeated review rounds on the npm scan (`--`, quotes, last-wins, wrappers, `env`) plus body-named script files, tool config and `.npmrc` that flip the gate with an identical digest | PR 3 `47964775`…`2cb0544a`; R3 `30c00058` |
+| Acknowledgement binding | Digest v2 binds the head sha; the cockpit's digest-only ack can be silently dropped and a different subject ran green | 4.2 `9014a2bb` (digest v2 binds the head); 5.1 `10a57e2c` (the cockpit control); R4 `d0172af2` (the drop) |
 | Verdict semantics | The five-value enum is closed and honest; the run-status mapping and "only `passed` is green" lived only in docs | 4.3 `a3071c59`; R4 |
 
 ## 📝 Architecture
@@ -925,7 +929,9 @@ existing default path.
 4. Add `packages/cezar/src/workflows/check-commands.ts`:
    `resolveCheckCommands({ baseSha, explicit, repoRoot }) → { source, commands,
    digest, changedVsBase, diff }`, reading `.ai/agentic.config.json` and the root
-   `package.json` from the frozen base; digest over the list plus resolved bodies.
+   `package.json` from the frozen base; digest over the list and the executed
+   entry-point closure (resolved bodies, executed files, workspace topology,
+   build-file text — see PR 3 AC (b)).
    Test: fixtures for precedence, absent, drift and hooks; no execution anywhere in
    the module.
 5. Degradation vocabulary: `no-commands` names every source consulted; `Makefile`
@@ -944,7 +950,9 @@ existing default path.
    without the fix.
 8. Wire the run: create the check run through the manager with a check-only workflow
    built from the resolved commands plus the install step; record `landingCheck`;
-   refuse 409 only while another landing check for the project is in flight.
+   refuse 409 while another landing check for the project is in flight, and when the
+   request cannot be frozen (the invoking run's branch, an explicit source or a
+   ledger-derived source does not resolve — no run is created).
 9. Contract, route and CLI: schemas in `packages/contract/src/runs.ts`, the route
    chained in `server.ts`, the verb in `dispatch/task-cli.ts` (`--wait` polls), the
    BC §2 inventory. Tests: `contract-parity*.test.ts`, `route-parity.test.ts`,
