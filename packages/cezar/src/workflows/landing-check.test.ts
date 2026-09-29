@@ -7,10 +7,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { appendLedger } from '../dispatch/tree-fs.ts';
 import { RunStore, type RunRecord } from '../runs/store.ts';
 import {
+  detectForeignSubject,
   deriveLandingCandidates,
   gitIn,
   landingCheckStale,
   landingResultOf,
+  landingSubjectDigest,
+  LANDING_SUBJECT_DIGEST_VERSION,
   materializeLandingSubject,
   verdictFromResults,
   type LandingDerivation,
@@ -445,6 +448,108 @@ describe('the verdict vocabulary: only an unbroken run of `passed` is green', ()
   });
 });
 
+describe('the trust model: what makes a subject foreign', () => {
+  it('flags a source whose AUTHOR or COMMITTER is outside the local set, naming each identity', async () => {
+    const base = await git(root, 'rev-parse', 'HEAD');
+    await git(root, 'checkout', '-q', '-b', 'cez/foreign', base);
+    // Author elsewhere, committer local (the `-c` identity is the fixture's own).
+    writeFileSync(join(root, 'f1.txt'), 'f1\n');
+    await git(root, 'add', '-A');
+    await run(
+      'git',
+      ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '-q', '--author=Other <other@example.com>', '-m', 'authored elsewhere'],
+      { cwd: root },
+    );
+    // Committer elsewhere, author local.
+    writeFileSync(join(root, 'f2.txt'), 'f2\n');
+    await git(root, 'add', '-A');
+    await run(
+      'git',
+      ['-c', 'user.name=Outsider', '-c', 'user.email=outsider@example.com', 'commit', '-q', '--author=Local <test@local>', '-m', 'committed elsewhere'],
+      { cwd: root },
+    );
+    const sha = await git(root, 'rev-parse', 'HEAD');
+
+    const report = await detectForeignSubject({ git: gitIn(root), baseSha: base, sources: [{ ref: 'cez/foreign', sha }] });
+    expect(report.foreign).toBe(true);
+    expect(report.authors).toEqual(['Other <other@example.com>', 'Outsider <outsider@example.com>']);
+    expect(report.headSha).toBe(sha);
+  });
+
+  it('stays LOCAL for the fixture\'s own commits even with NO configured user.email — the base commit identities count', async () => {
+    // The machine's global identity is pinned away so "unset" is real: this repository has run
+    // no `git config user.email` anywhere, exactly like a fresh container or a CI fixture.
+    const saved = {
+      GIT_CONFIG_GLOBAL: process.env.GIT_CONFIG_GLOBAL,
+      GIT_CONFIG_SYSTEM: process.env.GIT_CONFIG_SYSTEM,
+    };
+    process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+    process.env.GIT_CONFIG_SYSTEM = '/dev/null';
+    try {
+      const base = await git(root, 'rev-parse', 'HEAD');
+      await git(root, 'checkout', '-q', '-b', 'cez/local', base);
+      const sha = await commit('l.txt', 'l\n', 'local work');
+      // `git config --get user.email` really is unset for this check.
+      await expect(run('git', ['config', '--get', 'user.email'], { cwd: root })).rejects.toThrow();
+      const report = await detectForeignSubject({ git: gitIn(root), baseSha: base, sources: [{ ref: 'cez/local', sha }] });
+      expect(report.foreign).toBe(false);
+      expect(report.authors).toEqual([]);
+
+      // ...and the same fixture's third-party commit IS foreign under the same pinned config.
+      writeFileSync(join(root, 'x.txt'), 'x\n');
+      await git(root, 'add', '-A');
+      await run('git', ['-c', 'user.name=Outsider', '-c', 'user.email=outsider@example.com', 'commit', '-q', '-m', 'elsewhere'], { cwd: root });
+      const foreignSha = await git(root, 'rev-parse', 'HEAD');
+      const foreign = await detectForeignSubject({ git: gitIn(root), baseSha: sha, sources: [{ ref: 'cez/local', sha: foreignSha }] });
+      expect(foreign.foreign).toBe(true);
+      expect(foreign.authors).toEqual(['Outsider <outsider@example.com>']);
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+});
+
+describe('the acknowledgement digest', () => {
+  const input = {
+    baseRef: 'cez/parent',
+    baseSha: 'a'.repeat(40),
+    sources: [{ ref: 'cez/child', sha: 'b'.repeat(40) }],
+    treeSha: 'c'.repeat(40),
+    commandsDigest: 'd'.repeat(64),
+    installArgv: ['npm', 'install'],
+  };
+
+  it('is a versioned canonical sha256: stable for the same subject, moved by every semantic input', () => {
+    const first = landingSubjectDigest(input);
+    expect(first.version).toBe(LANDING_SUBJECT_DIGEST_VERSION);
+    expect(first.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.parse(first.canonical)).toEqual({
+      version: LANDING_SUBJECT_DIGEST_VERSION,
+      baseRef: input.baseRef,
+      baseSha: input.baseSha,
+      sources: [{ ref: 'cez/child', sha: 'b'.repeat(40) }],
+      treeSha: input.treeSha,
+      commandsDigest: input.commandsDigest,
+      installArgv: ['npm', 'install'],
+    });
+    // Same subject, recomputed (a second run over the same shas) — same digest.
+    expect(landingSubjectDigest({ ...input, sources: [{ ...input.sources[0]! }] }).digest).toBe(first.digest);
+
+    const moved = (patch: Partial<typeof input>): string => landingSubjectDigest({ ...input, ...patch }).digest;
+    expect(moved({ baseRef: 'cez/other' })).not.toBe(first.digest);
+    expect(moved({ baseSha: '1'.repeat(40) })).not.toBe(first.digest);
+    expect(moved({ treeSha: '2'.repeat(40) })).not.toBe(first.digest);
+    expect(moved({ commandsDigest: '3'.repeat(64) })).not.toBe(first.digest);
+    expect(moved({ sources: [{ ref: 'cez/child', sha: '4'.repeat(40) }] })).not.toBe(first.digest);
+    expect(moved({ sources: [{ ref: 'cez/renamed', sha: input.sources[0]!.sha }] })).not.toBe(first.digest);
+    expect(moved({ installArgv: ['npm', 'ci'] })).not.toBe(first.digest);
+    expect(moved({ installArgv: [] })).not.toBe(first.digest);
+  });
+});
+
 describe('the landingCheck record field', () => {
   it('round-trips through the store, and an unparseable field drops the FIELD, never the run', () => {
     const subject = {
@@ -455,7 +560,17 @@ describe('the landingCheck record field', () => {
     };
     const keeper = store.createRun({ title: 'keeper', workflow: 'task', task: 'k', steps: [] });
     store.updateRun(keeper.id, {
-      landingCheck: { ofRunId: 'parent', subject, verdict: 'passed', results: [{ command: 'npm test', exitCode: 0, outcome: 'passed', startedAt: 't' }] },
+      landingCheck: {
+        ofRunId: 'parent',
+        subject,
+        // The acknowledgement rides on the record so the check run that materializes the subject
+        // later can compare it — the store PARSES the record, so a key the contract does not
+        // declare is silently stripped (which is why this assertion exists).
+        request: { commands: ['npm test'], acknowledge: { digest: 'e'.repeat(64) } },
+        ack: { digest: 'e'.repeat(64), at: 't' },
+        verdict: 'passed',
+        results: [{ command: 'npm test', exitCode: 0, outcome: 'passed', startedAt: 't' }],
+      },
     });
     const drifted = store.createRun({ title: 'drifted', workflow: 'task', task: 'd', steps: [] });
     store.updateRun(drifted.id, {
@@ -477,6 +592,8 @@ describe('the landingCheck record field', () => {
     expect(reopened.listRuns().map((record) => record.id)).toContain(keeper.id);
     expect(reopened.getRun(keeper.id)?.landingCheck?.verdict).toBe('passed');
     expect(reopened.getRun(keeper.id)?.landingCheck?.results?.[0]?.outcome).toBe('passed');
+    expect(reopened.getRun(keeper.id)?.landingCheck?.request?.acknowledge?.digest).toBe('e'.repeat(64));
+    expect(reopened.getRun(keeper.id)?.landingCheck?.ack?.digest).toBe('e'.repeat(64));
     expect(reopened.getRun(drifted.id)).toBeDefined();
     expect(reopened.getRun(drifted.id)?.landingCheck).toBeUndefined();
   });

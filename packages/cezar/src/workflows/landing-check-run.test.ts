@@ -20,6 +20,8 @@ import { RunManager } from './run.ts';
  */
 const run = promisify(execFile);
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
+/** An identity no fixture in this file ever configures — the colleague's fetched branch. */
+const GIT_FOREIGN = ['-c', 'user.name=Outsider', '-c', 'user.email=other@example.com'];
 const posix = describe.skipIf(process.platform === 'win32');
 
 let repoRoot: string;
@@ -40,6 +42,24 @@ const waitFor = async (id: string, predicate: (record: RunRecord | undefined) =>
 };
 const settle = (id: string): Promise<void> => waitFor(id, (record) => TERMINAL.has(record?.status ?? ''));
 
+/** Run `body` with `patch` applied to `process.env`, restoring every key afterwards. */
+async function withEnv(patch: Record<string, string | undefined>, body: () => Promise<void>): Promise<void> {
+  const saved = new Map<string, string | undefined>();
+  for (const [name, value] of Object.entries(patch)) {
+    saved.set(name, process.env[name]);
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+  try {
+    await body();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
 const events = (id: string): Array<Record<string, unknown>> =>
   readFileSync(join(dataDir, 'runs', `${id}.ndjson`), 'utf8')
     .trim()
@@ -52,12 +72,12 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-async function commit(file: string, text: string, message: string): Promise<string> {
+async function commit(file: string, text: string, message: string, identity: string[] = GIT_ID): Promise<string> {
   const target = join(repoRoot, file);
   mkdirSync(dirname(target), { recursive: true });
   writeFileSync(target, text);
   await git(repoRoot, 'add', '-A');
-  await git(repoRoot, ...GIT_ID, 'commit', '-q', '-m', message);
+  await git(repoRoot, ...identity, 'commit', '-q', '-m', message);
   return git(repoRoot, 'rev-parse', 'HEAD');
 }
 
@@ -83,7 +103,9 @@ function mkRun(options: {
 }
 
 /** base A (gate declared) → parent branch with its own commit B → child branch with commit C. */
-async function parentAndChild(options: { child?: (parentSha: string) => Promise<string> } = {}): Promise<{
+async function parentAndChild(
+  options: { child?: (parentSha: string) => Promise<string>; childIdentity?: string[] } = {},
+): Promise<{
   parent: RunRecord;
   parentSha: string;
   child: RunRecord;
@@ -94,7 +116,7 @@ async function parentAndChild(options: { child?: (parentSha: string) => Promise<
   const parentSha = await commit('b.txt', 'parent\n', 'parent work');
   const startedAt = new Date().toISOString();
   await git(repoRoot, 'checkout', '-q', '-b', 'cez/child', parentSha);
-  const childSha = options.child ? await options.child(parentSha) : await commit('c.txt', 'child\n', 'child work');
+  const childSha = options.child ? await options.child(parentSha) : await commit('c.txt', 'child\n', 'child work', options.childIdentity ?? GIT_ID);
   await git(repoRoot, 'checkout', '-q', 'cez/parent');
 
   // The invoking run is STILL RUNNING — the normal case, never a 409 (review finding C1).
@@ -111,6 +133,13 @@ beforeEach(async () => {
   savedEnv.CEZ_DRY_RUN = process.env.CEZ_DRY_RUN;
   delete process.env.CEZ_DRY_RUN;
   await git(repoRoot, 'init', '-q', '-b', 'main');
+  // The fixture ignores cezar's own state directory before any run exists, exactly as a real
+  // repository does. Without this the tests' later `git checkout`s would DELETE the run state
+  // (a `git add -A` in a fixture with no ignore file tracks `.ai/cezar/runs/…`, and switching
+  // branches then removes it from the working tree).
+  writeFileSync(join(repoRoot, '.gitignore'), '.ai/cezar/\n');
+  await git(repoRoot, 'add', '-A');
+  await git(repoRoot, ...GIT_ID, 'commit', '-q', '-m', 'chore: ignore cezar state');
   store = RunStore.open(dataDir);
   manager = new RunManager(store, repoRoot);
   currentId = undefined;
@@ -150,6 +179,9 @@ posix('startLandingCheck', () => {
     expect(final?.landingCheck?.verdict).toBe('passed');
     expect(final?.landingCheck?.subject.treeSha).toMatch(/^[0-9a-f]{40}$/);
     expect(final?.landingCheck?.results?.map((entry) => entry.outcome)).toEqual(['passed']);
+    // A local subject: no preview, no ack — the brake simply does not apply.
+    expect(final?.landingCheck?.preview).toBeUndefined();
+    expect(final?.landingCheck?.ack).toBeUndefined();
     expect(final?.landingCheck?.install).toBeUndefined(); // no manifest in the frozen base
     expect(final?.landingCheck?.envNames).toBeDefined();
     expect(final?.landingCheck?.user).toBeTruthy();
@@ -275,9 +307,211 @@ posix('the verdicts that are not green', () => {
     expect(final?.landingCheck?.verdict).toBe('could-not-run');
     expect(final?.landingCheck?.reason).toBe('install-failed');
     expect(final?.landingCheck?.install).toEqual({ argv: ['npm', 'ci'], exitCode: 1, outcome: 'failed' });
-    expect(final?.landingCheck?.results).toBeUndefined();
+    // D3: the gate was resolved and did not run — one `not-run` entry per resolved command,
+    // instead of an absent `results` that said nothing about the commands left behind.
+    const notRun = final?.landingCheck?.results ?? [];
+    expect(notRun.map(({ command, outcome, exitCode }) => ({ command, outcome, exitCode }))).toEqual([
+      { command: 'echo gate-ok > gate-ran.txt', outcome: 'not-run', exitCode: null },
+    ]);
+    expect(notRun[0]?.startedAt).toBe(notRun[0]?.finishedAt);
     expect(existsSync(join(final?.worktreePath as string, 'gate-ran.txt'))).toBe(false);
     // The install step is recorded as its own step, failed — visible on the run's rail.
     expect(final?.steps.map(({ id, status }) => ({ id, status }))).toEqual([{ id: 'install', status: 'failed' }]);
+  }, 60_000);
+});
+
+posix('the foreign-subject trust model', () => {
+  it('previews a foreign subject, runs NOTHING, and only a matching acknowledgement unlocks the gate', async () => {
+    await commit('.ai/agentic.config.json', `${JSON.stringify({ version: 1, validation: { commands: ['echo gate-ok > gate-ran.txt'] } })}\n`, 'base');
+    await commit(
+      'package.json',
+      `${JSON.stringify({ name: 'fixture', version: '1.0.0', private: true, scripts: { postinstall: 'echo x >> install-count.txt' } })}\n`,
+      'manifest',
+    );
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    const parentSha = await commit('b.txt', 'parent\n', 'parent work');
+    const startedAt = new Date().toISOString();
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/child', parentSha);
+    const childSha = await commit('c.txt', 'child\n', 'child work', GIT_FOREIGN);
+    await git(repoRoot, 'checkout', '-q', 'cez/parent');
+
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+    const child = mkRun({ title: 'child', branch: 'cez/child', parentId: parent.id, baseBranch: 'cez/parent', startedAt });
+    appendLedger(dataDir, parent.id, { type: 'dispatch', runId: child.id, parentRunId: parent.id });
+
+    const preview = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in preview)) throw new Error(preview.refused);
+    currentId = preview.runId;
+    await settle(preview.runId);
+    const previewed = store.getRun(preview.runId);
+    const digest = previewed?.landingCheck?.preview?.subjectDigest as string;
+    expect(previewed?.status).toBe('failed');
+    expect(previewed?.landingCheck?.verdict).toBe('could-not-run');
+    expect(previewed?.landingCheck?.reason).toBe('foreign-subject-needs-ack');
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(previewed?.landingCheck?.preview).toMatchObject({
+      authors: ['Outsider <other@example.com>'],
+      commands: ['echo gate-ok > gate-ran.txt'],
+      installArgv: ['npm', 'install'],
+      headSha: childSha,
+    });
+    expect(previewed?.landingCheck?.preview?.diffStat).toContain('c.txt');
+    // The subject was still MATERIALIZED (the preview describes exact content) — and nothing else:
+    // no results, no step, no install side effect, no gate side effect.
+    expect(previewed?.landingCheck?.subject.treeSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(previewed?.landingCheck?.results).toBeUndefined();
+    expect(previewed?.landingCheck?.install).toEqual({ argv: ['npm', 'install'], exitCode: null, outcome: 'not-run' });
+    expect(previewed?.steps).toEqual([]);
+    const previewWorktree = previewed?.worktreePath as string;
+    expect(readFileSync(join(previewWorktree, 'c.txt'), 'utf8')).toContain('child');
+    expect(existsSync(join(previewWorktree, 'gate-ran.txt'))).toBe(false);
+    expect(existsSync(join(previewWorktree, 'install-count.txt'))).toBe(false);
+
+    // The matching acknowledgement: the subject is re-frozen and re-materialized, the digest
+    // recomputes identically, and only then does the gate run — recording the ack it honoured.
+    const ack = await manager.startLandingCheck(parent.id, { acknowledge: { digest } });
+    if (!('runId' in ack)) throw new Error(ack.refused);
+    currentId = ack.runId;
+    await settle(ack.runId);
+    const acked = store.getRun(ack.runId);
+    expect(acked?.status).toBe('done');
+    expect(acked?.landingCheck?.verdict).toBe('passed');
+    expect(acked?.landingCheck?.ack?.digest).toBe(digest);
+    expect(acked?.landingCheck?.ack?.at).toBeTruthy();
+    expect(acked?.landingCheck?.preview).toBeUndefined();
+    expect(acked?.landingCheck?.install?.outcome).toBe('passed');
+    expect(acked?.landingCheck?.install?.argv).toEqual(['npm', 'install']);
+    expect(acked?.landingCheck?.results?.map((entry) => entry.command)).toEqual(['echo gate-ok > gate-ran.txt']);
+    const ackWorktree = acked?.worktreePath as string;
+    expect(existsSync(join(ackWorktree, 'gate-ran.txt'))).toBe(true);
+    // D1 rides along: the install ran exactly ONCE, and `results` holds the gate command only.
+    expect(readFileSync(join(ackWorktree, 'install-count.txt'), 'utf8').trim().split('\n')).toHaveLength(1);
+  }, 120_000);
+
+  it('re-previews (with a NEW digest) when the subject moved between preview and acknowledgement', async () => {
+    await commit('.ai/agentic.config.json', `${JSON.stringify({ version: 1, validation: { commands: ['echo gate-ok > gate-ran.txt'] } })}\n`, 'base');
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    const parentSha = await commit('b.txt', 'parent\n', 'parent work');
+    const startedAt = new Date().toISOString();
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/child', parentSha);
+    await commit('c.txt', 'child\n', 'child work', GIT_FOREIGN);
+    await git(repoRoot, 'checkout', '-q', 'cez/parent');
+
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+    const child = mkRun({ title: 'child', branch: 'cez/child', parentId: parent.id, baseBranch: 'cez/parent', startedAt });
+    appendLedger(dataDir, parent.id, { type: 'dispatch', runId: child.id, parentRunId: parent.id });
+
+    const preview = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in preview)) throw new Error(preview.refused);
+    currentId = preview.runId;
+    await settle(preview.runId);
+    const firstDigest = store.getRun(preview.runId)?.landingCheck?.preview?.subjectDigest as string;
+    expect(firstDigest).toMatch(/^[0-9a-f]{64}$/);
+
+    // The child branch moves after the preview: the subject the caller saw is gone.
+    await git(repoRoot, 'checkout', '-q', 'cez/child');
+    const movedSha = await commit('d.txt', 'more\n', 'more work', GIT_FOREIGN);
+    await git(repoRoot, 'checkout', '-q', 'cez/parent');
+
+    const stale = await manager.startLandingCheck(parent.id, { acknowledge: { digest: firstDigest } });
+    if (!('runId' in stale)) throw new Error(stale.refused);
+    currentId = stale.runId;
+    await settle(stale.runId);
+    const again = store.getRun(stale.runId);
+    expect(again?.status).toBe('failed');
+    expect(again?.landingCheck?.verdict).toBe('could-not-run');
+    expect(again?.landingCheck?.reason).toBe('foreign-subject-needs-ack');
+    expect(again?.landingCheck?.preview?.subjectDigest).not.toBe(firstDigest);
+    expect(again?.landingCheck?.preview?.headSha).toBe(movedSha);
+    expect(again?.landingCheck?.ack).toBeUndefined();
+    expect(again?.landingCheck?.results).toBeUndefined();
+    expect(existsSync(join((again?.worktreePath as string) ?? '', 'gate-ran.txt'))).toBe(false);
+  }, 120_000);
+
+  it("keeps a fixture with NO configured user.email LOCAL — the base commit's own identities are the operator's", async () => {
+    // The fixture never runs `git config user.email`; the machine's global identity is pinned
+    // away so "unset" is real, and the commit identity comes from the environment (which is also
+    // what lets the check's own merge commits happen). Its own `-c user.email=test@local` commits
+    // must still read as local — that is the zero-config half of the rule.
+    await withEnv(
+      {
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_SYSTEM: '/dev/null',
+        GIT_AUTHOR_NAME: 'test',
+        GIT_AUTHOR_EMAIL: 'test@local',
+        GIT_COMMITTER_NAME: 'test',
+        GIT_COMMITTER_EMAIL: 'test@local',
+      },
+      async () => {
+        const { parent } = await parentAndChild();
+        const started = await manager.startLandingCheck(parent.id, {});
+        if (!('runId' in started)) throw new Error(started.refused);
+        currentId = started.runId;
+        await settle(started.runId);
+        const final = store.getRun(started.runId);
+        expect(final?.landingCheck?.preview).toBeUndefined();
+        expect(final?.landingCheck?.verdict).toBe('passed');
+        expect(final?.landingCheck?.results?.map((entry) => entry.outcome)).toEqual(['passed']);
+      },
+    );
+  }, 60_000);
+});
+
+posix('an early break records the commands it never ran (D2)', () => {
+  it('a FAILED command with commands behind it is `failed`, and the ones behind it are not-run', async () => {
+    await commit(
+      '.ai/agentic.config.json',
+      `${JSON.stringify({ version: 1, validation: { commands: ['exit 1', 'echo second > second-ran.txt'] } })}\n`,
+      'base',
+    );
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    await commit('b.txt', 'parent\n', 'parent work');
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    await settle(started.runId);
+    const final = store.getRun(started.runId);
+    expect(final?.status).toBe('failed');
+    // Before D2 this read `could-not-run: cancelled` purely because a command was missing.
+    expect(final?.landingCheck?.verdict).toBe('failed');
+    expect(final?.landingCheck?.reason).toBe('command-failed');
+    expect(final?.landingCheck?.results?.map(({ command, outcome }) => ({ command, outcome }))).toEqual([
+      { command: 'exit 1', outcome: 'failed' },
+      { command: 'echo second > second-ran.txt', outcome: 'not-run' },
+    ]);
+    // The not-run entry reuses `startedAt` as the stop time: no dedicated field exists, and the
+    // record stays sortable.
+    const notRun = final?.landingCheck?.results?.[1];
+    expect(notRun?.exitCode).toBeNull();
+    expect(notRun?.startedAt).toBe(notRun?.finishedAt);
+    expect(existsSync(join(final?.worktreePath as string, 'second-ran.txt'))).toBe(false);
+  }, 60_000);
+
+  it('a TIMED-OUT command with commands behind it keeps `could-not-run: timeout`, the second entry not-run', async () => {
+    await commit(
+      '.ai/agentic.config.json',
+      `${JSON.stringify({ version: 1, validation: { commands: ['sleep 5', 'echo second > second-ran.txt'] } })}\n`,
+      'base',
+    );
+    writeFileSync(join(dataDir, 'config.json'), JSON.stringify({ checkTimeoutMs: 500, checkGateTimeoutMs: 60_000 }));
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    await commit('b.txt', 'parent\n', 'parent work');
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    await settle(started.runId);
+    const final = store.getRun(started.runId);
+    expect(final?.status).toBe('failed');
+    expect(final?.landingCheck?.verdict).toBe('could-not-run');
+    expect(final?.landingCheck?.reason).toBe('timeout');
+    expect(final?.landingCheck?.results?.map(({ command, outcome }) => ({ command, outcome }))).toEqual([
+      { command: 'sleep 5', outcome: 'could-not-run' },
+      { command: 'echo second > second-ran.txt', outcome: 'not-run' },
+    ]);
+    expect(existsSync(join(final?.worktreePath as string, 'second-ran.txt'))).toBe(false);
   }, 60_000);
 });

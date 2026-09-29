@@ -117,10 +117,12 @@ import {
 } from './check-runner.ts';
 import { resolveCheckCommands, type CheckCommandResolution } from './check-commands.ts';
 import {
+  detectForeignSubject,
   deriveLandingCandidates,
   gitIn,
   landingCheckStale,
   landingResultOf,
+  landingSubjectDigest,
   materializeLandingSubject,
   verdictFromResults,
   type LandingCandidateSet,
@@ -2328,6 +2330,13 @@ export class RunManager {
         return { refused: `could not freeze the subject — ${derivation.detail}`, notFound: false };
       }
       const candidates = derivation.candidates;
+      // Everything that cannot be re-derived from the record alone rides in `request`: the
+      // explicit command list, and the acknowledgement digest a foreign subject's caller is
+      // echoing back. The check run materializes the subject later, in its own execution.
+      const request = {
+        ...(input.commands?.length ? { commands: [...input.commands] } : {}),
+        ...(input.acknowledge ? { acknowledge: { digest: input.acknowledge.digest } } : {}),
+      };
       const workflow: WorkflowDef = { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] };
       const record = this.startRun(workflow, {
         task:
@@ -2354,7 +2363,7 @@ export class RunManager {
             order: candidates.order,
             ...(candidates.excluded.length ? { excluded: candidates.excluded } : {}),
           },
-          ...(input.commands?.length ? { request: { commands: [...input.commands] } } : {}),
+          ...(Object.keys(request).length ? { request } : {}),
         },
       });
       this.store.appendEvent(record.id, {
@@ -2477,15 +2486,85 @@ export class RunManager {
       return { error: `landing check ${verdict} — ${reason}` };
     }
 
+    // The subject is materialized and the plan is resolved — and NOW, before the install step
+    // runs (let alone a gate command), the trust model decides whether any of it is the
+    // operator's own work. A foreign subject gets a PREVIEW and nothing else: no install, no
+    // step, no command, just the resolved plan, the identities and a digest the caller can
+    // acknowledge. The digest is recomputed here on every run, so an ack is only ever good for
+    // the exact subject (and plan) it was issued against.
+    const installArgv = resolution.install.kind !== 'none' && resolution.install.argv.length > 0 ? [...resolution.install.argv] : undefined;
+    const subjectDigest = landingSubjectDigest({
+      baseRef: subject.baseRef,
+      baseSha: subject.baseSha,
+      sources,
+      treeSha,
+      commandsDigest: resolution.digest,
+      ...(installArgv ? { installArgv } : {}),
+    }).digest;
+    const foreign = await detectForeignSubject({ git: gitIn(worktree), baseSha: subject.baseSha, sources });
+    if (foreign.foreign) {
+      const latest = this.store.getRun(runId)?.landingCheck ?? materializedCheck;
+      if (latest.request?.acknowledge?.digest !== subjectDigest) {
+        if (foreign.unreadable) {
+          emit({ type: 'note', message: 'a source history could not be read — treated as a foreign subject (fail closed)' });
+        }
+        const diff = await gitIn(worktree)(['diff', '--stat', '--no-color', subject.baseSha, 'HEAD']);
+        // `when cheap`: a stat is one git call, and the cap keeps a pathological diff from
+        // bloating `runs.json` — the preview's job is to identify the subject, not to reproduce it.
+        const diffStat = diff.ok && diff.stdout.trim() ? diff.stdout.trim().slice(0, 8192) : undefined;
+        const headSha = foreign.headSha ?? sources[sources.length - 1]?.sha ?? subject.baseSha;
+        this.store.updateRun(runId, {
+          landingCheck: {
+            ...latest,
+            preview: {
+              subjectDigest,
+              authors: foreign.authors,
+              commands: resolution.commands.map((entry) => entry.command),
+              ...(installArgv ? { installArgv } : {}),
+              headSha,
+              ...(diffStat ? { diffStat } : {}),
+            },
+            // The install step did not run: say so rather than leaving a manifest-bearing
+            // preview looking like a run whose install simply vanished.
+            ...(installArgv ? { install: { argv: installArgv, exitCode: null, outcome: 'not-run' as const } } : {}),
+          },
+        });
+        this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason: 'foreign-subject-needs-ack' });
+        emit({
+          type: 'note',
+          message:
+            `foreign subject — ${foreign.authors.length ? foreign.authors.join(', ') : 'an identity outside the local set'}` +
+            `; nothing was run. Acknowledge digest ${subjectDigest} to run the gate on exactly this subject`,
+        });
+        return {
+          error: `landing check could not run — foreign-subject-needs-ack: the subject contains commits by ${foreign.authors.join(', ') || 'an unknown identity'}; re-request with acknowledge.digest=${subjectDigest} to run it`,
+        };
+      }
+      this.store.updateRun(runId, {
+        landingCheck: { ...latest, ack: { digest: subjectDigest, at: new Date().toISOString() } },
+      });
+      emit({
+        type: 'note',
+        message: `foreign subject acknowledged — digest ${subjectDigest} matches the materialized tree; running the gate`,
+      });
+    }
+
     const workflow: WorkflowDef = { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] };
     if (resolution.install.kind !== 'none' && resolution.install.argv.length > 0) {
       const installCommand = resolution.install.argv.join(' ');
+      // The install step exists on the run's RAIL (`store.addStep`) and in `landingCheck.install`,
+      // but it is deliberately NOT pushed into the workflow the execute loop walks: it is being
+      // run right here, under `runLandingInstall`. Pushing it too made the loop run it a second
+      // time — and record the second `npm install` in `results` as if it were a gate command
+      // (D1). `results` is for gate commands; the install reports through `landingCheck.install`.
       this.store.addStep(runId, { id: INSTALL_STEP_ID, name: `install (${installCommand})`, kind: 'check' });
-      workflow.steps.push({ id: INSTALL_STEP_ID, name: `install (${installCommand})`, command: installCommand });
       const install = await this.runLandingInstall(runId, state, installCommand, emit);
       if (!install.ok) {
         const reason = install.status === 'skipped' ? 'dry-run' : install.status === 'timed-out' ? 'timeout' : 'install-failed';
-        this.store.updateRun(runId, { workflowDef: { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] } });
+        // The gate commands never ran. Say so, one entry per resolved command, instead of
+        // leaving `results` absent — an install failure is a verdict about a gate that was
+        // resolved and not executed (D3).
+        this.appendLandingNotRun(runId, resolution.commands.map((entry) => entry.command));
         this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason });
         return { error: `landing check could not run — the install step (${installCommand}) failed (${reason}); the gate commands were not run` };
       }
@@ -2587,6 +2666,44 @@ export class RunManager {
   }
 
   /**
+   * Gate commands this run resolved but never executed, recorded as `not-run` — once per command,
+   * in the order they were resolved.
+   *
+   * `startedAt` is REUSED as the stop time: the record's entry shape has no dedicated "never
+   * started" field and the contract is additive-only, so the moment the loop stopped is written
+   * into both stamps. That is honest for a command that never ran (it bounds the interval to
+   * zero and names WHEN the decision to stop was made), and it keeps every entry sortable against
+   * the executed ones. The verdict is derived from these entries, so "did not run" is visible
+   * rather than inferred from a length mismatch.
+   */
+  private appendLandingNotRun(runId: string, commands: readonly string[], at = new Date().toISOString()): void {
+    const state = this.active.get(runId);
+    if (!state?.landingCheckRun || commands.length === 0) return;
+    state.landingCheckRun.results.push(
+      ...commands.map(
+        (command): LandingResultEntry => ({ command, exitCode: null, outcome: 'not-run', startedAt: at, finishedAt: at }),
+      ),
+    );
+    const check = this.store.getRun(runId)?.landingCheck;
+    if (check) this.store.updateRun(runId, { landingCheck: { ...check, results: [...state.landingCheckRun.results] } });
+  }
+
+  /**
+   * The `not-run` tail from step `fromIndex` onward — what every early break in `execute`'s step
+   * loop owes the record. Before this existed, a gate that stopped at its first failure recorded
+   * only the commands that ran, and `finalizeLandingCheck` saw a short list and called it
+   * `cancelled` (D2). Call sites: every `break` that can leave a gate command unexecuted.
+   */
+  private recordLandingNotRunTail(runId: string, workflow: WorkflowDef, fromIndex: number): void {
+    if (!this.active.get(runId)?.landingCheckRun) return;
+    const commands = workflow.steps
+      .slice(fromIndex)
+      .filter((step) => step.id !== INSTALL_STEP_ID && stepKind(step) === 'check' && typeof step.command === 'string')
+      .map((step) => step.command as string);
+    this.appendLandingNotRun(runId, commands);
+  }
+
+  /**
    * The verdict, once the gate has run (or once something stopped it). Only an unbroken run of
    * `passed` commands is green; a dry run, a timeout, a cancellation and a platform that cannot
    * execute all end `could-not-run` — "did not run" must never read as "passed".
@@ -2595,18 +2712,21 @@ export class RunManager {
     const record = this.store.getRun(runId);
     const check = record?.landingCheck;
     if (!check || check.verdict !== undefined) return;
-    const gateSteps = record?.steps.filter((step) => step.kind === 'check' && step.id !== INSTALL_STEP_ID) ?? [];
     const recorded = check.results ?? [];
     const decided = verdictFromResults(recorded);
-    if (recorded.length < gateSteps.length) {
-      // A command was cut short (a cancel, a hard kill) before its outcome was recorded: the
-      // unrecorded one is not evidence of anything, least of all success.
-      this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason: 'cancelled' });
-      return;
-    }
-    // The seam's own reason (`timeout`, `dry-run`, `unsupported-platform`) outranks the generic
-    // one the four-outcome mapping can carry — "the command did not run" is worth naming exactly.
-    const reason = decided.verdict === 'passed' ? undefined : (this.active.get(runId)?.landingCheckRun?.reason ?? decided.reason);
+    // The verdict comes from the RECORDED results, never from their count: every gate command now
+    // has an entry (a `not-run` one when the loop stopped before it), so a short list is no
+    // longer the "cancelled" signal it used to be — and a failure with commands behind it is
+    // `failed`, not `could-not-run`. Precedence: a recorded `failed` wins (command-failed), then
+    // the seam's own reason (`timeout`, `dry-run`, `cancelled`) names exactly why nothing ran,
+    // and only a reasonless could-not-run falls back to `cancelled`.
+    const carried = this.active.get(runId)?.landingCheckRun?.reason;
+    const reason =
+      decided.verdict === 'passed'
+        ? undefined
+        : decided.verdict === 'failed'
+          ? decided.reason
+          : (carried ?? decided.reason ?? 'cancelled');
     this.recordLandingVerdict(runId, { verdict: decided.verdict, ...(reason ? { reason } : {}) });
   }
 
@@ -4599,7 +4719,10 @@ export class RunManager {
 
     let i = 0;
     while (i < workflow.steps.length) {
-      if (state.cancelled) break;
+      if (state.cancelled) {
+        this.recordLandingNotRunTail(runId, workflow, i);
+        break;
+      }
       const step = workflow.steps[i] as WorkflowStepDef;
       const kind = stepKind(step);
       const record = this.store.getRun(runId)?.steps.find((s) => s.id === step.id);
@@ -4636,10 +4759,14 @@ export class RunManager {
         startImages = undefined;
         startAttachments = [];
         checkFailure = null;
-        if (state.cancelled) break;
+        if (state.cancelled) {
+          this.recordLandingNotRunTail(runId, workflow, i);
+          break;
+        }
         if (failure) {
           this.finishStep(runId, step.id, 'failed', failure, emit);
           runError = `step "${step.id}" failed: ${failure}`;
+          this.recordLandingNotRunTail(runId, workflow, i);
           break;
         }
         // This step parked the workflow on a `CEZ:ASK` (#917) and its session
@@ -4651,6 +4778,7 @@ export class RunManager {
           // the rail reads like any other finished step. An unanswered one is
           // marked by the settlement, alongside the run it failed.
           if (state.askPark === 'abandoned') this.finishStep(runId, step.id, 'done', undefined, emit);
+          this.recordLandingNotRunTail(runId, workflow, i);
           break;
         }
         this.finishStep(runId, step.id, 'done', undefined, emit);
@@ -4666,7 +4794,11 @@ export class RunManager {
         this.recordLandingResult(runId, step.command, outcome, stepStartedAt);
       }
       const { ok, output, status } = outcome;
-      if (state.cancelled) break;
+      if (state.cancelled) {
+        // The cancelled command's own outcome is already recorded; the ones behind it are not.
+        this.recordLandingNotRunTail(runId, workflow, i + 1);
+        break;
+      }
       if (status === 'skipped') {
         // `CEZ_DRY_RUN=1` spawns nothing for a check, by contract. The step is
         // recorded `skipped` — the rail's honest "never ran" glyph — and the
@@ -4676,6 +4808,7 @@ export class RunManager {
         const note = `skipped (CEZ_DRY_RUN=1) — nothing was run`;
         this.finishStep(runId, step.id, 'skipped', note, emit);
         runError = `check "${step.id}" skipped (CEZ_DRY_RUN=1) — nothing was run`;
+        this.recordLandingNotRunTail(runId, workflow, i + 1);
         break;
       }
       if (ok) {
@@ -4724,6 +4857,7 @@ export class RunManager {
         });
       }
       runError = `check "${step.id}" ${why}${step.onFail && retryable ? ` after ${used + 1} attempts` : ''}`;
+      this.recordLandingNotRunTail(runId, workflow, i + 1);
       break;
     }
 

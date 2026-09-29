@@ -70,15 +70,23 @@ describe('POST /runs/:id/land-check', () => {
   });
 
   it('carries explicit sources and commands through, and 400s a misspelled key rather than ignoring it', async () => {
-    const ok = await post('/api/v1/runs/parent-1/land-check', JSON.stringify({ sources: ['cez/a'], commands: ['npm test'] }));
+    const ok = await post(
+      '/api/v1/runs/parent-1/land-check',
+      JSON.stringify({ sources: ['cez/a'], commands: ['npm test'], acknowledge: { digest: 'a'.repeat(64) } }),
+    );
     expect(ok.status).toBe(201);
-    expect(calls[0]?.input).toEqual({ sources: ['cez/a'], commands: ['npm test'] });
+    expect(calls[0]?.input).toEqual({ sources: ['cez/a'], commands: ['npm test'], acknowledge: { digest: 'a'.repeat(64) } });
 
     // `.strict()`: a `source` (singular) filter that silently did nothing would be worse than a
     // refusal — the check would run whatever the ledger says while the caller believes otherwise.
     const bad = await post('/api/v1/runs/parent-1/land-check', JSON.stringify({ source: ['cez/a'] }));
     expect(bad.status).toBe(400);
     expect(((await bad.json()) as { error: string }).error).toContain('source');
+
+    // An acknowledgement is a digest or it is nothing at all: an empty one would compare equal
+    // to nothing and silently strip the brake.
+    const empty = await post('/api/v1/runs/parent-1/land-check', JSON.stringify({ acknowledge: { digest: '' } }));
+    expect(empty.status).toBe(400);
   });
 
   it('answers 404 for an unknown run and 409 only for a check already in flight', async () => {
