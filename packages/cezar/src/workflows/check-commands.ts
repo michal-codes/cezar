@@ -16,11 +16,13 @@
  * visible as a drift verdict instead of a silently different gate.
  *
  * The iron rule of this module: **it executes nothing**. The only subprocesses it
- * ever spawns are `git rev-parse` (one probe, to tell "no such file in this tree"
- * from "this base is not readable") and `git show <sha>:<path>` (the frozen-base
- * read) — both fixed argv, no shell, never a string from either tree. A caller
- * (PR 4's core) hands `commands` to `runCheckCommand`; a `nothing-to-check` or
- * `could-not-run` resolution never yields a command to run at all.
+ * ever spawns are fixed-argv `git` READS — `rev-parse` (one probe, to tell "no
+ * such tree" from "this base is not readable"), `show <sha>:<path>` (the
+ * frozen-base read), and `ls-tree` (one whole-tree listing, reached only when a
+ * `-w` delegation makes the root `workspaces` globs matter) — no shell, and never
+ * a string from either tree as a command. A caller (PR 4's core) hands `commands`
+ * to `runCheckCommand`; a `nothing-to-check` or `could-not-run` resolution never
+ * yields a command to run at all.
  *
  * Vocabulary (the spec's, `## Acceptance Criteria for PRs 2–6`, PR 3):
  *  - `resolved`             — a non-empty list, identical in base and candidate;
@@ -31,15 +33,19 @@
  * `nothing-to-check` is not green and `commands` is empty on every non-`resolved`
  * status, so a caller that ignores `status` still has nothing to execute.
  *
- * What the pinned plan covers — the F1 lesson. Pinning the bodies a list
- * *directly* names is close to vacuous in a repo whose gate is a set of thin
- * delegating stubs (`typecheck` -> `npm run typecheck:server` -> …), so the
- * digest covers the TRANSITIVE CLOSURE of npm-run references (bounded depth,
- * cycle-safe, `pre*`/`post*` hooks included), the local script files an argv
- * names (best effort: an argv-position token that exists in the tree), and the
- * Makefile when a make command makes it a body. What cannot be resolved
- * statically — `npm run "$TARGET"`, a chain past the depth bound, a `-w`
- * workspace delegation — is recorded in `notes`, never guessed at.
+ * What the pinned plan covers — the F1 lesson, extended by PR 3.2. Pinning the
+ * bodies a list *directly* names is close to vacuous in a repo whose gate is a
+ * set of thin delegating stubs (`typecheck` -> `npm run typecheck:server` ->
+ * `-w @scope/pkg` -> the workspace's body), so the digest covers the TRANSITIVE
+ * CLOSURE of npm-run references (bounded depth, cycle-safe, `pre*`/`post*` hooks
+ * included), the local script files an argv names (best effort: an argv-position
+ * token that exists in the tree), the Makefile when a make command makes it a
+ * body, and — PR 3.2 — the WORKSPACE MANIFESTS a `-w`/`--workspace`/`--workspaces`
+ * delegation addresses: resolved through the root `workspaces` globs, read from
+ * the same tree, pinned recursively with the manifest path recorded. What cannot
+ * be resolved statically — `npm run "$TARGET"`, a chain past the depth bound, a
+ * delegation whose target the tree does not declare — is recorded in `notes`,
+ * never guessed at.
  *
  * And what "cannot be read" means — the F3 lesson. `git show` exits 128 when the
  * path is not in that tree; that is absence. Every other failure (ENOBUFS on a
@@ -50,7 +56,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /** The repo-level gate declaration every om-* skill already reads. Highest-precedence repo source. */
 export const AGENTIC_CONFIG_PATH = '.ai/agentic.config.json';
@@ -106,8 +112,14 @@ const SEGMENT_WRAPPERS = new Set(['env', 'command', 'exec', 'nohup', 'time', 'su
 /** npm script names are plain identifiers; anything else (`$VAR`, `$(…)`) is dynamic and recorded, not guessed. */
 const PLAUSIBLE_SCRIPT_NAME = /^[A-Za-z0-9_:.+-][A-Za-z0-9_:.@+-]*$/;
 
-/** `-w <name>`, `--workspace <name>`, `-w=<name>`: a delegation to another manifest this resolver does not read. */
-const WORKSPACE_FLAG = /^(?:-w|--workspace)(?:=(.+))?$/;
+/**
+ * The digest payload's shape version. v1 pinned only the bodies a list directly
+ * named; v2 added the transitive npm-run closure and the argv script files; v3
+ * (PR 3.2) adds the workspace manifests behind `-w`/`--workspace`/`--workspaces`
+ * delegations. A payload change means a version bump — the digest is compared
+ * across runs, never persisted, but PR 4 and the review read this number.
+ */
+export const CHECK_PLAN_DIGEST_VERSION = 3;
 
 /** How much of a drift diff is kept. A moved body is the interesting part, and a
  *  manifest diff cannot usefully exceed this. */
@@ -201,6 +213,45 @@ interface PinnedFile {
   text: string;
 }
 
+/** One workspace manifest the root `workspaces` globs name. */
+interface WorkspaceManifest {
+  /** Tree-relative manifest path, e.g. `packages/cezar/package.json`. */
+  path: string;
+  /** The manifest's `name`, when it declares a string one — what `-w <name>` addresses. */
+  name?: string;
+  scripts: Record<string, string>;
+}
+
+/** A workspace script body, pinned with the manifest that defines it. */
+interface WorkspaceScriptBody {
+  manifest: string;
+  name: string;
+  body: string;
+}
+
+/** The workspace manifests one lookup resolved, or why it resolved none. */
+interface WorkspaceLookup {
+  manifests: WorkspaceManifest[];
+  /** Glob-matched manifests present but unreadable/unusable — a read that did not happen. */
+  errors: string[];
+  /** Why no manifest was resolved; `undefined` when the lookup is complete. */
+  detail?: string;
+}
+
+/**
+ * Resolve the root `"workspaces"` globs once, then answer `-w` selectors against
+ * them. Built lazily: a plan with no delegation never lists a tree.
+ */
+interface WorkspaceIndex {
+  /** Every workspace manifest this tree declares — what `-ws`/`--workspaces` addresses. */
+  all(): WorkspaceLookup;
+  /** The manifests a `-w <name|path>` selector names. */
+  matching(selector: string): WorkspaceLookup;
+}
+
+/** Every path in one tree, or why the listing could not be read. */
+type TreePathListing = { kind: 'paths'; paths: string[] } | { kind: 'error'; message: string };
+
 /** Everything one tree resolves to; base and candidate are built the same way. */
 interface TreePlan {
   label: string;
@@ -208,6 +259,8 @@ interface TreePlan {
   commands: string[];
   /** The npm-run closure: referenced scripts, their hooks, the hooks of the chain, sorted by name. */
   scripts: ScriptBody[];
+  /** Workspace script bodies reached through `-w` delegations, sorted by manifest then name. */
+  workspaceScripts: WorkspaceScriptBody[];
   /** Local script files named in argv, sorted by path. */
   files: PinnedFile[];
   makefile: { present: boolean; targets: string[]; text: string; pinned: boolean };
@@ -215,11 +268,15 @@ interface TreePlan {
   /** The tree's consulted source is present but unusable — the plan stops there. */
   malformed?: { reason: CheckCommandReason; detail: string };
   notes: string[];
+  /** The workspace manifest paths this tree resolved; the candidate reads exactly these. */
+  workspaceManifestPaths: string[];
 }
 
 interface FrozenBase {
   shortSha: string;
   read(path: string): TreeFile;
+  /** Every path in the base tree — one `git ls-tree`, cached; resolves `workspaces` globs. */
+  listPaths(): TreePathListing;
 }
 
 function shortSha(sha: string): string {
@@ -282,6 +339,7 @@ function createFrozenBase(repoRoot: string, baseSha: string): { kind: 'ok'; base
     return { kind: 'error', detail: `git rev-parse ${shortSha(baseSha)}^{commit} failed: ${probe.stderr || 'git is not available'}` };
   }
   const cache = new Map<string, TreeFile>();
+  let listing: TreePathListing | undefined;
   return {
     kind: 'ok',
     base: {
@@ -298,6 +356,16 @@ function createFrozenBase(repoRoot: string, baseSha: string): { kind: 'ok'; base
             : { kind: 'error', message: `git show ${shortSha(baseSha)}:${path} could not be read (${readFailureReason(show)}) — present but unreadable, not absent` };
         cache.set(path, result);
         return result;
+      },
+      listPaths(): TreePathListing {
+        if (listing) return listing;
+        // A FIXED argv: the whole tree, so nothing tree-supplied (a `workspaces`
+        // glob, a path) reaches git as a pathspec.
+        const ls = git(repoRoot, ['ls-tree', '-r', '--name-only', '-z', baseSha]);
+        listing = ls.ok
+          ? { kind: 'paths', paths: ls.stdout.split('\0').filter((path) => path !== '') }
+          : { kind: 'error', message: `git ls-tree ${shortSha(baseSha)} could not be read (${readFailureReason(ls)})` };
+        return listing;
       },
     },
   };
@@ -433,57 +501,117 @@ function shellSegments(text: string): string[][] {
   return segments;
 }
 
+/** One `-w`/`--workspace`/`--workspaces` delegation: a script npm runs in another manifest. */
+interface WorkspaceDelegation {
+  /** The script name npm resolves in the target manifest(s). */
+  script: string;
+  /** The `-w <name|path>` selector; absent for `-ws`/`--workspaces` (every workspace). */
+  workspace?: string;
+}
+
 interface NpmScriptRefs {
+  /** Scripts npm resolves against the SAME manifest (no workspace flag in the segment). */
   names: string[];
   /** References whose target cannot be resolved statically, verbatim. */
   dynamic: string[];
-  /** `-w` / `--workspace` delegations to a manifest this resolver does not read. */
-  workspaces: string[];
+  /** Scripts the segment delegates to other workspaces — where they actually run. */
+  delegations: WorkspaceDelegation[];
+}
+
+/**
+ * One npm workspace flag, with the token index to resume at. `-w x`,
+ * `--workspace x`, `--workspace=x` and `-w=x` name one workspace; `-ws` /
+ * `--workspaces` names every workspace. A workspace flag whose value is missing
+ * is not a flag (it is left for the ordinary flag-skipping).
+ */
+function parseWorkspaceFlag(tokens: readonly string[], index: number): { delegation: Omit<WorkspaceDelegation, 'script'>; next: number } | undefined {
+  const token = unquote(tokens[index] ?? '');
+  if (token === '-ws' || token === '--workspaces') return { delegation: {}, next: index + 1 };
+  const match = /^(?:-w|--workspace)(?:=(.+))?$/.exec(token);
+  if (!match) return undefined;
+  const inline = match[1];
+  if (inline !== undefined) return inline === '' ? undefined : { delegation: { workspace: inline }, next: index + 1 };
+  const value = tokens[index + 1] === undefined ? undefined : unquote(tokens[index + 1]!);
+  if (value === undefined || value.startsWith('-')) return undefined;
+  return { delegation: { workspace: value }, next: index + 2 };
 }
 
 /**
  * Every npm script a piece of shell text references, ANYWHERE in it: the head of
  * a simple command (`npm test`), the tail of a compound one (`a && npm run b`),
  * and every hop of a script body. A name that is not a plain identifier
- * (`npm run "$TARGET"`) is reported as dynamic instead of guessed at; a name npm
- * resolves against another manifest (`-w`) is reported as a workspace delegation.
+ * (`npm run "$TARGET"`) is reported as dynamic instead of guessed at. A workspace
+ * flag changes WHERE the script resolves (`npm run build -w @scope/pkg` runs the
+ * workspace's `build`, not the root's), so such a segment yields a delegation and
+ * never a same-manifest name.
  */
 function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const names: string[] = [];
   const dynamic: string[] = [];
-  const workspaces: string[] = [];
+  const delegations: WorkspaceDelegation[] = [];
   for (const tokens of shellSegments(text)) {
     for (let i = 0; i < tokens.length; i += 1) {
       if (unquote(tokens[i] ?? '') !== 'npm') continue;
-      const verb = tokens[i + 1] === undefined ? undefined : unquote(tokens[i + 1]!);
-      let after = i + 2;
+      // Only workspace flags may precede the verb; any other leading token keeps
+      // the original parse (it must be the verb itself).
+      const targets: Omit<WorkspaceDelegation, 'script'>[] = [];
+      let cursor = i + 1;
+      while (cursor < tokens.length) {
+        const flag = parseWorkspaceFlag(tokens, cursor);
+        if (!flag) break;
+        targets.push(flag.delegation);
+        cursor = flag.next;
+      }
+      const verb = tokens[cursor] === undefined ? undefined : unquote(tokens[cursor]!);
+      let after = cursor + 1;
+      let script: string | undefined;
       if (verb === 'test') {
-        names.push('test');
+        script = 'test';
       } else if (verb === 'run' || verb === 'run-script') {
-        while (after < tokens.length && unquote(tokens[after]!).startsWith('-')) after += 1;
-        const raw = tokens[after];
-        if (raw === undefined) continue;
-        const name = unquote(raw);
-        if (PLAUSIBLE_SCRIPT_NAME.test(name)) names.push(name);
-        else dynamic.push(`npm ${verb} ${raw}`);
-        after += 1;
+        while (after < tokens.length) {
+          const flag = parseWorkspaceFlag(tokens, after);
+          if (flag) {
+            targets.push(flag.delegation);
+            after = flag.next;
+            continue;
+          }
+          if (unquote(tokens[after]!).startsWith('-')) {
+            after += 1;
+            continue;
+          }
+          script = unquote(tokens[after]!);
+          after += 1;
+          break;
+        }
+        if (script === undefined) continue;
       } else {
         continue;
       }
+      // Workspace flags may also follow the script name.
       for (let k = after; k < tokens.length; k += 1) {
-        const match = WORKSPACE_FLAG.exec(unquote(tokens[k]!));
-        if (!match) continue;
-        const inline = match[1];
-        const value = inline ?? (tokens[k + 1] === undefined ? undefined : unquote(tokens[k + 1]!));
-        if (value) {
-          workspaces.push(value);
-          if (!inline) k += 1;
-        }
+        const flag = parseWorkspaceFlag(tokens, k);
+        if (!flag) continue;
+        targets.push(flag.delegation);
+        if (flag.next > k + 1) k = flag.next - 1;
+      }
+      if (!PLAUSIBLE_SCRIPT_NAME.test(script)) {
+        dynamic.push(`npm ${verb} ${script}`);
+      } else if (targets.length) {
+        for (const target of targets) delegations.push({ ...target, script });
+      } else {
+        names.push(script);
       }
       i = after - 1;
     }
   }
-  return { names: dedupe(names), dynamic: dedupe(dynamic), workspaces: dedupe(workspaces) };
+  const seen = new Set<string>();
+  const uniqueDelegations = delegations.filter((delegation) => {
+    const key = `${delegation.workspace ?? '*'}\u0000${delegation.script}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return { names: dedupe(names), dynamic: dedupe(dynamic), delegations: uniqueDelegations };
 }
 
 /** The local script path a bare argv token names, if it looks like one. */
@@ -538,8 +666,150 @@ function scriptFilePaths(commands: readonly string[]): string[] {
   return dedupe(out);
 }
 
-/** One node of the closure: an npm script body, or a local script file named in argv. */
-type ClosureNode = { kind: 'script'; name: string; depth: number } | { kind: 'file'; path: string; depth: number };
+/** `packages/cezar` from `packages/cezar/package.json` — what a `-w <path>` selector names. */
+function manifestDirectory(manifestPath: string): string {
+  return dirname(manifestPath).replace(/^\.$/, '');
+}
+
+/** Strip `./` and trailing slashes from a workspace glob or a `-w <path>` selector. */
+function normalizeWorkspacePath(value: string): string {
+  return value.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
+/** npm workspace globs are simple: `?`/`*` stay inside one segment, `**` crosses. */
+function workspaceGlobToRegExp(glob: string): RegExp {
+  let out = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const ch = glob[i]!;
+    if (ch === '*' && glob[i + 1] === '*') {
+      out += '.*';
+      i += 1;
+      continue;
+    }
+    if (ch === '*') {
+      out += '[^/]*';
+      continue;
+    }
+    if (ch === '?') {
+      out += '[^/]';
+      continue;
+    }
+    out += /[.*+?^${}()|[\]\\]/.test(ch) ? `\\${ch}` : ch;
+  }
+  return new RegExp(`^${out}$`);
+}
+
+/**
+ * The manifest paths the root `"workspaces"` globs name, from a flat path
+ * listing. npm globs address DIRECTORIES, so each is matched as
+ * `<glob>/package.json`; a `!`-prefixed glob excludes (npm's negation).
+ */
+function workspaceManifestPaths(allPaths: readonly string[], globs: readonly string[]): string[] {
+  const included: string[] = [];
+  const excluded = new Set<string>();
+  for (const raw of globs) {
+    const negated = raw.trim().startsWith('!');
+    const pattern = normalizeWorkspacePath(negated ? raw.trim().slice(1) : raw);
+    if (!pattern) continue;
+    const regex = workspaceGlobToRegExp(`${pattern}/package.json`);
+    for (const path of allPaths) {
+      if (!regex.test(path)) continue;
+      if (negated) excluded.add(path);
+      else included.push(path);
+    }
+  }
+  return dedupe(included.filter((path) => !excluded.has(path))).sort();
+}
+
+/**
+ * Read every workspace manifest of one tree. The BASE resolves its manifest set
+ * from the root `"workspaces"` globs (list the tree with `git ls-tree`, match,
+ * `git show` each manifest); the CANDIDATE reads the FROZEN BASE's manifest paths
+ * from the working tree — the plan that would run is the base's, and reading the
+ * same files is what turns a neutered workspace script into a drift line. Built
+ * lazily: a plan with no `-w` delegation never lists a tree.
+ */
+function createWorkspaceIndex(sources: TreeSources, manifest: ParsedManifest): WorkspaceIndex {
+  let cached: WorkspaceLookup | undefined;
+  const all = (): WorkspaceLookup => (cached ??= resolveAll());
+  const resolveAll = (): WorkspaceLookup => {
+    let paths: string[];
+    if (sources.workspaceManifestPaths) {
+      paths = [...sources.workspaceManifestPaths];
+      if (paths.length === 0) return { manifests: [], errors: [], detail: `the frozen base resolved no workspace manifest under ${PACKAGE_JSON_PATH}` };
+    } else {
+      if (manifest.workspaces === undefined) {
+        return { manifests: [], errors: [], detail: manifest.workspacesDetail ?? `no "workspaces" field in ${PACKAGE_JSON_PATH}` };
+      }
+      if (manifest.workspaces.length === 0) return { manifests: [], errors: [], detail: `"workspaces" in ${PACKAGE_JSON_PATH} is empty` };
+      const listing = sources.listPaths?.();
+      if (!listing || listing.kind === 'error') {
+        const message = listing?.kind === 'error' ? listing.message : 'this tree cannot be listed';
+        return { manifests: [], errors: [`${PACKAGE_JSON_PATH}: workspaces could not be listed (${message})`], detail: `the tree could not be listed (${message})` };
+      }
+      paths = workspaceManifestPaths(listing.paths, manifest.workspaces);
+      if (paths.length === 0) return { manifests: [], errors: [], detail: `"workspaces" (${manifest.workspaces.join(', ')}) matches no manifest` };
+    }
+    const manifests: WorkspaceManifest[] = [];
+    const errors: string[] = [];
+    for (const path of paths) {
+      const file = sources.read(path);
+      if (file.kind === 'absent') continue;
+      if (file.kind === 'error') {
+        errors.push(`${path}: ${file.message}`);
+        continue;
+      }
+      const parsed = parseWorkspaceManifest(file, path);
+      if (!parsed.ok) {
+        errors.push(parsed.detail ?? `${path}: unusable`);
+        continue;
+      }
+      manifests.push(parsed.value!);
+    }
+    return {
+      manifests,
+      errors,
+      ...(manifests.length === 0 ? { detail: `none of the ${paths.length} workspace manifest(s) ${PACKAGE_JSON_PATH} declares could be read` } : {}),
+    };
+  };
+  return {
+    all,
+    matching(selector: string): WorkspaceLookup {
+      const lookup = all();
+      const wanted = normalizeWorkspacePath(selector);
+      const matches = lookup.manifests.filter(
+        (entry) => entry.name === selector || normalizeWorkspacePath(entry.path) === wanted || manifestDirectory(entry.path) === wanted,
+      );
+      if (matches.length) return { ...lookup, manifests: matches };
+      return { ...lookup, manifests: [], detail: `no workspace manifest named or at "${selector}"` };
+    },
+  };
+}
+
+interface ClosureInput {
+  /** The root manifest's scripts. */
+  rootScripts: Record<string, string>;
+  commandRoots: readonly string[];
+  lifecycleRoots: readonly string[];
+  filePaths: readonly string[];
+  readFile: (path: string) => TreeFile;
+  workspaces: WorkspaceIndex;
+  notes: string[];
+}
+
+interface ClosureResult {
+  scripts: ScriptBody[];
+  workspaceScripts: WorkspaceScriptBody[];
+  files: PinnedFile[];
+  errors: string[];
+  /** The workspace manifest paths any delegation resolved — the candidate reads exactly these. */
+  workspaceManifestPaths: string[];
+}
+
+/** One node of the closure: an npm script body (root or workspace manifest), or a local script file named in argv. */
+type ClosureNode =
+  | { kind: 'script'; manifest: string; name: string; depth: number }
+  | { kind: 'file'; path: string; depth: number };
 
 /**
  * The bodies the plan would execute: the transitive npm-run closure of the list
@@ -547,20 +817,18 @@ type ClosureNode = { kind: 'script'; name: string; depth: number } | { kind: 'fi
  * npm's install lifecycle hooks and everything THEY reach. Each body contributes
  * its `pre*`/`post*` hooks and every npm script it references, to a bounded
  * depth; `seen` makes a cycle terminate, and a node is pinned once, at the
- * shallowest depth it is reached (the queue is FIFO). Best effort is the point:
- * anything that cannot be resolved statically is recorded in `notes`, so the
- * verdict can state what is NOT pinned.
+ * shallowest depth it is reached (the queue is FIFO). A `-w` delegation moves
+ * the same closure into another manifest (`workspaces`), so a workspace script
+ * is pinned like any other body — keyed by manifest, hooks and all — and a body
+ * that cannot be resolved statically is recorded in `notes`, so the verdict can
+ * state what is NOT pinned.
  */
-function collectPinnedBodies(
-  manifestScripts: Record<string, string>,
-  commandRoots: readonly string[],
-  lifecycleRoots: readonly string[],
-  filePaths: readonly string[],
-  readFile: (path: string) => TreeFile,
-  notes: string[],
-): { scripts: ScriptBody[]; files: PinnedFile[]; errors: string[] } {
-  const bodies = new Map<string, string>();
+function collectPinnedBodies(input: ClosureInput): ClosureResult {
+  const { rootScripts, commandRoots, lifecycleRoots, filePaths, readFile, workspaces, notes } = input;
+  const scriptsByManifest = new Map<string, Record<string, string>>([[PACKAGE_JSON_PATH, rootScripts]]);
+  const bodies = new Map<string, WorkspaceScriptBody>();
   const files = new Map<string, string>();
+  const workspaceManifestPathsSeen = new Set<string>();
   const seenScripts = new Set<string>();
   const seenFiles = new Set<string>();
   const errors: string[] = [];
@@ -568,11 +836,20 @@ function collectPinnedBodies(
   const note = (line: string): void => {
     if (!notes.includes(line)) notes.push(line);
   };
+  const fail = (line: string): void => {
+    if (!errors.includes(line)) errors.push(line);
+  };
+  const scriptKey = (manifest: string, name: string): string => `${manifest}\u0000${name}`;
 
-  const visitScript = (name: string, depth: number): void => {
-    if (seenScripts.has(name)) return;
-    seenScripts.add(name);
-    queue.push({ kind: 'script', name, depth });
+  const visitScript = (manifest: string, name: string, depth: number): boolean => {
+    const scripts = scriptsByManifest.get(manifest);
+    if (!scripts || scripts[name] === undefined) return false;
+    const key = scriptKey(manifest, name);
+    if (!seenScripts.has(key)) {
+      seenScripts.add(key);
+      queue.push({ kind: 'script', manifest, name, depth });
+    }
+    return true;
   };
   const visitFile = (path: string, depth: number): void => {
     if (seenFiles.has(path)) return;
@@ -580,21 +857,33 @@ function collectPinnedBodies(
     queue.push({ kind: 'file', path, depth });
   };
 
-  for (const name of lifecycleRoots) if (manifestScripts[name] !== undefined) visitScript(name, 1);
-  for (const path of filePaths) visitFile(path, 1);
-  for (const command of commandRoots) {
-    for (const name of extractNpmScriptRefs(command).names) {
-      visitScript(name, 1);
-      if (manifestScripts[name] === undefined) {
-        notes.push(`${command}: the frozen base resolves no "${name}" script — the argv is pinned, its body is not`);
-      }
+  const followWorkspace = (origin: string, delegation: WorkspaceDelegation, depth: number): void => {
+    const lookup = delegation.workspace === undefined ? workspaces.all() : workspaces.matching(delegation.workspace);
+    for (const error of lookup.errors) fail(error);
+    for (const manifest of lookup.manifests) {
+      workspaceManifestPathsSeen.add(manifest.path);
+      scriptsByManifest.set(manifest.path, manifest.scripts);
     }
-  }
+    const label = delegation.workspace === undefined ? 'npm --workspaces' : `npm workspace "${delegation.workspace}"`;
+    const targets = lookup.manifests.filter((manifest) => manifest.scripts[delegation.script] !== undefined);
+    if (targets.length === 0) {
+      const why =
+        lookup.detail ??
+        (lookup.manifests.length
+          ? `none of ${lookup.manifests.map((manifest) => manifest.path).join(', ')} defines it`
+          : 'the tree declares no workspace manifest for it');
+      note(`${origin}: ${label} could not be pinned (${why}) — the delegated "${delegation.script}" script body is not pinned`);
+      return;
+    }
+    note(`${origin}: ${label} → ${targets.map((manifest) => manifest.path).join(', ')} — the delegated "${delegation.script}" script is pinned`);
+    for (const manifest of targets) visitScript(manifest.path, delegation.script, depth);
+  };
 
-  const follow = (origin: string, text: string, depth: number): void => {
+  const follow = (origin: string, text: string, manifest: string, depth: number): void => {
+    const scripts = scriptsByManifest.get(manifest) ?? {};
     const refs = extractNpmScriptRefs(text);
     for (const ref of refs.names) {
-      if (manifestScripts[ref] === undefined) {
+      if (scripts[ref] === undefined) {
         note(`${origin}: references npm script "${ref}", which the frozen base does not define — its body is not pinned`);
         continue;
       }
@@ -602,24 +891,39 @@ function collectPinnedBodies(
         note(`${origin}: the npm-run chain is deeper than ${MAX_SCRIPT_DEPTH} hops at "${ref}" — its body is not pinned (bounded depth)`);
         continue;
       }
-      visitScript(ref, depth + 1);
+      visitScript(manifest, ref, depth + 1);
     }
     for (const dynamic of refs.dynamic) note(`${origin}: dynamic npm-run reference (${dynamic}) — not pinnable, and not pinned`);
-    for (const workspace of refs.workspaces) {
-      note(`${origin}: npm workspace "${workspace}" has its own manifest, which this resolver does not pin — the delegated script bodies are not pinned`);
+    for (const delegation of refs.delegations) {
+      if (depth >= MAX_SCRIPT_DEPTH) {
+        note(`${origin}: the npm-run chain is deeper than ${MAX_SCRIPT_DEPTH} hops at the "${delegation.script}" workspace delegation — its body is not pinned (bounded depth)`);
+        continue;
+      }
+      followWorkspace(origin, delegation, depth + 1);
     }
   };
+
+  for (const name of lifecycleRoots) visitScript(PACKAGE_JSON_PATH, name, 1);
+  for (const path of filePaths) visitFile(path, 1);
+  for (const command of commandRoots) {
+    const refs = extractNpmScriptRefs(command);
+    for (const name of refs.names) {
+      if (!visitScript(PACKAGE_JSON_PATH, name, 1)) {
+        notes.push(`${command}: the frozen base resolves no "${name}" script — the argv is pinned, its body is not`);
+      }
+    }
+    for (const delegation of refs.delegations) followWorkspace(command, delegation, 1);
+  }
 
   while (queue.length) {
     const node = queue.shift()!;
     if (node.kind === 'script') {
-      const body = manifestScripts[node.name];
+      const scripts = scriptsByManifest.get(node.manifest) ?? {};
+      const body = scripts[node.name];
       if (body === undefined) continue;
-      bodies.set(node.name, body);
-      for (const hook of [`pre${node.name}`, `post${node.name}`]) {
-        if (manifestScripts[hook] !== undefined) visitScript(hook, node.depth);
-      }
-      follow(`script "${node.name}"`, body, node.depth);
+      bodies.set(scriptKey(node.manifest, node.name), { manifest: node.manifest, name: node.name, body });
+      for (const hook of [`pre${node.name}`, `post${node.name}`]) visitScript(node.manifest, hook, node.depth);
+      follow(`script "${node.name}"`, body, node.manifest, node.depth);
       continue;
     }
     const file = readFile(node.path);
@@ -634,17 +938,25 @@ function collectPinnedBodies(
     }
     files.set(node.path, file.text);
     note(`${node.path}: pinned as a body named in argv (${file.text.length} characters)`);
-    follow(`file "${node.path}"`, file.text, node.depth);
+    follow(`file "${node.path}"`, file.text, PACKAGE_JSON_PATH, node.depth);
   }
 
+  const allBodies = [...bodies.values()];
   return {
-    scripts: [...bodies.entries()]
-      .map(([name, body]) => ({ name, body }))
+    scripts: allBodies
+      .filter((entry) => entry.manifest === PACKAGE_JSON_PATH)
+      .map(({ name, body }) => ({ name, body }))
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    workspaceScripts: allBodies
+      .filter((entry) => entry.manifest !== PACKAGE_JSON_PATH)
+      .sort((a, b) =>
+        a.manifest < b.manifest ? -1 : a.manifest > b.manifest ? 1 : a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+      ),
     files: [...files.entries()]
       .map(([path, text]) => ({ path, text }))
       .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)),
     errors,
+    workspaceManifestPaths: [...workspaceManifestPathsSeen].sort(),
   };
 }
 
@@ -658,8 +970,17 @@ interface ParseResult<T> {
   detail?: string;
 }
 
-function parseManifest(file: TreeFile, label: string): ParseResult<Record<string, string>> {
-  if (file.kind === 'absent') return { ok: true, value: {} };
+/** The root manifest as this module reads it: script bodies plus the `workspaces` globs. */
+interface ParsedManifest {
+  scripts: Record<string, string>;
+  /** The root `"workspaces"` globs (npm's array form, or yarn's `{ "packages": [...] }`). */
+  workspaces?: string[];
+  /** Present but unusable — a `-w` delegation cannot be resolved against it. */
+  workspacesDetail?: string;
+}
+
+function parseManifest(file: TreeFile, label: string): ParseResult<ParsedManifest> {
+  if (file.kind === 'absent') return { ok: true, value: { scripts: {} } };
   if (file.kind === 'error') return { ok: false, detail: `${PACKAGE_JSON_PATH} (${label}): ${file.message}` };
   let raw: unknown;
   try {
@@ -668,15 +989,58 @@ function parseManifest(file: TreeFile, label: string): ParseResult<Record<string
     return { ok: false, detail: `${PACKAGE_JSON_PATH} (${label}) is not valid JSON: ${(err as Error).message}` };
   }
   if (!isObject(raw)) return { ok: false, detail: `${PACKAGE_JSON_PATH} (${label}) is not a JSON object` };
+  const workspaces = parseWorkspacesField(raw['workspaces']);
   const scripts = raw['scripts'];
-  if (scripts === undefined) return { ok: true, value: {} };
+  if (scripts === undefined) return { ok: true, value: { scripts: {}, ...workspaces } };
   if (!isObject(scripts)) return { ok: false, detail: `${PACKAGE_JSON_PATH} (${label}): "scripts" is not an object` };
   const out: Record<string, string> = {};
   for (const [name, body] of Object.entries(scripts)) {
     if (typeof body !== 'string') return { ok: false, detail: `${PACKAGE_JSON_PATH} (${label}): script "${name}" is not a string` };
     out[name] = body;
   }
-  return { ok: true, value: out };
+  return { ok: true, value: { scripts: out, ...workspaces } };
+}
+
+/**
+ * npm's `workspaces` field. A mismatched shape is reported, never silently
+ * ignored — but it does not make the whole manifest malformed: without a `-w`
+ * delegation the field is not consulted at all.
+ */
+function parseWorkspacesField(raw: unknown): Pick<ParsedManifest, 'workspaces' | 'workspacesDetail'> {
+  if (raw === undefined) return {};
+  const list = Array.isArray(raw) ? raw : isObject(raw) && Array.isArray(raw['packages']) ? (raw['packages'] as unknown[]) : undefined;
+  if (list === undefined) return { workspacesDetail: `${PACKAGE_JSON_PATH}: "workspaces" is neither an array of globs nor { packages: [...] }` };
+  const globs: string[] = [];
+  for (const entry of list) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      return { workspacesDetail: `${PACKAGE_JSON_PATH}: "workspaces" entries must be non-empty strings (found ${JSON.stringify(entry)})` };
+    }
+    globs.push(entry.trim());
+  }
+  return { workspaces: globs };
+}
+
+/** One workspace manifest, as read from one tree. */
+function parseWorkspaceManifest(file: TreeFile, path: string): ParseResult<WorkspaceManifest> {
+  if (file.kind !== 'file') return { ok: false, detail: `${path}: not a readable file` };
+  let raw: unknown;
+  try {
+    raw = JSON.parse(file.text);
+  } catch (err) {
+    return { ok: false, detail: `${path}: not valid JSON: ${(err as Error).message}` };
+  }
+  if (!isObject(raw)) return { ok: false, detail: `${path}: not a JSON object` };
+  const scripts: Record<string, string> = {};
+  const scriptsRaw = raw['scripts'];
+  if (scriptsRaw !== undefined) {
+    if (!isObject(scriptsRaw)) return { ok: false, detail: `${path}: "scripts" is not an object` };
+    for (const [name, body] of Object.entries(scriptsRaw)) {
+      if (typeof body !== 'string') return { ok: false, detail: `${path}: script "${name}" is not a string` };
+      scripts[name] = body;
+    }
+  }
+  const name = typeof raw['name'] === 'string' && raw['name'] !== '' ? raw['name'] : undefined;
+  return { ok: true, value: { path, ...(name === undefined ? {} : { name }), scripts } };
 }
 
 function parseAgenticConfig(file: TreeFile, label: string): ParseResult<string[]> {
@@ -723,8 +1087,12 @@ interface TreeSources {
   packageJson: TreeFile;
   packageLock: TreeFile;
   makefile: TreeFile;
-  /** Read another path from THIS tree — the local script files argv names. */
+  /** Read another path from THIS tree — the local script files argv names, the workspace manifests. */
   read: (path: string) => TreeFile;
+  /** List every path in THIS tree — the base only; resolves the `"workspaces"` globs. */
+  listPaths?: () => TreePathListing;
+  /** Set on the candidate: read workspace manifests at exactly these frozen-base paths. */
+  workspaceManifestPaths?: readonly string[];
 }
 
 /**
@@ -776,7 +1144,7 @@ function planFromSources(sources: TreeSources): TreePlan {
     notes.push(`${AGENTIC_CONFIG_PATH} (${label}): ${(config.value ?? []).length} command(s) — wins`);
   }
 
-  const manifestScripts = manifest.value ?? {};
+  const manifestScripts = manifest.value?.scripts ?? {};
   const discovered = DISCOVERY_SCRIPT_NAMES.filter((name) => manifestScripts[name] !== undefined).map((name) =>
     name === 'test' ? 'npm test' : `npm run ${name}`,
   );
@@ -834,25 +1202,29 @@ function planFromSources(sources: TreeSources): TreePlan {
       source,
       commands: [],
       scripts: [],
+      workspaceScripts: [],
       files: [],
       makefile: { present: makefilePresent, targets, text: makefileText, pinned: makefilePinned },
       install,
       malformed,
       notes,
+      workspaceManifestPaths: [],
     };
   }
 
   // --- the bodies this plan would execute: the transitive npm-run closure of the
   //     list (with pre*/post* hooks), the local script files the argv names, and
-  //     the install lifecycle hooks when an install step exists.
-  const pinned = collectPinnedBodies(
-    manifestScripts,
-    commands,
-    install.kind === 'none' ? [] : INSTALL_LIFECYCLE_SCRIPTS,
-    scriptFilePaths(commands),
-    sources.read,
+  //     the install lifecycle hooks when an install step exists. A `-w` delegation
+  //     pulls the delegated script (and its own closure) out of another manifest.
+  const pinned = collectPinnedBodies({
+    rootScripts: manifestScripts,
+    commandRoots: commands,
+    lifecycleRoots: install.kind === 'none' ? [] : INSTALL_LIFECYCLE_SCRIPTS,
+    filePaths: scriptFilePaths(commands),
+    readFile: sources.read,
+    workspaces: createWorkspaceIndex(sources, manifest.value ?? { scripts: {} }),
     notes,
-  );
+  });
   for (const error of pinned.errors) malformed ??= { reason: 'unreadable-source', detail: error };
 
   return {
@@ -860,11 +1232,13 @@ function planFromSources(sources: TreeSources): TreePlan {
     source,
     commands,
     scripts: pinned.scripts,
+    workspaceScripts: pinned.workspaceScripts,
     files: pinned.files,
     makefile: { present: makefilePresent, targets, text: makefileText, pinned: makefilePinned },
     install,
     malformed,
     notes,
+    workspaceManifestPaths: pinned.workspaceManifestPaths,
   };
 }
 
@@ -882,17 +1256,20 @@ function resolveInstall(sources: TreeSources): TreePlan['install'] {
 /**
  * Identity of the plan that would run: the ordered list, the resolved closure
  * (referenced scripts, their hooks, the whole npm-run chain), the local script
- * files named in argv, and the Makefile text when a make command makes it a
- * body. Deterministic — sorted bodies, no paths, no timestamps. Exactly what the
- * drift rule compares. `version: 2` is the closure + files shape (v1 pinned only
- * directly referenced bodies).
+ * files named in argv, the workspace script bodies behind `-w` delegations (with
+ * the manifest path that defines each), and the Makefile text when a make command
+ * makes it a body. Deterministic — sorted bodies, no timestamps. Exactly what the
+ * drift rule compares. `CHECK_PLAN_DIGEST_VERSION` is the shape version (v1 pinned
+ * only directly referenced bodies; v2 added the closure and argv files; v3 adds
+ * the workspace manifests) — bump it whenever the payload changes.
  */
-function planDigest(plan: Pick<TreePlan, 'source' | 'commands' | 'scripts' | 'files' | 'makefile'>): string {
+function planDigest(plan: Pick<TreePlan, 'source' | 'commands' | 'scripts' | 'workspaceScripts' | 'files' | 'makefile'>): string {
   const payload = {
-    version: 2,
+    version: CHECK_PLAN_DIGEST_VERSION,
     source: plan.source,
     commands: plan.commands,
     scripts: plan.scripts.map(({ name, body }) => ({ name, body })),
+    workspaceScripts: plan.workspaceScripts.map(({ manifest, name, body }) => ({ manifest, name, body })),
     files: plan.files.map(({ path, text }) => ({ path, text })),
     makefile: plan.makefile.pinned ? plan.makefile.text : null,
   };
@@ -932,6 +1309,24 @@ function renderPlanDiff(base: TreePlan, candidate: TreePlan): string {
     sections.push(
       diffSection(
         `script:${name}`,
+        before === undefined ? [MISSING_BASE] : before.split('\n'),
+        after === undefined ? [MISSING_CANDIDATE] : after.split('\n'),
+      ),
+    );
+  }
+  const workspaceKeys = [
+    ...new Set([
+      ...base.workspaceScripts.map((script) => `${script.manifest}#${script.name}`),
+      ...candidate.workspaceScripts.map((script) => `${script.manifest}#${script.name}`),
+    ]),
+  ].sort();
+  for (const key of workspaceKeys) {
+    const before = base.workspaceScripts.find((script) => `${script.manifest}#${script.name}` === key)?.body;
+    const after = candidate.workspaceScripts.find((script) => `${script.manifest}#${script.name}` === key)?.body;
+    if (before === after) continue;
+    sections.push(
+      diffSection(
+        `workspace:${key}`,
         before === undefined ? [MISSING_BASE] : before.split('\n'),
         after === undefined ? [MISSING_CANDIDATE] : after.split('\n'),
       ),
@@ -989,10 +1384,12 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
       source: 'none',
       commands: [],
       scripts: [],
+      workspaceScripts: [],
       files: [],
       makefile: { present: false, targets: [], text: '', pinned: false },
       install: { kind: 'none', argv: [] },
       notes: [],
+      workspaceManifestPaths: [],
     };
     return {
       status: 'could-not-run',
@@ -1017,6 +1414,7 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
     packageLock: frozen.base.read(PACKAGE_LOCK_PATH),
     makefile: frozen.base.read(MAKEFILE_PATH),
     read: frozen.base.read,
+    listPaths: frozen.base.listPaths,
   });
   const candidate = planFromSources({
     label: 'candidate (working tree)',
@@ -1026,6 +1424,10 @@ export function resolveCheckCommands(options: ResolveCheckCommandsOptions): Chec
     packageLock: readWorkingFile(options.repoRoot, PACKAGE_LOCK_PATH),
     makefile: readWorkingFile(options.repoRoot, MAKEFILE_PATH),
     read: (path: string) => readWorkingFile(options.repoRoot, path),
+    // The plan that would run is the base's, so the candidate resolves the SAME
+    // workspace manifests — read from the working tree, which is what turns a
+    // neutered workspace script body into a drift line.
+    workspaceManifestPaths: base.workspaceManifestPaths,
   });
 
   const diff = renderPlanDiff(base, candidate);
