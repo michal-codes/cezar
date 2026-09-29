@@ -8,6 +8,7 @@ import {
   checkTruncationMarker,
   resolveBash,
   runCheckCommand,
+  type CheckOutcome,
 } from './check-runner.ts';
 
 /**
@@ -162,6 +163,53 @@ fs.writeFileSync('pid', String(process.pid));
 setInterval(() => {}, 1000);
 `;
 
+/**
+ * A leader that spawns a DETACHED grandchild with stdio inherited. `detached`
+ * puts the grandchild in its own session/process group, so no `kill(-pid)` of
+ * ours reaches it, while `stdio: 'inherit'` means it holds the pipes we are
+ * still reading — the exact shape that kept `runCheckCommand` from ever
+ * settling. The pid lands on disk so the test can reap the escaped orphan,
+ * which nothing else can.
+ */
+const ESCAPEE_PROBE = `
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const kid = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'inherit', detached: true });
+kid.unref();
+fs.writeFileSync('escapee', String(kid.pid));
+fs.writeFileSync('pid', String(process.pid));
+setInterval(() => {}, 1000);
+`;
+
+/** The same escapee, but the leader exits 0 at once — the orphan holds the
+ *  pipes while the check that spawned it has already finished. */
+const ESCAPEE_EXITS_PROBE = `
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const kid = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'inherit', detached: true });
+kid.unref();
+fs.writeFileSync('escapee', String(kid.pid));
+process.exit(0);
+`;
+
+/** SIGKILL the escaped orphan the probes above leave behind — nothing else can
+ *  reach it, so the tests below have to reap it themselves. */
+const reapEscapee = (): void => {
+  try {
+    process.kill(readPid('escapee'), 'SIGKILL');
+  } catch {
+    // the probe never got to write the pid, or the orphan is already gone
+  }
+};
+
+/**
+ * Wait for the seam's outcome, but only this long. Without the fix the promise
+ * NEVER settles, and a plain `await` would turn that into a 15 s test-budget
+ * timeout instead of a readable assertion failure.
+ */
+const settleWithin = async (ms: number, pending: Promise<CheckOutcome>): Promise<CheckOutcome | undefined> =>
+  Promise.race([pending, sleep(ms).then(() => undefined)]);
+
 describe('runCheckCommand — the process group', () => {
   it('kills a grandchild that outlives the timed-out command, and ignores SIGTERM doing it', async () => {
     const command = writeProbe('holder.cjs', HOLDER_PROBE);
@@ -216,6 +264,53 @@ process.exit(0);
     expect(outcome.ok).toBe(false);
     expect(await waitUntilDead(readPid('pid'))).toBe(true);
     expect(await waitUntilDead(readPid('grandchild'))).toBe(true);
+  }, 15_000);
+
+  /**
+   * The review's hang probe. A group-escaping grandchild is unreachable by
+   * `terminateGroup` (the group looks empty, so no SIGKILL is armed), and its
+   * inherited stdio keeps the pipes open — so `close` never fires and the
+   * promise used to hang forever, holding a `maxParallel` slot for good.
+   */
+  it('settles even when a detached grandchild inherits stdio and holds the pipes', async () => {
+    const command = writeProbe('escapee.cjs', ESCAPEE_PROBE);
+    const started = Date.now();
+    try {
+      const outcome = await settleWithin(
+        4_000,
+        runCheckCommand({ cwd, command, timeoutMs: 600, graceMs: 200 }),
+      );
+      expect(outcome).toBeDefined();
+      expect(outcome?.status).toBe('timed-out');
+      expect(outcome?.ok).toBe(false);
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(await waitUntilDead(readPid('pid'))).toBe(true);
+      // Not a vacuous scenario: the orphan really did leave the group and is
+      // still alive, which is why only cutting the pipes can settle the promise.
+      expect(alive(readPid('escapee'))).toBe(true);
+    } finally {
+      reapEscapee();
+    }
+  }, 15_000);
+
+  it('settles when the command exits but its detached stdio-inheriting orphan outlives it', async () => {
+    const command = writeProbe('escapee-exits.cjs', ESCAPEE_EXITS_PROBE);
+    const started = Date.now();
+    try {
+      const outcome = await settleWithin(
+        4_000,
+        runCheckCommand({ cwd, command, timeoutMs: 20_000, graceMs: 200 }),
+      );
+      // The leader's own exit status is the outcome — the leftover process must
+      // not change that (see the backgrounded-grandchild case above) — but the
+      // promise has to settle instead of waiting on a pipe nobody will close.
+      expect(outcome).toBeDefined();
+      expect(outcome?.status).toBe('passed');
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(alive(readPid('escapee'))).toBe(true);
+    } finally {
+      reapEscapee();
+    }
   }, 15_000);
 });
 
@@ -321,6 +416,45 @@ describe('runCheckCommand — the minimal check env by default', () => {
         cez: null,
         path: true,
         home: true,
+      });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  /**
+   * The review's env probe, through the seam: before the fix all three named
+   * vars arrived `null` — the check env had no escape hatch at all, and
+   * `SSH_AUTH_SOCK` (an agent handle, not a secret) was dropped with the rest.
+   */
+  it('honours CEZ_ENV_PASSTHROUGH for the vars it names, and only those', async () => {
+    const saved = {
+      MY_CHECK_TOKEN: process.env.MY_CHECK_TOKEN,
+      SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+      CI: process.env.CI,
+      CEZ_ENV_PASSTHROUGH: process.env.CEZ_ENV_PASSTHROUGH,
+      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+    };
+    process.env.MY_CHECK_TOKEN = 'check-probe';
+    process.env.SSH_AUTH_SOCK = '/tmp/ssh-check-probe/agent.1';
+    process.env.CI = 'true';
+    process.env.CEZ_ENV_PASSTHROUGH = 'MY_CHECK_TOKEN,SSH_AUTH_SOCK,CI';
+    process.env.GITHUB_TOKEN = 'ghs_probe';
+    try {
+      const outcome = await runCheckCommand({
+        cwd,
+        command:
+          'node -e "console.log(JSON.stringify({token:process.env.MY_CHECK_TOKEN??null,sock:process.env.SSH_AUTH_SOCK??null,ci:process.env.CI??null,gh:process.env.GITHUB_TOKEN??null}))"',
+      });
+      expect(outcome.status).toBe('passed');
+      expect(JSON.parse(outcome.output)).toEqual({
+        token: 'check-probe',
+        sock: '/tmp/ssh-check-probe/agent.1',
+        ci: 'true',
+        gh: null,
       });
     } finally {
       for (const [key, value] of Object.entries(saved)) {

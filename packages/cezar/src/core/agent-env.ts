@@ -325,10 +325,15 @@ const ALL_VENDOR_PREFIXES: readonly string[] = [
  * allowlisted NAME that is credential-shaped is dropped (`SSH_AUTH_SOCK` is an
  * agent handle; `SESSIONNAME` only trips the name patterns).
  *
- * The two agent-step escape hatches (`CEZ_ENV_PASSTHROUGH`, `CEZ_AGENT_ENV_FULL`)
- * deliberately do NOT apply: widening a check's env is not a supported knob,
- * because the thing being fenced off is repository code, not a backend that
- * needs to authenticate.
+ * One escape hatch survives, because a repository-authored command can have a
+ * legitimate need the name heuristic cannot know about: `CEZ_ENV_PASSTHROUGH`
+ * names individual host vars to forward, exactly as it does for the agent env
+ * (`MY_CHECK_TOKEN`, a tool's config dir, `SSH_AUTH_SOCK` — an agent handle the
+ * name patterns read as credential-shaped). The named vars widen the env and
+ * nothing else: `GH_*`, the vendor/cloud families and the rest of `CEZ_*` stay
+ * dropped even when named, so the hatch can never reopen what this cut exists
+ * to close. `CEZ_AGENT_ENV_FULL` deliberately does NOT apply — the thing being
+ * fenced off is repository code, not a backend that needs to authenticate.
  *
  * NOT a sandbox, and it does not pretend to be: the check still runs as the
  * local user, in the worktree, and can read `~/.ssh`, `~/.config/gh` or any
@@ -337,6 +342,14 @@ const ALL_VENDOR_PREFIXES: readonly string[] = [
  * section of the landing-check design).
  */
 export function buildCheckEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  // The explicit opt-in, parsed exactly like `buildChildEnv`'s: comma-separated,
+  // trimmed, case-insensitive.
+  const passthrough = upperSet(
+    (readVar(source, 'CEZ_ENV_PASSTHROUGH') ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
   const out: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(source)) {
     if (value === undefined) continue;
@@ -344,8 +357,14 @@ export function buildCheckEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.P
     if (key.startsWith('CEZ_')) continue; // cezar's own namespace (incl. CEZ_DRY_RUN)
     if (GH_ALLOW_NAMES.has(key)) continue; // gh/PR handoff — agent steps only
     if (matchesPrefix(key, ALL_VENDOR_PREFIXES)) continue; // vendor auth, cloud creds
-    if (looksSecret(key)) continue; // never ride in on a prefix family either
-    if (BASE_ALLOW_NAMES.has(key) || matchesPrefix(key, BASE_ALLOW_PREFIXES)) out[name] = value;
+    // A var the operator NAMED is taken at its word: the heuristic would flag
+    // `SSH_AUTH_SOCK` (`_AUTH_`) and `MY_CHECK_TOKEN`, and both are exactly the
+    // kind of handle a check is given by hand. The families above are not
+    // negotiable, so naming one of those still forwards nothing.
+    if (!passthrough.has(key) && looksSecret(key)) continue;
+    if (passthrough.has(key) || BASE_ALLOW_NAMES.has(key) || matchesPrefix(key, BASE_ALLOW_PREFIXES)) {
+      out[name] = value;
+    }
   }
   return out;
 }

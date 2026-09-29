@@ -4241,7 +4241,16 @@ export class RunManager {
 
       const used = retriesUsed.get(step.id) ?? 0;
       const failureNote = checkFailureNote(step.command as string, status);
-      if (step.onFail && used < step.onFail.max) {
+      // A check that could not execute is not a check that failed, and looping
+      // the workflow back to an agent step cannot fix it: after the gate
+      // deadline expires every retry runs nothing (`timed-out`), a platform
+      // without a POSIX shell or a PATH without `bash` runs nothing every time
+      // (`could-not-run`), and a dry run never will (`skipped`, handled above).
+      // Retrying those burns agent turns on a command that cannot run, so the
+      // outcome the seam carried decides: only an exit status the agent could
+      // actually act on is retried.
+      const retryable = status === 'failed';
+      if (step.onFail && used < step.onFail.max && retryable) {
         retriesUsed.set(step.id, used + 1);
         checkFailure = output;
         this.finishStep(runId, step.id, 'failed', failureNote, emit);
@@ -4262,7 +4271,14 @@ export class RunManager {
 
       this.finishStep(runId, step.id, 'failed', failureNote, emit);
       const why = status === 'timed-out' ? 'timed out' : status === 'could-not-run' ? 'could not run' : 'failed';
-      runError = `check "${step.id}" ${why}${step.onFail ? ` after ${used + 1} attempts` : ''}`;
+      if (step.onFail && !retryable && used < step.onFail.max) {
+        emit({
+          type: 'note',
+          stepId: step.id,
+          message: `not retrying from "${step.onFail.retry}": the check did not run (${status}) — re-running it cannot change that`,
+        });
+      }
+      runError = `check "${step.id}" ${why}${step.onFail && retryable ? ` after ${used + 1} attempts` : ''}`;
       break;
     }
 
@@ -5581,10 +5597,11 @@ async function checkLimits(repoRoot: string): Promise<{ timeoutMs: number; gateT
 
 /**
  * The step-level `error` for a non-green check. A timeout and a could-not-run
- * are still FAILURES — `onFail` retries them like any other, bounded by the gate
- * deadline — but "exited non-zero" on a command that never started (or that we
- * killed) is a lie a reviewer then spends an hour on. The transcript carries
- * the detail; the step says which of the three happened.
+ * are still FAILURES — they end the run just like a non-zero exit, and `onFail`
+ * deliberately does NOT loop back for them: a retry would re-run the agent for
+ * a command that cannot execute. But "exited non-zero" on a command that never
+ * started (or that we killed) is a lie a reviewer then spends an hour on. The
+ * transcript carries the detail; the step says which of the three happened.
  */
 function checkFailureNote(command: string, status: CheckOutcomeStatus): string {
   if (status === 'timed-out') return `\`${command}\` timed out`;
