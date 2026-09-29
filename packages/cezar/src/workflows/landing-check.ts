@@ -31,6 +31,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { CheckOutcomeStatus } from './check-runner.ts';
@@ -461,6 +462,142 @@ export function verdictFromResults(results: readonly LandingResultEntry[]): { ve
   const failed = results.find((entry) => entry.outcome === 'failed');
   if (failed) return { verdict: 'failed', reason: 'command-failed' };
   return { verdict: 'could-not-run' };
+}
+
+// ---- the trust model: foreign subjects and the acknowledgement digest -------------------------
+
+/**
+ * Is this subject the operator's OWN work? The check runs repository-authored shell with the
+ * operator's identity, and the spec's brake is that a foreign subject — any commit a source
+ * introduces whose author or committer is not the local user — stops before execution.
+ *
+ * The LOCAL identity set is deliberately two things, and the second half is what keeps the rule
+ * zero-config:
+ *
+ *  - the repository's configured `user.email` (`git config --get user.email`, so local, global
+ *    and system config all count), when set; PLUS
+ *  - the author and committer emails of the subject's OWN base commit — the invoking run's branch
+ *    tip, which by construction is the operator's own work.
+ *
+ * Without the second half, a fixture repository (or a container) that never ran
+ * `git config user.email` would read every commit made with `-c user.email=test@local` as
+ * foreign, and the check's zero-config path would be preview-only. With it, a colleague's
+ * fetched branch — whose commits carry an identity neither source knows — is foreign, which is
+ * the case the brake exists for.
+ *
+ * Fail-closed on an unreadable history: a scan that cannot name identities cannot prove the
+ * subject is local, and guessing "local" would run foreign code. Detection reads git only; it
+ * executes NOTHING.
+ */
+export interface LandingForeignReport {
+  foreign: boolean;
+  /** The foreign identities as `Name <email>`, deduped and sorted (stable across runs). */
+  authors: string[];
+  /** The source tip the FIRST foreign commit arrived with — the head a preview is about. */
+  headSha?: string;
+  /** True when a source's history could not be read at all; the report is foreign either way. */
+  unreadable?: boolean;
+}
+
+/** The commit-identity format the scan parses: author name/email, committer name/email. */
+const IDENTITY_FORMAT = '%an%x09%ae%x09%cn%x09%ce';
+
+export async function detectForeignSubject(options: {
+  git: LandingGit;
+  baseSha: string;
+  sources: readonly LandingSource[];
+}): Promise<LandingForeignReport> {
+  const local = new Set<string>();
+  const configured = await options.git(['config', '--get', 'user.email']);
+  const configuredEmail = configured.ok ? configured.stdout.trim().toLowerCase() : '';
+  if (configuredEmail) local.add(configuredEmail);
+
+  const base = await options.git(['log', '-1', '--format=%ae%n%ce', options.baseSha]);
+  const lastSource = options.sources.length ? options.sources[options.sources.length - 1] : undefined;
+  if (!base.ok) {
+    return { foreign: true, authors: [], ...(lastSource ? { headSha: lastSource.sha } : {}), unreadable: true };
+  }
+  for (const line of base.stdout.split('\n')) {
+    const email = line.trim().toLowerCase();
+    if (email) local.add(email);
+  }
+
+  const authors = new Set<string>();
+  let headSha: string | undefined;
+  let unreadable = false;
+  for (const source of options.sources) {
+    // "Any commit a source introduces": everything in `<base>..<source>`, author AND committer.
+    const log = await options.git(['log', `--format=${IDENTITY_FORMAT}`, `${options.baseSha}..${source.sha}`]);
+    if (!log.ok) {
+      unreadable = true;
+      headSha ??= source.sha;
+      continue;
+    }
+    for (const line of log.stdout.split('\n')) {
+      if (!line.trim()) continue;
+      const [authorName = '', authorEmail = '', committerName = '', committerEmail = ''] = line
+        .split('\t')
+        .map((cell) => cell.trim());
+      const foreign: string[] = [];
+      if (authorEmail && !local.has(authorEmail.toLowerCase())) foreign.push(`${authorName} <${authorEmail}>`);
+      if (committerEmail && !local.has(committerEmail.toLowerCase())) foreign.push(`${committerName} <${committerEmail}>`);
+      if (!foreign.length) continue;
+      for (const identity of foreign) authors.add(identity);
+      headSha ??= source.sha;
+    }
+  }
+
+  return {
+    foreign: authors.size > 0 || unreadable,
+    authors: [...authors].sort(),
+    ...(headSha ? { headSha } : {}),
+    ...(unreadable ? { unreadable: true } : {}),
+  };
+}
+
+/** The canonical digest's version. Bump it when the shape below changes: an old preview's digest
+ *  must never match a digest computed under a new shape, or a stale ack would unlock a run. */
+export const LANDING_SUBJECT_DIGEST_VERSION = 1;
+
+export interface LandingSubjectDigestInput {
+  baseRef: string;
+  baseSha: string;
+  sources: readonly LandingSource[];
+  /** The materialized subject's tree — the verdict's identity, and the digest's anchor. */
+  treeSha: string;
+  /** The resolved plan's digest (`check-commands.ts`), so a moved PLAN re-previews too. */
+  commandsDigest: string;
+  /** `npm ci` / `npm install`, when the frozen base declares a manifest. */
+  installArgv?: readonly string[];
+}
+
+/**
+ * The acknowledgement digest: a sha256 over a VERSIONED, explicitly-ordered canonical JSON of the
+ * frozen subject. Two properties are the whole point, and both are properties of this function:
+ *
+ *  - Stable — the same subject digests identically on a later run. The key order is fixed here
+ *    (JSON.stringify preserves insertion order), the tree sha is the materialized result (merge
+ *    commits carry metadata, trees do not), and every semantic input — the pinned sources, the
+ *    resolved plan, the install argv — is inside.
+ *  - Moving with the subject — a new commit on a source, a new base, a different tree or a changed
+ *    plan all produce a different digest, so an old acknowledgement previews again instead of
+ *    running.
+ */
+export function landingSubjectDigest(input: LandingSubjectDigestInput): { version: number; canonical: string; digest: string } {
+  const canonical = JSON.stringify({
+    version: LANDING_SUBJECT_DIGEST_VERSION,
+    baseRef: input.baseRef,
+    baseSha: input.baseSha,
+    sources: input.sources.map((source) => ({ ref: source.ref, sha: source.sha })),
+    treeSha: input.treeSha,
+    commandsDigest: input.commandsDigest,
+    installArgv: [...(input.installArgv ?? [])],
+  });
+  return {
+    version: LANDING_SUBJECT_DIGEST_VERSION,
+    canonical,
+    digest: createHash('sha256').update(canonical).digest('hex'),
+  };
 }
 
 // ---- staleness ---------------------------------------------------------------------------------

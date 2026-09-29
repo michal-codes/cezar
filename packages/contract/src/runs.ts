@@ -203,6 +203,15 @@ export const landingCheckSchema = z.object({
   request: z
     .object({
       commands: z.array(z.string()).optional(),
+      /**
+       * A foreign-subject acknowledgement, carried verbatim from the request that created this
+       * check run. It has to live on the record for the same reason `commands` does: the subject
+       * is materialized later, in the check run's own execution (and, after a restart, in a new
+       * process), so the digest the caller acknowledged cannot be kept in memory. Its VALUE is
+       * what makes the brake honest — the digest is recomputed over the frozen subject before
+       * anything runs, and only an equal one unlocks execution.
+       */
+      acknowledge: z.object({ digest: z.string() }).optional(),
     })
     .optional(),
   /** The install step, when the frozen base declares a manifest. Run FIRST, never green on failure. */
@@ -260,6 +269,13 @@ export const landingCheckInputSchema = z
     sources: z.array(z.string().min(1).max(120)).max(24).optional(),
     /** Explicit commands. Replaces the repo's declared list; still base-pinned and drift-checked. */
     commands: z.array(z.string().min(1).max(200)).max(12).optional(),
+    /**
+     * The acknowledgement of a foreign subject: the `preview.subjectDigest` the caller saw. The
+     * check re-freezes and re-materializes the subject, recomputes the digest and proceeds only
+     * when the two are equal — a moved subject previews again instead of running. An ack on a
+     * subject that is NOT foreign is inert: nothing needed acknowledging, so nothing is recorded.
+     */
+    acknowledge: z.object({ digest: z.string().min(1).max(64) }).optional(),
   })
   .strict();
 export type LandingCheckInput = z.infer<typeof landingCheckInputSchema>;
