@@ -749,11 +749,12 @@ persisted before any merge and applied by sha, with the base defined as the invo
 run's branch tip frozen at request time and the worktree created at `baseSha` (a
 regression test pins that the parent's own commits are in the subject); (b2) zero
 eligible sources yields a base-only subject with `sources: []`; (c) the tree sha is
-the identity and is recomputed at read for `stale`; (d) conflicts abort with the
-U-file list and no commands; (d2) the install step runs first under the timeout/kill
-rules and its failure is never green; (d3) crash/restart at every durable stage ends
-with exactly one verdict and the status mapping of the lifecycle invariant; each case
-is proven red without its guard; (d4) every request carrying `acknowledge.digest`
+the identity, and `stale` is computed at read from the recorded pins; (d) conflicts
+abort with the U-file list and no commands; (d2) the install step runs first under
+the timeout/kill rules and its failure is never green; (d3) crash/restart at every
+durable stage ends with exactly one verdict and the status mapping of the lifecycle
+invariant; each case is proven red without its guard; (d4) every request carrying
+`acknowledge.digest`
 compares it whatever the subject's provenance, and a request that omits the previewed
 inputs re-previews instead of running; (e) the route is chained, zod-validated as
 middleware, and covered by route parity, typed-bodies and the BC route inventory; the
