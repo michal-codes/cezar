@@ -54,14 +54,18 @@
  * listing from the candidate: a manifest the candidate ADDS inside an unchanged
  * glob is a body `--workspaces` runs that the frozen base's path list never named.
  *
- * The npm scan behind all of it (PR 3.3, tightened by PR 3.4) models the GLOBAL
+ * The npm scan behind all of it (PR 3.3, tightened by PR 3.4 and PR 3.6) models the GLOBAL
  * FLAGS npm accepts around the verb (`npm --silent run inner`,
  * `npm --loglevel=error test`) and the workspace flags (`-w`/`--workspace`/`-ws`,
  * `--ws` — an abbreviation npm 11 accepts — and `--workspaces`, all measured
- * against npm 11.19.0), and it stops at `--`, where npm hands the rest to the
+ * against npm 11.19.0; PR 3.6 adds `--no-workspaces`, the boolean-false spelling
+ * of the same key), and it stops at `--`, where npm hands the rest to the
  * script: a forwarded `-w` is an ARGUMENT, so the ROOT body is what gets pinned.
  * A flag it does not model is recorded as a dynamic note for the whole segment —
- * never silently skipped, because npm's abbreviation surface is open-ended. What
+ * never silently skipped, because npm's abbreviation surface is open-ended. A
+ * shell wrapper's `-c` string (`sh -c "npm run inner --ws"`) is scanned as a
+ * nested command line by the same parser, and NAMED by the wrapper when it cannot
+ * be modelled (PR 3.6) — the same never-silent rule, one hop deeper. What
  * cannot be resolved statically — `npm run "$TARGET"`, a chain past the depth
  * bound, a delegation whose target the tree does not declare — is recorded in
  * `notes`, never guessed at.
@@ -124,6 +128,12 @@ const SCRIPT_FILE_EXTENSIONS = ['.sh', '.bash', '.zsh', '.ksh', '.mjs', '.cjs', 
 
 /** Interpreters whose first non-flag argument is itself the script to pin. */
 const SCRIPT_INTERPRETERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'node', 'tsx', 'deno', 'bun', 'python', 'python3', 'ruby', 'perl', 'pwsh', 'powershell']);
+
+/** Shells whose `-c <string>` argument is a command line this scan can read. */
+const SHELL_WRAPPERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh']);
+
+/** Shell flags that consume the NEXT token as a value: `-o option`, bash's `-O name` / `--rcfile file`. */
+const SHELL_VALUE_FLAGS = new Set(['-o', '+o', '-O', '--rcfile', '--init-file']);
 
 /** Wrappers that precede the real program in a simple command. */
 const SEGMENT_WRAPPERS = new Set(['env', 'command', 'exec', 'nohup', 'time', 'sudo']);
@@ -639,19 +649,26 @@ type WorkspaceFlag =
  * root, while `--ws foo`, `--ws 0` and `--ws FALSE` keep the flag on and forward
  * the token to the script as an argument). Only the exact value `false` turns the
  * flag off; every other value (including `0`) leaves it on.
+ *
+ * `negated` reads npm's `--no-…` spelling, where the SAME token and value rules
+ * mean the opposite: npm 11.19.0's `--no-workspaces` runs the root (the plain
+ * form's off value), and `--no-workspaces=false` runs every workspace (its on
+ * value). Nothing changes but which side `false` lands on.
  */
 function parseNpmBooleanFlag(
   tokens: readonly string[],
   index: number,
   pattern: RegExp,
+  negated = false,
 ): { enabled: boolean; next: number } | undefined {
   const token = unquote(tokens[index] ?? '');
   const match = pattern.exec(token);
   if (!match) return undefined;
-  if (match[1] !== undefined) return { enabled: unquote(match[1]) !== 'false', next: index + 1 };
+  const enabled = (value: string): boolean => (negated ? value === 'false' : value !== 'false');
+  if (match[1] !== undefined) return { enabled: enabled(unquote(match[1])), next: index + 1 };
   const value = tokens[index + 1] === undefined ? undefined : unquote(tokens[index + 1]!);
-  if (value === 'true' || value === 'false') return { enabled: value !== 'false', next: index + 2 };
-  return { enabled: true, next: index + 1 };
+  if (value === 'true' || value === 'false') return { enabled: enabled(value), next: index + 2 };
+  return { enabled: !negated, next: index + 1 };
 }
 
 /**
@@ -663,9 +680,14 @@ function parseNpmBooleanFlag(
  * workspace flag whose value is missing is not a flag (it is left for the
  * ordinary flag-skipping); the boolean forms carry their own value rules (see
  * `parseNpmBooleanFlag`), and a false value yields no delegation: the root runs.
+ * `--no-workspaces` is the boolean-false spelling of the SAME key (measured:
+ * `npm run inner --no-workspaces` runs the ROOT body, `--no-workspaces=false`
+ * runs every workspace — see `parseNpmBooleanFlag`'s `negated`).
  */
 function parseWorkspaceFlag(tokens: readonly string[], index: number): WorkspaceFlag | undefined {
-  const all = parseNpmBooleanFlag(tokens, index, /^(?:-ws|--ws|--workspaces)(?:=(.*))?$/);
+  const all =
+    parseNpmBooleanFlag(tokens, index, /^(?:-ws|--ws|--workspaces)(?:=(.*))?$/) ??
+    parseNpmBooleanFlag(tokens, index, /^--no-workspaces(?:=(.*))?$/, true);
   if (all) return { kind: 'all', enabled: all.enabled, next: all.next };
   const token = unquote(tokens[index] ?? '');
   const match = /^(?:-w|--workspace)(?:=(.+))?$/.exec(token);
@@ -723,6 +745,52 @@ function npmGlobalFlagTokens(tokens: readonly string[], index: number): number |
 }
 
 /**
+ * The script string of a shell wrapper at `tokens[index]`, if these tokens spell
+ * one: `sh -c "…"`, `bash -ec '…'`, `bash -o pipefail -c "…"`. The string is a
+ * COMMAND LINE the wrapper hands to the shell, so `extractNpmScriptRefs` scans it
+ * like any other text — npm 11.19.0 runs the workspace bodies behind
+ * `sh -c "npm run inner --ws"`, while a scan that only saw the wrapper token
+ * pinned nothing AND said nothing. A wrapper without a `-c` string (`sh
+ * ./gate.sh`) is not this shape: `scriptFilePaths` already pins the file its argv
+ * names, and an option the shell does not know exits it before any command runs
+ * (measured: `bash -Z -c …` and `bash --unknown-long -c …` exit 2), so treating
+ * it as inert cannot hide npm.
+ */
+function shellWrapperScript(tokens: readonly string[], index: number): string | undefined {
+  const program = unquote(tokens[index] ?? '');
+  if (!SHELL_WRAPPERS.has(program)) return undefined;
+  for (let k = index + 1; k < tokens.length; k += 1) {
+    const token = unquote(tokens[k]!);
+    // `-c` may sit in any cluster (`-ec`, `-lc`), and flags may precede it.
+    if (/^-[A-Za-z]*c[A-Za-z]*$/.test(token)) {
+      const script = tokens[k + 1];
+      return script === undefined ? undefined : unquote(script);
+    }
+    // `-o option` / `+o option` / `-O name` / `--rcfile file` consume a value;
+    // other flags are self-contained (measured: `bash -O extglob -c …` and
+    // `bash --rcfile /dev/null -c …` run the `-c` string).
+    if (SHELL_VALUE_FLAGS.has(token)) {
+      k += 1;
+      continue;
+    }
+    if (!token.startsWith('-') && !token.startsWith('+')) return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Could this `-c` string run npm? True when the scan can see an `npm` token in it,
+ * or when it holds a shell expansion (`$VAR`, backticks, a `\` escape) the
+ * tokenizer cannot see through — either way npm may run, and the segment must be
+ * named rather than assumed inert. A string with neither (`sh -c "echo hi"`)
+ * cannot invoke npm and is left alone.
+ */
+function wrapperMayRunNpm(text: string): boolean {
+  if (/[\\$`]/.test(text)) return true;
+  return shellSegments(text).some((tokens) => tokens.some((token) => unquote(token) === 'npm'));
+}
+
+/**
  * Every npm script a piece of shell text references, ANYWHERE in it: the head of
  * a simple command (`npm test`), the tail of a compound one (`a && npm run b`),
  * and every hop of a script body. A name that is not a plain identifier
@@ -731,15 +799,19 @@ function npmGlobalFlagTokens(tokens: readonly string[], index: number): number |
  * workspace's `build`, not the root's), so such a segment yields a delegation and
  * never a same-manifest name; the flags are resolved with npm's own last-wins
  * parsing (`--ws --ws=false` runs the root; a `-w` selector wins over the
- * boolean). GLOBAL flags between `npm` and the verb do not hide the verb when
- * this scan models them (`npm --silent run inner`, `npm --loglevel=error test`);
- * an UNMODELLED one is reported as dynamic rather than skipped, because npm's
+ * boolean; `--no-workspaces` is the boolean-false spelling of the same key).
+ * GLOBAL flags between `npm` and the verb do not hide the verb when this scan
+ * models them (`npm --silent run inner`, `npm --loglevel=error test`); an
+ * UNMODELLED one is reported as dynamic rather than skipped, because npm's
  * abbreviation surface is open-ended (`--ws` IS `--workspaces` in npm 11) and a
  * flag of unknown arity can hide the verb. `--` is npm's own end-of-options where
  * it stops parsing for the WHOLE invocation: before the verb it ends the flag scan
  * (`npm -- run inner --ws` runs the ROOT with `--ws` as an ARGUMENT, measured),
  * and after the verb it is the script NAME that may follow (`npm run -- inner`),
- * with everything later forwarded to the script.
+ * with everything later forwarded to the script. A shell wrapper's `-c` string
+ * (`sh -c "npm run inner --ws"`) is a nested command line: it is scanned with this
+ * same parser when it models a segment, and NAMED by the wrapper otherwise (see
+ * `shellWrapperScript`).
  */
 function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const names: string[] = [];
@@ -747,6 +819,25 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const delegations: WorkspaceDelegation[] = [];
   for (const tokens of shellSegments(text)) {
     for (let i = 0; i < tokens.length; i += 1) {
+      const wrapperScript = shellWrapperScript(tokens, i);
+      if (wrapperScript !== undefined) {
+        // The wrapper hands this string to the shell, so npm runs what it spells.
+        // Scan it with this same parser and merge what it models; a string that
+        // could run npm but models nothing is NAMED by the wrapper, never skipped
+        // (npm 11.19.0 runs `sh -c "npm run inner --ws"`'s workspace bodies; the
+        // old silent skip pinned nothing and said nothing).
+        const nested = extractNpmScriptRefs(wrapperScript);
+        if (nested.names.length || nested.delegations.length) {
+          names.push(...nested.names);
+          dynamic.push(...nested.dynamic);
+          delegations.push(...nested.delegations);
+        } else if (wrapperMayRunNpm(wrapperScript)) {
+          dynamic.push(npmSegmentLabel(tokens, i));
+        }
+        // Everything after the script string is $0/$1… to the INNER shell, not a
+        // command line npm reads.
+        break;
+      }
       if (unquote(tokens[i] ?? '') !== 'npm') continue;
       // npm's own config parsing is LAST-WINS PER KEY: the all-workspaces
       // boolean's last occurrence decides (`npm run inner --ws --ws=false` runs the

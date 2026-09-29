@@ -1472,6 +1472,218 @@ describe('check-commands — the command policy resolver', () => {
     });
   });
 
+  describe('nested shell wrappers and --no-workspaces (PR 3.6)', () => {
+    /**
+     * The 3.5 fixture, reused: a root `probe` body spells the invocation under
+     * test, a root `inner` body is what a wrapper can reach, and a workspace
+     * manifest is what a delegation resolves to. The base carries `echo ROOT-REAL`
+     * / `echo WS-A-REAL`; a candidate neuters one of them, so a plan that does not
+     * pin that body stays `resolved` while npm runs the neutered one.
+     */
+    const fixture = (probe: string, rootInner = 'echo ROOT-REAL', workspace: Record<string, string> = {}): Record<string, string> => ({
+      '.ai/agentic.config.json': config(['npm run probe']),
+      'package.json': workspaceRoot({ probe, inner: rootInner }),
+      'packages/a/package.json': pkgNamed('@scope/a', { inner: 'echo WS-A-REAL', ...workspace }),
+    });
+
+    describe('a `-c` shell string is scanned as a command line (F1)', () => {
+      it('pins the workspace body behind `sh -c "npm run inner --ws"` — npm runs it (F1)', () => {
+        const probe = 'sh -c "npm run inner --ws"';
+        baseSha = freeze(dir, fixture(probe));
+        // npm 11.19.0: `sh -c "npm run inner --ws"` prints WS-A-REAL then WS-B-REAL —
+        // the workspace bodies run, so a candidate that neuters WS-A is drift.
+        candidate(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.reason).toBe('commands-changed-vs-base');
+        expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+        expect(resolution.diff).toContain('- echo WS-A-REAL');
+        expect(resolution.diff).toContain('+ echo WS-A-NEUTERED');
+      });
+
+      it('pins a `-c` string in every measured wrapper spelling — quotes and flag clusters do not hide it (F1)', () => {
+        for (const probe of [
+          'sh -c "npm run inner"',
+          "sh -c 'npm run inner'",
+          'bash -c "npm run inner"',
+          'sh -ec "npm run inner"',
+          'bash -o pipefail -c "npm run inner"',
+          'bash -O extglob -c "npm run inner"',
+          'bash --rcfile /dev/null -c "npm run inner"',
+        ]) {
+          baseSha = freeze(dir, fixture(probe), `base ${probe}`);
+          // npm 11.19.0: every spelling runs the ROOT `inner` body (the argument is
+          // a command line, whatever flags precede `-c`).
+          candidate(dir, fixture(probe, 'echo ROOT-NEUTERED'));
+
+          const resolution = resolve(dir, baseSha);
+
+          expect(resolution.status, probe).toBe('nothing-to-check');
+          expect(resolution.diff, probe).toContain('@@ script:inner @@');
+        }
+      });
+
+      it('pins a wrapper’s inner invocation inside a script BODY too — the closure scans bodies (F1)', () => {
+        const shape = (neuter: boolean): Record<string, string> => ({
+          '.ai/agentic.config.json': config(['npm run gate']),
+          'package.json': workspaceRoot({ gate: 'sh -c "npm run inner --ws"', inner: 'echo ROOT-REAL' }),
+          'packages/a/package.json': pkgNamed('@scope/a', { inner: neuter ? 'echo WS-A-NEUTERED' : 'echo WS-A-REAL' }),
+        });
+        baseSha = freeze(dir, shape(false));
+        // npm 11.19.0: the body runs the workspace bodies; a body-level wrapper is
+        // the same hole one hop deeper.
+        candidate(dir, shape(true));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+      });
+
+      it('pins a wrapper in the command list itself — the same scan, one hop shallower (F1)', () => {
+        const command = 'sh -c "npm run inner --ws"';
+        const shape = (neuter: boolean): Record<string, string> => ({
+          '.ai/agentic.config.json': config([command]),
+          'package.json': workspaceRoot({ inner: 'echo ROOT-REAL' }),
+          'packages/a/package.json': pkgNamed('@scope/a', { inner: neuter ? 'echo WS-A-NEUTERED' : 'echo WS-A-REAL' }),
+        });
+        baseSha = freeze(dir, shape(false));
+        // npm 11.19.0: the command list entry runs the workspace bodies too; a fix
+        // that only scanned script bodies would leave this spelling silent.
+        candidate(dir, shape(true));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+      });
+
+      it('records a wrapper whose script string it cannot model — never silent (F1)', () => {
+        baseSha = freeze(dir, fixture('sh -c "$CMD"'));
+        // The script string is computed at run time: whether npm runs at all (and
+        // with which flags) is unknowable here, so the segment must be NAMED, not
+        // silently skipped.
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('resolved');
+        expect(notes(resolution)).toContain('dynamic npm-run reference');
+        expect(notes(resolution)).toContain('sh -c $CMD');
+        expect(notes(resolution)).toContain('not pinned');
+      });
+
+      it('names the wrapper when its inner npm invocation cannot be modelled (F1)', () => {
+        baseSha = freeze(dir, fixture('sh -c "npm run $TARGET"'));
+        // `npm run $TARGET` names a script this scan cannot read; the note names the
+        // WRAPPER, so a reader can see where the unpinnable invocation hides.
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('resolved');
+        expect(notes(resolution)).toContain('dynamic npm-run reference');
+        expect(notes(resolution)).toContain('sh -c npm run $TARGET');
+        expect(notes(resolution)).toContain('not pinned');
+      });
+
+      it('leaves a wrapper with no npm inside it alone — no note, no pin (guard)', () => {
+        baseSha = freeze(dir, fixture('sh -c "echo hi"'));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('resolved');
+        expect(notes(resolution)).not.toContain('dynamic npm-run reference');
+      });
+    });
+
+    describe('--no-workspaces is npm’s boolean-false spelling (F2)', () => {
+      it('runs the ROOT body for `--no-workspaces` — the negated boolean (F2)', () => {
+        const probe = 'npm run inner --no-workspaces';
+        baseSha = freeze(dir, fixture(probe));
+        // npm 11.19.0: prints ROOT-REAL — `--no-workspaces` IS `--workspaces=false`,
+        // so the ROOT body runs and a neutered ROOT is drift.
+        candidate(dir, fixture(probe, 'echo ROOT-NEUTERED'));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.reason).toBe('commands-changed-vs-base');
+        expect(resolution.diff).toContain('@@ script:inner @@');
+        expect(notes(resolution)).not.toContain('dynamic npm-run reference');
+      });
+
+      it('reads `--no-workspaces=false` as every workspace — the negation of false (F2)', () => {
+        const probe = 'npm run inner --no-workspaces=false';
+        baseSha = freeze(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-REAL' }));
+        // npm 11.19.0: prints WS-A-REAL and WS-B-REAL — the negation of false leaves
+        // every workspace selected; the ROOT does not run.
+        candidate(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+      });
+
+      it('reads the separate `--no-workspaces false` token as the negated value too (F2)', () => {
+        const probe = 'npm run inner --no-workspaces false';
+        baseSha = freeze(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-REAL' }));
+        // npm 11.19.0: the `false` token is consumed as the flag's value, and the
+        // negation of false is on — every workspace runs.
+        candidate(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+      });
+
+      it('keeps last-wins across --ws and --no-workspaces — the same npm config key (F2)', () => {
+        const cases = [
+          { probe: 'npm run inner --no-workspaces --ws', neuterRoot: false, section: '@@ workspace:packages/a/package.json#inner @@' },
+          { probe: 'npm run inner --ws --no-workspaces', neuterRoot: true, section: '@@ script:inner @@' },
+        ];
+        for (const { probe, neuterRoot, section } of cases) {
+          baseSha = freeze(dir, fixture(probe), `base ${probe}`);
+          // npm 11.19.0: the last spelling wins — `--... --ws` runs WS-A + WS-B,
+          // `--ws --no-workspaces` runs the ROOT only.
+          candidate(dir, neuterRoot ? fixture(probe, 'echo ROOT-NEUTERED') : fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+          const resolution = resolve(dir, baseSha);
+
+          expect(resolution.status, probe).toBe('nothing-to-check');
+          expect(resolution.diff, probe).toContain(section);
+        }
+      });
+
+      it('records --no-workspaces beside a -w selector instead of pinning a body npm refuses to run (F2 guard)', () => {
+        const probe = 'npm run inner -w @scope/a --no-workspaces';
+        baseSha = freeze(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-REAL' }));
+        // npm 11.19.0 exits 1: "Cannot use --no-workspaces and --workspace at the
+        // same time" — nothing runs, so nothing may be claimed as pinned.
+        candidate(dir, fixture(probe, 'echo ROOT-NEUTERED', { inner: 'echo WS-A-NEUTERED' }));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('resolved');
+        expect(notes(resolution)).toContain('dynamic npm-run reference');
+        expect(notes(resolution)).not.toContain('the delegated "inner" script is pinned');
+      });
+
+      it('keeps the selector when `--no-workspaces=false` turns the boolean back on (F2 guard)', () => {
+        const probe = 'npm run inner --no-workspaces=false -w @scope/a';
+        baseSha = freeze(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-REAL' }));
+        // npm 11.19.0: WS-A-REAL only — a selector wins over an on boolean, whatever
+        // spelling turned it on.
+        candidate(dir, fixture(probe, 'echo ROOT-REAL', { inner: 'echo WS-A-NEUTERED' }));
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('nothing-to-check');
+        expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#inner @@');
+      });
+    });
+  });
+
   describe('the install lifecycle — npm 11’s full set (F2)', () => {
     for (const hook of ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare']) {
       it(`pins the lifecycle hook the install step runs: ${hook}`, () => {
