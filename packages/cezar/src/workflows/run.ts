@@ -2,6 +2,7 @@ import type { TrackerAssociation } from '@open-mercato/cezar-contract';
 import { TrackerAgentBindingError } from '../server/tracker/agent-credentials.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import {
   parseAskMarker,
@@ -57,6 +58,7 @@ import type { QueuedMessage, RunRecord, RunStore, StepState } from '../runs/stor
 // ON *and* the run carries a `dispatch`: `dispatchOf()` is the single gate, and a run without one
 // takes byte-for-byte the path it took before this feature existed.
 import type { DispatchInput, DispatchIntent, DispatchReport, RunDispatch } from '@open-mercato/cezar-contract';
+import type { LandingCheckInput } from '@open-mercato/cezar-contract';
 import { resolveCapabilities } from '../server/capabilities.ts';
 import { composeDispatchPrompt } from '../dispatch/prompts.ts';
 import {
@@ -113,6 +115,19 @@ import {
   type CheckOutcome,
   type CheckOutcomeStatus,
 } from './check-runner.ts';
+import { resolveCheckCommands, type CheckCommandResolution } from './check-commands.ts';
+import {
+  deriveLandingCandidates,
+  gitIn,
+  landingCheckStale,
+  landingResultOf,
+  materializeLandingSubject,
+  verdictFromResults,
+  type LandingCandidateSet,
+  type LandingResultEntry,
+  type LandingSource,
+  type LandingVerdict,
+} from './landing-check.ts';
 import { buildCheckEnv } from '../core/agent-env.ts';
 
 async function configuredModelProvider(
@@ -464,6 +479,13 @@ interface ActiveRun {
    * in both.
    */
   checkGateDeadline?: number;
+  /**
+   * The landing check's in-flight evidence, while ITS run executes: one entry per command the
+   * gate ran, plus the first non-green reason. Populated only in `execute` — a landing check is
+   * never continued (`runContinuation` never sees one), so the twin construction site has
+   * nothing to carry; the field is optional precisely so that stays true.
+   */
+  landingCheckRun?: { results: LandingResultEntry[]; reason?: string };
 }
 
 /** Safety cap on autonomous auto-continues per run — stops a stuck agent from nudging forever.
@@ -524,6 +546,38 @@ export const AUTO_RESUME_MISSED_WINDOW_MS = 24 * 60 * 60_000;
 export const QUEUE_WATCHDOG_MS = 60_000;
 /** Shared empty holds for the common "nothing is held" pump — avoids allocating per sweep. */
 const NO_HOLDS: AccountHolds = { deadline: new Set(), inFlight: new Set() };
+
+/**
+ * The check-only workflow a landing check run executes (spec 2026-09-29-landing-check). A name of
+ * its own, deliberately absent from the workflow catalog: the persisted `workflowDef` is the only
+ * source a restart may revive it from, and a fallback to a same-named catalog entry would silently
+ * run a different gate.
+ */
+const LANDING_CHECK_WORKFLOW = 'landing-check';
+/** The install step's id: always first, always the same id, so retries and the UI agree. */
+const INSTALL_STEP_ID = 'install';
+/** The event sink one step receives — the shape every `emit` in this module already has. */
+type RunEventEmit = (event: { type: string; stepId?: string; [k: string]: unknown }) => void;
+
+/**
+ * The user the check ran as — `USER` first (what a shell exports and what a person expects to
+ * read), then `LOGNAME`, then the OS account. Never a credential, never a secret.
+ */
+function landingCheckUser(): string {
+  return process.env.USER?.trim() || process.env.LOGNAME?.trim() || userInfo().username;
+}
+
+/**
+ * The step-level `error` for an install step that did not pass. The install is the one step whose
+ * failure is not "the gate failed" but "the gate could not start", and the note says which.
+ */
+function installFailureNote(command: string, status: CheckOutcomeStatus): string {
+  if (status === 'timed-out') return `install "${command}" timed out — the gate commands were not run`;
+  if (status === 'skipped') return `install "${command}" skipped (CEZ_DRY_RUN=1) — nothing was run`;
+  if (status === 'cancelled') return `install "${command}" was cancelled — the gate commands were not run`;
+  if (status === 'could-not-run') return `install "${command}" could not run — the gate commands were not run`;
+  return `install "${command}" failed — the gate commands cannot run against an uninstalled tree`;
+}
 
 /**
  * May this run start, given what its account is holding?
@@ -1018,6 +1072,10 @@ export class RunManager {
   /** Runs currently being paused by the memory guard — dedupes the ~2 s samples so one breach
    *  triggers one pause, not a burst. Cleared in dropActive when the run leaves the registry. */
   private readonly memoryPausing = new Set<string>();
+  /** Landing checks being frozen right now (request in flight), so two concurrent requests for
+   *  one project cannot both pass the in-flight gate before either has created its run. The
+   *  durable half of the same gate is `landingCheckInFlight`'s scan of the records. */
+  private landingPreparing = 0;
 
   /** Unsubscribe handle for the constructor's `onUsage` subscription — released
    *  by dispose() so a torn-down manager stops receiving sampler ticks. */
@@ -2215,6 +2273,370 @@ export class RunManager {
       message: `report recorded — status ${report.status}${report.verdict ? `, verdict ${report.verdict}` : ''}`,
     });
     return true;
+  }
+
+  // ---- landing check (spec `.ai/specs/2026-09-29-landing-check.md`) ---------------------------
+
+  /**
+   * Freeze a subject for run `:id` and create the check run that will materialize and check it —
+   * the engine half of `POST /runs/:id/land-check` and `cez task land-check`.
+   *
+   * Asynchronous by construction: this freezes and PERSISTS the subject (base = the invoking run's
+   * branch tip at this instant, sources resolved by name and recorded by sha), then returns the
+   * check run's id. The merging and the command execution happen later, in the check run's own
+   * execution, so a check takes one ordinary `maxParallel` slot and queues like any task.
+   *
+   * The invoking run is typically still RUNNING — that is the normal case, not an error: the
+   * subject is its committed branch tip, frozen here. The one `409` is a landing check already in
+   * flight for this project.
+   */
+  async startLandingCheck(
+    parentId: string,
+    input: LandingCheckInput,
+  ): Promise<{ runId: string; ofRunId: string } | { refused: string; notFound: boolean }> {
+    const parent = this.store.getRun(parentId);
+    if (!parent) return { refused: `no such run: ${parentId}`, notFound: true };
+    const inFlight = this.landingCheckInFlight();
+    if (inFlight) {
+      return {
+        refused: `a landing check is already in flight for this project (${inFlight}) — wait for its verdict before starting another`,
+        notFound: false,
+      };
+    }
+    this.landingPreparing += 1;
+    try {
+      const git = gitIn(this.repoRoot);
+      // The subject's base: the invoking run's OWN branch tip, never `main` + children — the
+      // parent's own commits are part of what it is about to land. A run without a branch
+      // (in-place, or a detached HEAD) freezes whatever HEAD is at this instant instead.
+      const baseRef = parent.branch ?? 'HEAD';
+      const resolved = await git(['rev-parse', '--verify', '--quiet', `${baseRef}^{commit}`]);
+      if (!resolved.ok) {
+        return { refused: `the invoking run's "${baseRef}" does not resolve to a commit — nothing to freeze`, notFound: false };
+      }
+      const baseSha = resolved.stdout.trim();
+      const derivation = await deriveLandingCandidates({
+        dataDir: this.dataDir,
+        rootRunId: parent.dispatch?.rootRunId ?? parentId,
+        parentId,
+        parentSha: baseSha,
+        ...(input.sources?.length ? { explicit: input.sources } : {}),
+        runs: this.store.listRuns(),
+        git,
+      });
+      if (derivation.status !== 'ok') {
+        return { refused: `could not freeze the subject — ${derivation.detail}`, notFound: false };
+      }
+      const candidates = derivation.candidates;
+      const workflow: WorkflowDef = { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] };
+      const record = this.startRun(workflow, {
+        task:
+          `Landing check of run ${parentId}: freeze the invoking branch tip, merge the tree's eligible ` +
+          `children by sha in a fresh scratch worktree, and run the repository's own gate on the ` +
+          `combination. The verdict is recorded evidence, not a gate.`,
+        autonomous: true,
+        generateFollowups: false,
+      });
+      // Written in the SAME synchronous tick in which `startRun` returned, and after every await
+      // this method needs: `pump()` cannot reach the run before these keys exist (it suspends on
+      // its first await). That ordering is the whole "the subject is frozen and persisted before
+      // any merge" rule — `execute` reads the frozen subject off the RECORD.
+      this.store.updateRun(record.id, {
+        title: `Landing check — ${parent.title}`,
+        // The check worktree is created AT this commit (`execute` forks from `baseBranch`).
+        baseBranch: baseSha,
+        landingCheck: {
+          ofRunId: parentId,
+          subject: {
+            baseRef,
+            baseSha,
+            sources: candidates.sources,
+            order: candidates.order,
+            ...(candidates.excluded.length ? { excluded: candidates.excluded } : {}),
+          },
+          ...(input.commands?.length ? { request: { commands: [...input.commands] } } : {}),
+        },
+      });
+      this.store.appendEvent(record.id, {
+        type: 'note',
+        message: `subject frozen — base ${baseRef} @ ${baseSha.slice(0, 8)}${candidates.sources.length === 0 ? ', no eligible sources (the base alone)' : `, ${candidates.sources.length} source(s)`}`,
+      });
+      for (const note of candidates.notes) this.store.appendEvent(record.id, { type: 'note', message: note });
+      return { runId: record.id, ofRunId: parentId };
+    } finally {
+      this.landingPreparing -= 1;
+    }
+  }
+
+  /**
+   * The in-flight landing check for this project, if any — one ordinary slot's worth of
+   * serialization. Two landing checks would materialize two combinations in two worktrees and race
+   * each other for the same project's resources for no benefit: the second is refused, not queued.
+   */
+  private landingCheckInFlight(): string | undefined {
+    if (this.landingPreparing > 0) return 'one is being prepared';
+    const live = this.store
+      .listRuns()
+      .find((run) => run.landingCheck !== undefined && ['queued', 'running', 'waiting'].includes(run.status));
+    return live ? `run ${live.id.slice(0, 8)}` : undefined;
+  }
+
+  /**
+   * Materialize the frozen subject in the check run's own worktree and resolve the gate — the
+   * first thing a landing check run does once it holds a slot, before any command runs.
+   *
+   * Returns the resolved check-only workflow (install step + one step per command) and an error
+   * string for every outcome that is not a runnable gate. The verdict is recorded on the record
+   * either way; the run's terminal status is left to `execute`'s ordinary settlement, so a
+   * non-green verdict settles `failed` and only a green one can settle `done`.
+   */
+  private async prepareLandingCheck(
+    runId: string,
+    state: ActiveRun,
+    emit: RunEventEmit,
+  ): Promise<{ workflow?: WorkflowDef; error?: string }> {
+    const record = this.store.getRun(runId);
+    const check = record?.landingCheck;
+    const worktree = record?.worktreePath;
+    if (!check || !worktree) {
+      this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason: 'no-worktree' });
+      return { error: 'landing check could not run — the check run has no worktree to materialize the subject in' };
+    }
+    state.landingCheckRun = { results: [] };
+    const subject = check.subject;
+    const sources = subject.sources;
+    emit({
+      type: 'note',
+      message: `materializing the subject — ${sources.length === 0 ? 'no sources (the base alone)' : `${sources.length} source(s)`} onto base ${subject.baseSha.slice(0, 8)}`,
+    });
+
+    const materialized = await materializeLandingSubject({
+      worktreePath: worktree,
+      baseSha: subject.baseSha,
+      sources,
+      git: gitIn(worktree),
+    });
+    for (const sha of materialized.merged) emit({ type: 'note', message: `merged ${sha.slice(0, 8)} cleanly` });
+    if (materialized.status === 'conflict') {
+      emit({
+        type: 'note',
+        message: `conflict merging ${materialized.failedSha.slice(0, 8)} — ${materialized.files.length} conflicting file(s): ${materialized.files.join(', ')}`,
+      });
+      this.recordLandingVerdict(runId, {
+        verdict: 'conflict',
+        reason: 'merge-conflict',
+        conflict: { sha: materialized.failedSha, files: materialized.files },
+        merged: materialized.merged,
+      });
+      return {
+        error: `landing check conflict — merging ${materialized.failedSha.slice(0, 8)} left ${materialized.files.length} conflicting file(s); no command was run`,
+      };
+    }
+    if (materialized.status === 'could-not-run') {
+      this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason: materialized.reason, merged: materialized.merged });
+      return { error: `landing check could not run — ${materialized.reason}: ${materialized.detail}` };
+    }
+    const treeSha = materialized.treeSha;
+    this.store.updateRun(runId, {
+      landingCheck: { ...check, subject: { ...subject, treeSha } },
+    });
+    emit({
+      type: 'note',
+      message: `subject materialized — tree ${treeSha.slice(0, 12)}${sources.length === 0 ? ' (the base alone)' : ''}`,
+    });
+
+    // The plan comes from the FROZEN BASE, never from the tree under test; a candidate that moved
+    // it (or a base that declares nothing) is a non-green verdict, never a silent run of a
+    // different gate.
+    const resolution = resolveCheckCommands({
+      baseSha: subject.baseSha,
+      ...(check.request?.commands?.length ? { explicit: check.request.commands } : {}),
+      repoRoot: worktree,
+    });
+    for (const note of resolution.notes) emit({ type: 'note', message: note });
+    const resolvedBodies = Object.fromEntries(
+      resolution.commands
+        .filter((entry) => entry.script !== undefined)
+        .map((entry) => [entry.script!.name, entry.script!.body]),
+    );
+    const plan = {
+      source: resolution.source,
+      digest: resolution.digest,
+      ...(resolution.changedVsBase ? { changedVsBase: true } : {}),
+      ...(Object.keys(resolvedBodies).length ? { resolvedBodies } : {}),
+    };
+    const materializedCheck = { ...check, subject: { ...subject, treeSha }, commands: plan };
+    this.store.updateRun(runId, { landingCheck: materializedCheck });
+    if (resolution.status !== 'resolved') {
+      if (resolution.diff) {
+        emit({ type: 'note', message: `the candidate moved the pinned plan — nothing was run:\n${resolution.diff}` });
+      }
+      const verdict: LandingVerdict = resolution.status === 'nothing-to-check' ? 'nothing-to-check' : 'could-not-run';
+      const reason = resolution.reason ?? 'no-commands';
+      this.recordLandingVerdict(runId, { verdict, reason });
+      return { error: `landing check ${verdict} — ${reason}` };
+    }
+
+    const workflow: WorkflowDef = { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] };
+    if (resolution.install.kind !== 'none' && resolution.install.argv.length > 0) {
+      const installCommand = resolution.install.argv.join(' ');
+      this.store.addStep(runId, { id: INSTALL_STEP_ID, name: `install (${installCommand})`, kind: 'check' });
+      workflow.steps.push({ id: INSTALL_STEP_ID, name: `install (${installCommand})`, command: installCommand });
+      const install = await this.runLandingInstall(runId, state, installCommand, emit);
+      if (!install.ok) {
+        const reason = install.status === 'skipped' ? 'dry-run' : install.status === 'timed-out' ? 'timeout' : 'install-failed';
+        this.store.updateRun(runId, { workflowDef: { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] } });
+        this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason });
+        return { error: `landing check could not run — the install step (${installCommand}) failed (${reason}); the gate commands were not run` };
+      }
+    }
+    resolution.commands.forEach((entry, index) => {
+      const id = `check-${index + 1}`;
+      this.store.addStep(runId, { id, name: entry.command, kind: 'check' });
+      workflow.steps.push({ id, name: entry.command, command: entry.command });
+    });
+    this.store.updateRun(runId, { workflowDef: workflow });
+    emit({
+      type: 'note',
+      message: `gate resolved — ${resolution.commands.length} command(s) from ${resolution.source}; running them on the materialized subject`,
+    });
+    return { workflow };
+  }
+
+  /**
+   * The install step, executed FIRST under the same timeout, gate-deadline and process-group kill
+   * rules as every gate command (`check-runner.ts`), and recorded with its own argv and exit code.
+   * A failed install means the gate commands cannot run at all — `could-not-run`, never green.
+   */
+  private async runLandingInstall(
+    runId: string,
+    state: ActiveRun,
+    command: string,
+    emit: RunEventEmit,
+  ): Promise<CheckOutcome> {
+    const startedAt = new Date().toISOString();
+    this.store.updateRun(runId, { currentStepId: INSTALL_STEP_ID });
+    this.store.updateStep(runId, INSTALL_STEP_ID, { status: 'running', iterations: 1, startedAt });
+    emit({ type: 'step-start', stepId: INSTALL_STEP_ID, name: command, kind: 'check', iteration: 1 });
+    emit({ type: 'note', stepId: INSTALL_STEP_ID, message: `$ ${command}` });
+    const limits = await checkLimits(this.repoRoot);
+    if (state.checkGateDeadline === undefined && limits.gateTimeoutMs > 0) {
+      state.checkGateDeadline = Date.now() + limits.gateTimeoutMs;
+    }
+    const controller = new AbortController();
+    const previousInterrupt = state.interrupt;
+    state.interrupt = () => controller.abort();
+    let outcome: CheckOutcome;
+    try {
+      outcome = await runCheckCommand({
+        cwd: state.cwd,
+        command,
+        env: buildCheckEnv(),
+        timeoutMs: limits.timeoutMs,
+        signal: controller.signal,
+        ...(state.checkGateDeadline !== undefined ? { gateDeadlineAt: state.checkGateDeadline } : {}),
+      });
+    } finally {
+      // Restore rather than clobber, exactly as `runCheckStep` does — the previous handle belongs
+      // to whoever set it, and a stale no-op would silently disarm a live session's cancellation.
+      state.interrupt = previousInterrupt;
+    }
+    const finishedAt = new Date().toISOString();
+    emit({
+      type: 'check-output',
+      stepId: INSTALL_STEP_ID,
+      command,
+      text: outcome.output,
+      exitCode: outcome.exitCode,
+      status: outcome.status,
+    });
+    this.store.updateStep(runId, INSTALL_STEP_ID, {
+      status: outcome.ok ? 'done' : 'failed',
+      error: outcome.ok ? undefined : installFailureNote(command, outcome.status),
+      finishedAt,
+    });
+    emit({ type: 'step-end', stepId: INSTALL_STEP_ID, status: outcome.ok ? 'done' : 'failed' });
+    const record = this.store.getRun(runId);
+    if (record?.landingCheck) {
+      this.store.updateRun(runId, {
+        landingCheck: {
+          ...record.landingCheck,
+          install: { argv: command.split(' '), exitCode: outcome.exitCode, outcome: outcome.ok ? 'passed' : 'failed' },
+        },
+      });
+    }
+    return outcome;
+  }
+
+  /** One gate command's outcome, recorded as the check run executes it. */
+  private recordLandingResult(runId: string, command: string, outcome: CheckOutcome, startedAt: string): void {
+    const state = this.active.get(runId);
+    const check = this.store.getRun(runId)?.landingCheck;
+    if (!state?.landingCheckRun || !check) return;
+    const mapped = landingResultOf(outcome.status, outcome.exitCode, startedAt);
+    const entry: LandingResultEntry = {
+      command,
+      exitCode: outcome.exitCode,
+      outcome: mapped.outcome,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+    };
+    state.landingCheckRun.results.push(entry);
+    if (mapped.reason && state.landingCheckRun.reason === undefined) state.landingCheckRun.reason = mapped.reason;
+    this.store.updateRun(runId, { landingCheck: { ...check, results: [...state.landingCheckRun.results] } });
+  }
+
+  /**
+   * The verdict, once the gate has run (or once something stopped it). Only an unbroken run of
+   * `passed` commands is green; a dry run, a timeout, a cancellation and a platform that cannot
+   * execute all end `could-not-run` — "did not run" must never read as "passed".
+   */
+  private finalizeLandingCheck(runId: string): void {
+    const record = this.store.getRun(runId);
+    const check = record?.landingCheck;
+    if (!check || check.verdict !== undefined) return;
+    const gateSteps = record?.steps.filter((step) => step.kind === 'check' && step.id !== INSTALL_STEP_ID) ?? [];
+    const recorded = check.results ?? [];
+    const decided = verdictFromResults(recorded);
+    if (recorded.length < gateSteps.length) {
+      // A command was cut short (a cancel, a hard kill) before its outcome was recorded: the
+      // unrecorded one is not evidence of anything, least of all success.
+      this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason: 'cancelled' });
+      return;
+    }
+    // The seam's own reason (`timeout`, `dry-run`, `unsupported-platform`) outranks the generic
+    // one the four-outcome mapping can carry — "the command did not run" is worth naming exactly.
+    const reason = decided.verdict === 'passed' ? undefined : (this.active.get(runId)?.landingCheckRun?.reason ?? decided.reason);
+    this.recordLandingVerdict(runId, { verdict: decided.verdict, ...(reason ? { reason } : {}) });
+  }
+
+  /** Write the verdict onto the check run's record, with the environment it ran under. */
+  private recordLandingVerdict(
+    runId: string,
+    verdict: { verdict: LandingVerdict; reason?: string; conflict?: { sha: string; files: string[] }; merged?: string[] },
+  ): void {
+    const record = this.store.getRun(runId);
+    const check = record?.landingCheck;
+    if (!check) return;
+    this.store.updateRun(runId, {
+      landingCheck: {
+        ...check,
+        verdict: verdict.verdict,
+        ...(verdict.reason ? { reason: verdict.reason } : {}),
+        envNames: Object.keys(buildCheckEnv()).sort(),
+        user: landingCheckUser(),
+      },
+    });
+    if (verdict.conflict) {
+      this.store.appendEvent(runId, {
+        type: 'note',
+        message: `conflicting files (git diff --diff-filter=U): ${verdict.conflict.files.join(', ')}`,
+      });
+    }
+    this.store.appendEvent(runId, {
+      type: 'lifecycle',
+      message: `landing check verdict — ${verdict.verdict}${verdict.reason ? ` (${verdict.reason})` : ''}`,
+    });
   }
 
   /**
@@ -4159,6 +4581,22 @@ export class RunManager {
       return;
     }
 
+    // Landing check (spec `.ai/specs/2026-09-29-landing-check.md`): the subject was frozen on
+    // this run's record at request time and the worktree it already created stands AT `baseSha`.
+    // This is where it is materialized (sequential `merge --no-ff` by sha), where the gate is
+    // resolved from the frozen base, and where the install step runs — all before the workflow's
+    // first command. A non-green outcome sets `runError`, so the ordinary settlement below
+    // records it `failed`; a green gate settles `done` like any other run.
+    if (this.store.getRun(runId)?.landingCheck?.subject.treeSha === undefined && this.store.getRun(runId)?.landingCheck) {
+      const prepared = await this.prepareLandingCheck(runId, state, emit);
+      if (state.cancelled) {
+        this.dropActive(runId, state);
+        return;
+      }
+      if (prepared.workflow) workflow = prepared.workflow;
+      if (prepared.error) runError = prepared.error;
+    }
+
     let i = 0;
     while (i < workflow.steps.length) {
       if (state.cancelled) break;
@@ -4220,7 +4658,14 @@ export class RunManager {
         continue;
       }
 
-      const { ok, output, status } = await this.runCheckStep(state, step, emit);
+      // Stamped before the spawn so a landing check's own record carries when each command
+      // STARTED, not only when it ended (`check-output` carries no timings of its own).
+      const stepStartedAt = new Date().toISOString();
+      const outcome = await this.runCheckStep(state, step, emit);
+      if (state.landingCheckRun && typeof step.command === 'string') {
+        this.recordLandingResult(runId, step.command, outcome, stepStartedAt);
+      }
+      const { ok, output, status } = outcome;
       if (state.cancelled) break;
       if (status === 'skipped') {
         // `CEZ_DRY_RUN=1` spawns nothing for a check, by contract. The step is
@@ -4293,6 +4738,10 @@ export class RunManager {
     // below, ahead of the park, so they still land as `cancelled`/`failed`.
     const askPark = state.askPark;
     state.askPark = undefined;
+
+    // The landing check's verdict, if this run is one and nothing settled it yet: an unbroken run
+    // of `passed` commands is the only green outcome, and everything else records why.
+    if (state.landingCheckRun) this.finalizeLandingCheck(runId);
 
     // Final autosave: the branch always ends holding the finished state.
     this.clearAutosaveTimer(state);
@@ -5526,7 +5975,7 @@ export class RunManager {
     state: ActiveRun,
     step: WorkflowStepDef,
     emit: (event: { type: string; stepId?: string; [k: string]: unknown }) => void,
-  ): Promise<{ ok: boolean; output: string; status: CheckOutcomeStatus }> {
+  ): Promise<CheckOutcome> {
     const command = step.command as string;
     emit({ type: 'note', stepId: step.id, message: `$ ${command}` });
     const limits = await checkLimits(this.repoRoot);
@@ -5564,7 +6013,7 @@ export class RunManager {
       // distinguishable outcome on the wire. Existing readers key on `exitCode`.
       status: outcome.status,
     });
-    return { ok: outcome.ok, output: outcome.output, status: outcome.status };
+    return outcome;
   }
 
   private finishStep(
