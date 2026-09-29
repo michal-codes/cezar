@@ -319,10 +319,12 @@ freezing its tip is the point) asks for a check of run `:id`. The subject's base
 **that run's branch tip frozen at request time**, so the parent's own commits are
 part of it; the sources are the tree's eligible children — `done` children with a
 branch, excluding `review`/failed/non-terminal children, empty tips (tip == fork
-point), children already landed, and duplicates — in dispatch-ledger order, or an
-explicit `sources` list when you name one. Sources are applied **by sha**, so a
-branch that moves while the check runs cannot change what was checked. The
-identity is the **merged tree sha**, recorded on the check run.
+point), children already landed, children whose branch is gone or no longer
+resolves (`missing-ref`), and duplicates — in dispatch-ledger order (when a tree
+has no ledger, the store's `createdAt` order stands in and the run notes the
+fallback), or an explicit `sources` list when you name one. Sources are applied
+**by sha**, so a branch that moves while the check runs cannot change what was
+checked. The identity is the **merged tree sha**, recorded on the check run.
 
 **The verdict.** `landingCheck.verdict` is one of `passed`, `failed`, `conflict`,
 `nothing-to-check` or `could-not-run`, and **a check that could not run is not
@@ -333,10 +335,9 @@ and runs **no** command. `nothing-to-check` covers the cases where there is no
 gate to run: no command source declares anything, or the candidate moved the
 command list or a script body pinned from the frozen base. `could-not-run`
 covers everything that stopped the check before it could conclude — a
-`CEZ_DRY_RUN=1` dry run, a timeout, a failed install, a source that no longer
-resolves, a platform without a POSIX shell, a dirty worktree. The check run is
-an ordinary run: it settles `done` only on `passed` and `failed` otherwise
-(unless you cancel it).
+`CEZ_DRY_RUN=1` dry run, a timeout, a failed install, a platform without a
+POSIX shell, a dirty worktree. The check run is an ordinary run: it settles
+`done` only on `passed` and `failed` otherwise (unless you cancel it).
 
 **Frozen-base commands and the install step.** The command list comes from the
 frozen base — an explicit list, then `.ai/agentic.config.json`, then the root
@@ -362,21 +363,42 @@ cez task land-check [<run id>] [--sources a,b] [--commands "…"] [--wait]
 and exits non-zero on anything but `passed`. From the API:
 `POST /api/v1/p/<projectId>/runs/:id/land-check` (or
 `/api/v1/runs/:id/land-check` for the boot project), with an optional body
-`{sources?, commands?}`. The route answers `201 {runId, ofRunId}` **before any
-command has run** — the check is its own run and queues for a `maxParallel` slot
-like any task — `404` for an unknown run, `409` while a landing check for the
-project is already in flight, and `400` on a shape violation.
+`{sources?, commands?, acknowledge?}`. The route answers `201 {runId, ofRunId}`
+**before any command has run** — the check is its own run and queues for a
+`maxParallel` slot like any task — `404` for an unknown run, `400` on a shape
+violation, and `409` for each of the three refusals: a landing check for the
+project is already in flight, the invoking run's branch no longer resolves to a
+commit, or a source you named explicitly does not resolve.
 
 **What lands in the record.** `landingCheck` on the check run's record carries
 `ofRunId`, the `subject` (`baseRef`, `baseSha`, `sources[{ref, sha}]`, `order`,
 `treeSha`, and the `excluded` candidates with their reasons), the resolved
 `commands` plan (`source`, `digest`, `changedVsBase`, `resolvedBodies`), the
-`install` step when one ran, the `verdict` and `reason`, the per-command
-`results[]`, and the check's own `envNames` and `user`. `GET /runs` and
-`GET /runs/:id` add a derived, never-stored `landingCheckStale` flag: it
+`install` step when one ran, the `preview` a foreign subject gets instead of
+execution and its `ack` once acknowledged, the `verdict` and `reason`, the
+per-command `results[]`, and the check's own `envNames` and `user`. `GET /runs`
+and `GET /runs/:id` add a derived, never-stored `landingCheckStale` flag: it
 re-checks each recorded sha against its ref at **read time** and reads `true`
 when the base or a source moved after the check ran; the key is absent on a run
 with nothing to be stale about, and the stored verdict text is never rewritten.
+
+**Foreign subjects are previewed, not executed.** A subject is *foreign* when
+any commit a source introduces is authored or committed by an identity outside
+the local set — the repository's configured `user.email` plus the base commit's
+own identities — and an unreadable history counts as foreign, never as local. A
+foreign subject runs nothing, the install step included: the check freezes it,
+records a `preview` (`subjectDigest`, authors, resolved commands, install argv,
+head sha, diffstat) and the verdict `could-not-run` with reason
+`foreign-subject-needs-ack`. The acknowledgement is explicit and API/JSON-only
+(`cez task land-check` has no ack flag): a re-request (`POST
+…/runs/:id/land-check` with `{ acknowledge: { digest } }`) proceeds only when
+the recomputed `subjectDigest` still matches the frozen subject, so a moved
+branch, a moved resolved plan or a different install previews again; on a local
+subject the key is inert. The check card surfaces the preview, and its
+acknowledge control is what sends that request. The brake is there because the
+check executes repository-authored shell as you and the install step would run
+the candidate's dependency lifecycle scripts — a foreign subject stops before
+either of those happens.
 
 The gate runs the repository's own code, as you, in a scratch worktree — it is
 **not a sandbox** and can read whatever that account can; the reduced environment
