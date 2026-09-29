@@ -1,21 +1,24 @@
 import { ChevronRightIcon, GitMergeIcon, TerminalIcon } from 'lucide-react'
 import { Fragment, useState } from 'react'
 
-import { useRuns } from '@/api/queries'
+import { useRuns, useStartLandingCheck } from '@/api/queries'
 import type { ApiRun, LandingCheck, RunEvent } from '@open-mercato/cezar-api-client'
 import { LandingCheckChip } from '@/components/landing-check-chip'
 import { StatusDot } from '@/components/status-dot'
+import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
+import { toast } from '@/components/ui/toaster'
 import {
   humanizeLandingReason,
   landingCheckChip,
+  landingCheckLive,
   landingCheckNotRun,
   landingCheckRows,
   landingSubjectFacts,
   shortSha,
   type LandingCheckRow,
 } from '@/lib/landing-check'
-import { Link } from '@/lib/project-router'
+import { Link, useNavigate } from '@/lib/project-router'
 import { runTitle } from '@/lib/task-groups'
 import { cn } from '@/lib/utils'
 
@@ -37,6 +40,11 @@ import { ToolOutput } from './thread-items'
  *    "freezing", then "merging", never as an error or a fake set of rows.
  *  - **Neutral for `nothing-to-check` / `could-not-run`.** Nothing green is ever painted for a
  *    check that did not pass, and nothing red for one that never had a chance to run.
+ *  - **The acknowledgement is a deliberate click, never a follow-on.** A foreign subject gets a
+ *    preview and one control carrying the digest that preview was issued against; the server
+ *    re-derives the digest before anything executes, so a moved subject previews again instead of
+ *    running. Nothing here auto-fires, and nothing claims to know the answer before the new run
+ *    records it.
  */
 export function LandingCheckCard({ run, events = [] }: { run: ApiRun; events?: readonly RunEvent[] }) {
   const check = run.landingCheck
@@ -45,6 +53,7 @@ export function LandingCheckCard({ run, events = [] }: { run: ApiRun; events?: r
   const facts = landingSubjectFacts(check)
   const rows = landingCheckRows(check, events)
   const notRun = landingCheckNotRun(run)
+  const live = landingCheckLive(run.status)
 
   return (
     <section data-slot="landing-check-card" data-state={chip?.state} aria-label="Landing check">
@@ -80,18 +89,7 @@ export function LandingCheckCard({ run, events = [] }: { run: ApiRun; events?: r
           ) : null}
 
           {check.preview !== undefined ? (
-            <div data-slot="landing-check-preview" className="rounded-md border border-dashed border-border px-2.5 py-2 text-[11.5px] text-muted-foreground">
-              <p className="font-semibold text-foreground">Preview — nothing was executed</p>
-              <p className="mt-0.5">
-                {check.preview.authors.length > 0 ? `authors ${check.preview.authors.join(', ')} · ` : ''}
-                head <code className="font-mono">{shortSha(check.preview.headSha) ?? check.preview.headSha}</code>
-                {check.preview.diffStat !== undefined ? ` · ${check.preview.diffStat}` : ''}
-              </p>
-              {check.preview.commands.length > 0 ? (
-                <p className="mt-0.5 font-mono">{check.preview.commands.join(' · ')}</p>
-              ) : null}
-              <p className="mt-1">A foreign subject needs an acknowledgement before it can run — not available in the cockpit yet.</p>
-            </div>
+            <ForeignPreview ofRunId={check.ofRunId} preview={check.preview} />
           ) : null}
 
           {rows.length > 0 ? (
@@ -101,7 +99,7 @@ export function LandingCheckCard({ run, events = [] }: { run: ApiRun; events?: r
               ))}
             </div>
           ) : check.verdict === undefined ? (
-            <StageTrail check={check} live={['queued', 'running', 'waiting'].includes(run.status)} />
+            <StageTrail check={check} live={live} />
           ) : (
             <p data-slot="landing-check-empty" className="text-xs text-muted-foreground">
               {emptyVerdictNote(check)}
@@ -175,6 +173,81 @@ function SubjectLine({ facts }: { facts: ReturnType<typeof landingSubjectFacts> 
 }
 
 /**
+ * The preview a FOREIGN subject gets instead of execution (spec § Trust model): everything the
+ * record resolved — authors, install argv, gate commands, head sha, diffstat — plus the one
+ * deliberate exit, `Acknowledge and run`.
+ *
+ * Nothing here is automatic. The button carries the `subjectDigest` this preview was issued
+ * against and posts it to the INVOKING run (`ofRunId`) — a new check run re-freezes the subject,
+ * recomputes the digest and proceeds only if the two agree. An ack whose subject has moved is not
+ * an error: the new run records a fresh preview, and the honest render is whatever it says. That
+ * is also why nothing is optimistic — the answer is a run id, so the reader is sent to it.
+ */
+function ForeignPreview({
+  ofRunId,
+  preview,
+}: {
+  ofRunId: string
+  preview: NonNullable<LandingCheck['preview']>
+}) {
+  const navigate = useNavigate()
+  const start = useStartLandingCheck()
+  return (
+    <div
+      data-slot="landing-check-preview"
+      className="rounded-md border border-dashed border-border px-2.5 py-2 text-[11.5px] text-muted-foreground"
+    >
+      <p className="font-semibold text-foreground">Preview — nothing was executed</p>
+      <p className="mt-0.5">
+        {preview.authors.length > 0 ? `authors ${preview.authors.join(', ')} · ` : ''}
+        head <code className="font-mono">{shortSha(preview.headSha) ?? preview.headSha}</code>
+        {preview.diffStat !== undefined ? ` · ${preview.diffStat}` : ''}
+      </p>
+      {preview.installArgv !== undefined && preview.installArgv.length > 0 ? (
+        <p className="mt-0.5 font-mono">
+          <span className="text-soft-foreground">install: </span>
+          {preview.installArgv.join(' ')}
+        </p>
+      ) : null}
+      {preview.commands.length > 0 ? (
+        <p className="mt-0.5 font-mono">{preview.commands.join(' · ')}</p>
+      ) : null}
+      <p className="mt-1">
+        The subject is outside the local identity set, so nothing ran. Acknowledging runs the
+        repository’s gate on exactly this frozen subject, as you — it is not a sandbox. If the
+        subject has moved since this preview, the new check previews again instead of running.
+      </p>
+      <div className="mt-1.5 flex flex-wrap items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          data-slot="landing-check-acknowledge"
+          disabled={start.isPending}
+          onClick={() =>
+            start.mutate(
+              { id: ofRunId, acknowledge: preview.subjectDigest },
+              {
+                // The answer is the NEW check run's id: follow it, so the reader lands on the run
+                // that will carry the verdict — or the fresh preview the moved subject produced.
+                onSuccess: (started) => navigate(`/tasks/${started.runId}`),
+                // A refusal (another check is already in flight) is surfaced where the click
+                // happened, in the server's own words.
+                onError: (error: Error) => toast(error.message, { tone: 'danger' }),
+              },
+            )
+          }
+        >
+          {start.isPending ? 'Acknowledging…' : 'Acknowledge and run'}
+        </Button>
+        <span className="text-[11px] text-soft-foreground">
+          a deliberate click — the gate runs on the frozen subject above, as you
+        </span>
+      </div>
+    </div>
+  )
+}
+
+/**
  * The empty state while the verdict does not exist yet: what the record PROVES, stage by stage.
  * The frozen subject is always persisted by the time the check run exists (stage one); the tree
  * sha appears when the sources have been merged (stage two); rows appear as commands run.
@@ -191,13 +264,19 @@ function StageTrail({ check, live }: { check: LandingCheck; live: boolean }) {
     {
       id: 'merge',
       label: 'Merging the sources',
-      detail: merged ? 'merged — the subject is one tree' : 'applying the pinned sources one by one',
+      detail: merged
+        ? 'merged — the subject is one tree'
+        : live
+          ? 'applying the pinned sources one by one'
+          : 'the check ended before the sources were merged',
       done: merged,
     },
     {
       id: 'gate',
       label: 'Running the gate',
-      detail: 'the repository’s own commands run on the merged tree',
+      detail: live
+        ? 'the repository’s own commands run on the merged tree'
+        : 'the gate never ran on this subject',
       done: false,
     },
   ]
@@ -206,9 +285,11 @@ function StageTrail({ check, live }: { check: LandingCheck; live: boolean }) {
       {stages.map((stage) => (
         <li key={stage.id} data-stage={stage.id} data-state={stage.done ? 'done' : 'pending'} className="flex items-center gap-1.5">
           <StatusDot
-            tone={stage.done ? 'success' : 'pending'}
-            pulse={!stage.done && live}
-            aria-label={stage.done ? 'done' : 'pending'}
+            // A dead run's trail is a record of where it stopped, not progress: no dot on it may
+            // wear the success tone, and no stage may read as still in flight (PR #1169 review).
+            tone={live ? (stage.done ? 'success' : 'pending') : 'neutral'}
+            pulse={live && !stage.done}
+            aria-label={live ? (stage.done ? 'done' : 'pending') : stage.done ? 'done earlier' : 'not reached'}
             role="img"
           />
           <span className={cn(stage.done ? 'text-foreground' : 'text-muted-foreground')}>{stage.label}</span>

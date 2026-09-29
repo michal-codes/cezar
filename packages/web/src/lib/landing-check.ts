@@ -64,6 +64,20 @@ export interface LandingCheckChipInput {
 }
 
 /**
+ * Can this run still move its landing check forward? `queued`, `running` and `waiting` can; a
+ * terminal status cannot, and a status the record does not carry at all counts as live (the
+ * caller does not KNOW it is over, and claiming "could not run" on a guess would be worse).
+ *
+ * ONE definition, read by both surfaces that must not disagree: the chip (where a terminal run
+ * without a verdict reads `could-not-run` rather than pulsing `checking` forever) and the card's
+ * stage trail (where a dead run must not paint a stage as success or say "applying…"). Two
+ * copies of this predicate is exactly how they drift apart.
+ */
+export function landingCheckLive(status: RunRecord['status'] | undefined): boolean {
+  return status === undefined || ['queued', 'running', 'waiting'].includes(status)
+}
+
+/**
  * `landingCheck` → the chip's state, or `undefined` for a run that is not a landing check.
  *
  * The one subtle case: a TERMINAL run with no verdict. Every engine path normally records one,
@@ -74,8 +88,7 @@ export function landingCheckChip(input: LandingCheckChipInput): LandingCheckChip
   const check = input.landingCheck
   if (check === undefined) return undefined
   if (check.verdict === undefined) {
-    const live = input.status === undefined || ['queued', 'running', 'waiting'].includes(input.status)
-    if (live) {
+    if (landingCheckLive(input.status)) {
       return {
         state: 'checking',
         label: 'checking',
