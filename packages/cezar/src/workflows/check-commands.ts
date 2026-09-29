@@ -39,7 +39,8 @@
  * -> `-w @scope/pkg` -> the workspace's body), so the digest covers the TRANSITIVE
  * CLOSURE of npm-run references (bounded depth, cycle-safe, `pre*`/`post*` hooks
  * included), the local script files an argv names (best effort: an argv-position
- * token that exists in the tree), the Makefile when a make command makes it a
+ * token that exists in the tree — a local script file a BODY names is not pinned,
+ * and a note says so), the Makefile when a make command makes it a
  * body, and — PR 3.2 — the WORKSPACE MANIFESTS a `-w`/`--workspace`/`--workspaces`
  * delegation addresses: resolved through the root `workspaces` globs, read from
  * the same tree, pinned recursively with the manifest path recorded. PR 3.3 adds
@@ -977,6 +978,13 @@ function collectPinnedBodies(input: ClosureInput): ClosureResult {
         continue;
       }
       followWorkspace(origin, delegation, depth + 1);
+    }
+    // A local script file a BODY names is out of the closure: only the command list's
+    // argv is pinned (the closure never executes a body to discover more). Name the
+    // residual so the verdict cannot read as covering it.
+    for (const path of scriptFilePaths([text])) {
+      if (seenFiles.has(path) || files.has(path)) continue;
+      note(`${origin}: names the local script file ${path} — its body is not pinned (only a file named in the command list's argv is)`);
     }
   };
 

@@ -1027,6 +1027,20 @@ describe('check-commands — the command policy resolver', () => {
       expect(notes(resolution)).toContain('$TARGET');
       expect(notes(resolution)).toContain('not pinned');
     });
+
+    it('names a local script file a BODY names — the file content is not pinned, and the note says so', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': pkg({ test: './scripts/run.sh' }),
+        'scripts/run.sh': 'echo REAL\n',
+      });
+
+      const resolution = resolve(dir, baseSha);
+
+      // Still resolved (only argv files are pinned), but the residual is named.
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('names the local script file scripts/run.sh — its body is not pinned');
+    });
   });
 
   describe('the install lifecycle — npm 11’s full set (F2)', () => {
