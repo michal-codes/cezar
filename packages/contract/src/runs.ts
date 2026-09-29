@@ -175,6 +175,7 @@ export const landingCheckSchema = z.object({
             'not-terminal',
             'review',
             'failed',
+            'cancelled',
             'missing-ref',
             'empty',
             'already-landed',

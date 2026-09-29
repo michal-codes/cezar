@@ -150,7 +150,7 @@ posix('the candidate set', () => {
     expect(candidates.notes.join('\n')).toContain('empty');
   });
 
-  it('tells an already-merged child from an empty one — via the child\'s FORK POINT — and excludes review/failed/non-terminal children', async () => {
+  it('tells an already-merged child from an empty one — via the child\'s FORK POINT — and excludes review/failed/cancelled/non-terminal children', async () => {
     // The parent commits its own work, then dispatches: the fork point both children build on is
     // the parent tip at that instant.
     await git(root, 'checkout', '-q', '-b', 'cez/parent');
@@ -163,6 +163,7 @@ posix('the candidate set', () => {
     await git(root, 'checkout', '-q', '-b', 'cez/reviewed', forkSha);
     await git(root, 'checkout', '-q', '-b', 'cez/failing', forkSha);
     await git(root, 'checkout', '-q', '-b', 'cez/running', forkSha);
+    await git(root, 'checkout', '-q', '-b', 'cez/cancelled', forkSha);
     await nextSecond();
     // The parent ACCEPTS the merged child (the `git merge --no-ff` its prompt asks for), moving
     // the parent tip past the child — which is exactly when ancestry alone calls a child landed.
@@ -176,8 +177,9 @@ posix('the candidate set', () => {
     const review = mkRun({ title: 'review', branch: 'cez/reviewed', kind: 'review', parentId: parent.id, baseBranch: 'cez/parent' });
     const failed = mkRun({ title: 'failed', branch: 'cez/failing', status: 'failed', parentId: parent.id, baseBranch: 'cez/parent' });
     const running = mkRun({ title: 'running', branch: 'cez/running', status: 'running', parentId: parent.id, baseBranch: 'cez/parent' });
+    const cancelled = mkRun({ title: 'cancelled', branch: 'cez/cancelled', status: 'cancelled', parentId: parent.id, baseBranch: 'cez/parent' });
     const gone = mkRun({ title: 'gone', branch: 'cez/never-existed', parentId: parent.id, baseBranch: 'cez/parent' });
-    for (const child of [merged, empty, review, failed, running, gone]) {
+    for (const child of [merged, empty, review, failed, cancelled, running, gone]) {
       appendLedger(dataDir, parent.id, { type: 'dispatch', runId: child.id, parentRunId: parent.id });
     }
 
@@ -190,6 +192,9 @@ posix('the candidate set', () => {
     expect(reason.get(empty.id)).toBe('empty');
     expect(reason.get(review.id)).toBe('review');
     expect(reason.get(failed.id)).toBe('failed');
+    // The spec's exclusion table lists `cancelled` apart from `failed` (spec:437) — a cancelled
+    // child that read as `failed` would answer "why is my child not in the subject" wrong.
+    expect(reason.get(cancelled.id)).toBe('cancelled');
     expect(reason.get(running.id)).toBe('not-terminal');
     expect(reason.get(gone.id)).toBe('missing-ref');
   }, 20_000);
@@ -332,6 +337,97 @@ posix('materialization', () => {
     expect(second.status).toBe('materialized');
     if (second.status !== 'materialized') return;
     expect(second.treeSha).toBe(first.treeSha);
+    expect(second.headSha).toBe(first.headSha);
+  }, 60_000);
+
+  /**
+   * The reviewer's F1 probe (PR 4.2, finding 1): a repository hook that rewrites commit messages
+   * changes the SYNTHETIC MERGE's message, so two materializations of the same subject become two
+   * different commits (probed: 28d4149b vs c071646f). The acknowledgement digest binds the
+   * materialized head, so such a repository could preview forever and never acknowledge its own
+   * check. The merge loop disables the repository's hooks; these two tests are the pin.
+   */
+  const MESSAGE_REWRITING_HOOK = '#!/bin/sh\necho "nonce $(date +%s%N)" >> "$1"\n';
+
+  it('ignores message-rewriting hooks installed in .git/hooks — the same subject still materializes to the same head', async () => {
+    const base = await git(root, 'rev-parse', 'HEAD');
+    await git(root, 'checkout', '-q', '-b', 'feat/hooked', base);
+    const sha = await commit('hooked.txt', 'hooked\n', 'hooked');
+    await git(root, 'checkout', '-q', 'main');
+    const hooks = join(root, '.git', 'hooks');
+    mkdirSync(hooks, { recursive: true });
+    // BOTH hooks: `--no-verify` covers `commit-msg` but not `prepare-commit-msg` (git 2.43's
+    // docs list only pre-merge and commit-msg), so anything short of disabling the hooks path
+    // leaves a way for the repository to rewrite the synthetic merge.
+    writeFileSync(join(hooks, 'commit-msg'), MESSAGE_REWRITING_HOOK, { mode: 0o755 });
+    writeFileSync(join(hooks, 'prepare-commit-msg'), MESSAGE_REWRITING_HOOK, { mode: 0o755 });
+
+    const firstWorktree = await scratchAt(base);
+    const first = await materializeLandingSubject({
+      worktreePath: firstWorktree,
+      baseSha: base,
+      sources: [{ ref: 'feat/hooked', sha }],
+      git: gitIn(firstWorktree),
+    });
+    expect(first.status).toBe('materialized');
+    if (first.status !== 'materialized') return;
+    await nextSecond();
+    const secondWorktree = await scratchAt(base);
+    const second = await materializeLandingSubject({
+      worktreePath: secondWorktree,
+      baseSha: base,
+      sources: [{ ref: 'feat/hooked', sha }],
+      git: gitIn(secondWorktree),
+    });
+    expect(second.status).toBe('materialized');
+    if (second.status !== 'materialized') return;
+    // The hook DID run pre-fix: two materializations, two heads — and two acknowledgement digests.
+    expect(second.headSha).toBe(first.headSha);
+    expect(second.treeSha).toBe(first.treeSha);
+    const digestOf = (materialized: { headSha: string; treeSha: string }): string =>
+      landingSubjectDigest({
+        baseRef: 'feat/hooked',
+        baseSha: base,
+        sources: [{ ref: 'feat/hooked', sha }],
+        treeSha: materialized.treeSha,
+        headSha: materialized.headSha,
+        commandsDigest: 'plan',
+      }).digest;
+    expect(digestOf(second)).toBe(digestOf(first));
+  }, 60_000);
+
+  it('overrides a repository-configured core.hooksPath the same way', async () => {
+    const base = await git(root, 'rev-parse', 'HEAD');
+    await git(root, 'checkout', '-q', '-b', 'feat/configured-hooks', base);
+    const sha = await commit('configured.txt', 'configured\n', 'configured');
+    await git(root, 'checkout', '-q', 'main');
+    // The other route into the same trap: the repository points core.hooksPath at its own hooks
+    // directory. A fix that only cleaned `.git/hooks` would still be rewritten here.
+    const hooks = join(root, '.githooks');
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, 'commit-msg'), MESSAGE_REWRITING_HOOK, { mode: 0o755 });
+    writeFileSync(join(hooks, 'prepare-commit-msg'), MESSAGE_REWRITING_HOOK, { mode: 0o755 });
+    await git(root, 'config', 'core.hooksPath', hooks);
+
+    const firstWorktree = await scratchAt(base);
+    const first = await materializeLandingSubject({
+      worktreePath: firstWorktree,
+      baseSha: base,
+      sources: [{ ref: 'feat/configured-hooks', sha }],
+      git: gitIn(firstWorktree),
+    });
+    expect(first.status).toBe('materialized');
+    if (first.status !== 'materialized') return;
+    await nextSecond();
+    const secondWorktree = await scratchAt(base);
+    const second = await materializeLandingSubject({
+      worktreePath: secondWorktree,
+      baseSha: base,
+      sources: [{ ref: 'feat/configured-hooks', sha }],
+      git: gitIn(secondWorktree),
+    });
+    expect(second.status).toBe('materialized');
+    if (second.status !== 'materialized') return;
     expect(second.headSha).toBe(first.headSha);
   }, 60_000);
 

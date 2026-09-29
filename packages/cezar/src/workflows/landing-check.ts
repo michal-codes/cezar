@@ -51,6 +51,7 @@ export type LandingExclusionReason =
   | 'not-terminal'
   | 'review'
   | 'failed'
+  | 'cancelled'
   | 'missing-ref'
   | 'empty'
   | 'already-landed'
@@ -276,7 +277,18 @@ export async function deriveLandingCandidates(options: DeriveLandingCandidatesOp
       continue;
     }
     if (record.status !== 'done') {
-      excluded.push({ runId, reason: record.status === 'review' || record.status === 'failed' || record.status === 'cancelled' ? (record.status === 'review' ? 'review' : 'failed') : 'not-terminal' });
+      // `cancelled` is its own reason: the spec's exclusion table lists it apart from `failed`
+      // (.ai/specs/2026-09-29-landing-check.md:437), and "why is my child not in the subject"
+      // must answer exactly — a cancelled child is not a failed one.
+      const reason: LandingExclusionReason =
+        record.status === 'review'
+          ? 'review'
+          : record.status === 'failed'
+            ? 'failed'
+            : record.status === 'cancelled'
+              ? 'cancelled'
+              : 'not-terminal';
+      excluded.push({ runId, reason });
       continue;
     }
     if (record.dispatch?.kind === 'review') {
@@ -383,8 +395,8 @@ async function landingMergeEnv(git: LandingGit, baseSha: string): Promise<Record
  * run's own worktree.
  *
  * The commits it creates are REPRODUCIBLE — identity, date and no-signing are pinned to the
- * frozen base (`landingMergeEnv`) — so the same subject yields the same head on a later run, which
- * is what the acknowledgement digest binds.
+ * frozen base (`landingMergeEnv`), and repository hooks are disabled for the merge — so the same
+ * subject yields the same head on a later run, which is what the acknowledgement digest binds.
  *
  * Three guards, each closing a measured way for the check to lie about what it checked:
  *  - a CLEAN PRECONDITION (a dirty, non-overlapping tracked file merges silently — the verdict
@@ -420,6 +432,17 @@ export async function materializeLandingSubject(options: MaterializeLandingSubje
   }
 
   const mergeEnv = await landingMergeEnv(git, options.baseSha);
+  // Repository hooks are the one input this loop cannot pin, and they break the property the
+  // digest binds: a `commit-msg`/`prepare-commit-msg` hook that rewrites the message gives two
+  // materializations of the SAME subject two different shas (probed: 28d4149b vs c071646f), so
+  // such a repository could preview forever and never acknowledge its own check. `--no-verify`
+  // is not enough: on git 2.43 it bypasses only the pre-merge and `commit-msg` hooks, and a
+  // `prepare-commit-msg` hook still rewrote the merge message into two different commits (probed
+  // on a scratch clone). `core.hooksPath` points at a directory inside the check's own scratch
+  // worktree that is never created — git finds no hook there, so no repository-authored hook
+  // (`commit-msg`, `prepare-commit-msg`, `post-merge`) can reach the synthetic commit, and a
+  // repository-configured `core.hooksPath` is overridden for this one command only.
+  const hooksPath = join(options.worktreePath, '.cez-no-hooks');
   for (const source of options.sources) {
     const merge = await git(
       [
@@ -427,6 +450,8 @@ export async function materializeLandingSubject(options: MaterializeLandingSubje
         // the same subject is the same commit only while these synthetic merges are unsigned.
         '-c',
         'commit.gpgsign=false',
+        '-c',
+        `core.hooksPath=${hooksPath}`,
         'merge',
         '--no-ff',
         '--no-edit',

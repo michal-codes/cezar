@@ -485,6 +485,14 @@ interface ActiveRun {
    * nothing to carry; the field is optional precisely so that stays true.
    */
   landingCheckRun?: { results: LandingResultEntry[]; reason?: string };
+  /**
+   * The "not a sandbox" disclaimer has already been said for this ATTEMPT (F2). The check says it
+   * before the first repository-authored step — before the install when one will run, before the
+   * gate loop otherwise — and this flag keeps the later site from repeating it. Like
+   * `landingCheckRun` it is only ever set in `execute` (a landing check is never continued, so the
+   * twin construction site has nothing to carry).
+   */
+  landingNoteEmitted?: boolean;
 }
 
 /** Safety cap on autonomous auto-continues per run — stops a stuck agent from nudging forever.
@@ -2559,6 +2567,12 @@ export class RunManager {
     const workflow: WorkflowDef = { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] };
     if (resolution.install.kind !== 'none' && resolution.install.argv.length > 0) {
       const installCommand = resolution.install.argv.join(' ');
+      // Before the FIRST repository-authored step, not merely before the gate loop: `npm ci`
+      // runs the repository's own lifecycle scripts (preinstall/install/postinstall/prepare), so
+      // the disclaimer belongs above IT — and an install failure must not ship without it.
+      // `landingNoteEmitted` keeps the pre-gate-loop site below from saying it twice.
+      emit({ type: 'note', message: LANDING_NOT_A_SANDBOX_NOTE });
+      state.landingNoteEmitted = true;
       // The install step exists on the run's RAIL (`store.addStep`) and in `landingCheck.install`,
       // but it is deliberately NOT pushed into the workflow the execute loop walks: it is being
       // run right here, under `runLandingInstall`. Pushing it too made the loop run it a second
@@ -2614,6 +2628,16 @@ export class RunManager {
     state: ActiveRun,
   ): Promise<string | undefined> {
     state.landingCheckRun = { results: [] };
+    // The recorder is re-initialised for THIS attempt, so the stored record it will write is
+    // re-initialised with it: `finalizeLandingCheck` derives the verdict from the RECORD, and an
+    // interrupted attempt's entries describe a pass this one is not making. Left in place, a
+    // crash between `appendLandingNotRun` and `recordLandingVerdict` would settle this resume
+    // `could-not-run / cancelled` over an `install.outcome=failed` — a cancellation that never
+    // happened, for a gate that never ran.
+    const interrupted = this.store.getRun(runId)?.landingCheck;
+    if (interrupted && (interrupted.results !== undefined || interrupted.reason !== undefined)) {
+      this.store.updateRun(runId, { landingCheck: { ...interrupted, results: undefined, reason: undefined } });
+    }
     const worktree = this.store.getRun(runId)?.worktreePath;
     const tree = worktree ? await gitIn(worktree)(['rev-parse', 'HEAD^{tree}']) : undefined;
     if (tree?.ok && tree.stdout.trim() === subjectTreeSha) return undefined;
@@ -4768,11 +4792,15 @@ export class RunManager {
       }
     }
     // The gate is about to execute repository-authored shell as the operator (spec §Verdict,
-    // §Trust model): say so once, on the check run's own transcript. A run whose verdict is
-    // already recorded ran nothing and does not claim otherwise.
+    // §Trust model): say so once per attempt, on the check run's own transcript. `prepareLandingCheck`
+    // already said it when an install step was going to run — the install is repository-authored
+    // shell too — so this site covers the paths that reach the gate loop without one (no manifest,
+    // or a resume after materialization). A run whose verdict is already recorded ran nothing and
+    // does not claim otherwise.
     const gateCheck = this.store.getRun(runId)?.landingCheck;
-    if (gateCheck && gateCheck.verdict === undefined) {
+    if (gateCheck && gateCheck.verdict === undefined && !state.landingNoteEmitted) {
       emit({ type: 'note', message: LANDING_NOT_A_SANDBOX_NOTE });
+      state.landingNoteEmitted = true;
     }
 
     let i = 0;
