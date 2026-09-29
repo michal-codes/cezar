@@ -626,6 +626,34 @@ function npmSegmentLabel(tokens: readonly string[], start: number): string {
   return shown.length > 8 ? `${shown.slice(0, 8).join(' ')} …` : shown.join(' ');
 }
 
+/** A parsed workspace-selection flag, and the token index to resume at. */
+type WorkspaceFlag =
+  | { kind: 'all'; enabled: boolean; next: number }
+  | { kind: 'select'; workspace: string; next: number };
+
+/**
+ * One npm boolean flag as npm reads it: the `=`-value is unquoted first because
+ * the SHELL strips those quotes before npm ever sees the token — `--ws='false'`
+ * IS `--ws=false` (measured: the root runs) — and a separate token is npm's
+ * value only when it is a literal `true`/`false` (measured: `--ws false` runs the
+ * root, while `--ws foo`, `--ws 0` and `--ws FALSE` keep the flag on and forward
+ * the token to the script as an argument). Only the exact value `false` turns the
+ * flag off; every other value (including `0`) leaves it on.
+ */
+function parseNpmBooleanFlag(
+  tokens: readonly string[],
+  index: number,
+  pattern: RegExp,
+): { enabled: boolean; next: number } | undefined {
+  const token = unquote(tokens[index] ?? '');
+  const match = pattern.exec(token);
+  if (!match) return undefined;
+  if (match[1] !== undefined) return { enabled: unquote(match[1]) !== 'false', next: index + 1 };
+  const value = tokens[index + 1] === undefined ? undefined : unquote(tokens[index + 1]!);
+  if (value === 'true' || value === 'false') return { enabled: value !== 'false', next: index + 2 };
+  return { enabled: true, next: index + 1 };
+}
+
 /**
  * One npm workspace flag, with the token index to resume at. `-w x`,
  * `--workspace x`, `--workspace=x` and `-w=x` name one workspace; `-ws`, `--ws`
@@ -633,36 +661,35 @@ function npmSegmentLabel(tokens: readonly string[], start: number): string {
  * abbreviation and runs the script in every workspace for it (measured; `--work`,
  * `--works` and `--worksp` are Unknown-config warnings that run the root). A
  * workspace flag whose value is missing is not a flag (it is left for the
- * ordinary flag-skipping), and npm's boolean coercion makes only the exact value
- * `false` turn the all-workspaces form off (`--ws=0` still runs every workspace,
- * measured) — a false value is consumed WITHOUT a delegation: the root script runs.
+ * ordinary flag-skipping); the boolean forms carry their own value rules (see
+ * `parseNpmBooleanFlag`), and a false value yields no delegation: the root runs.
  */
-function parseWorkspaceFlag(
-  tokens: readonly string[],
-  index: number,
-): { delegation?: Omit<WorkspaceDelegation, 'script'>; next: number } | undefined {
+function parseWorkspaceFlag(tokens: readonly string[], index: number): WorkspaceFlag | undefined {
+  const all = parseNpmBooleanFlag(tokens, index, /^(?:-ws|--ws|--workspaces)(?:=(.*))?$/);
+  if (all) return { kind: 'all', enabled: all.enabled, next: all.next };
   const token = unquote(tokens[index] ?? '');
-  const all = /^(?:-ws|--ws|--workspaces)(?:=(.*))?$/.exec(token);
-  if (all) return all[1] === 'false' ? { next: index + 1 } : { delegation: {}, next: index + 1 };
   const match = /^(?:-w|--workspace)(?:=(.+))?$/.exec(token);
   if (!match) return undefined;
   const inline = match[1];
-  if (inline !== undefined) return inline === '' ? undefined : { delegation: { workspace: inline }, next: index + 1 };
+  if (inline !== undefined) {
+    const workspace = unquote(inline);
+    return workspace === '' ? undefined : { kind: 'select', workspace, next: index + 1 };
+  }
   const value = tokens[index + 1] === undefined ? undefined : unquote(tokens[index + 1]!);
   if (value === undefined || value.startsWith('-')) return undefined;
-  return { delegation: { workspace: value }, next: index + 2 };
+  return { kind: 'select', workspace: value, next: index + 2 };
 }
 
 /**
  * `--include-workspace-root`, npm's "run the root script as well" option. With a
  * workspace selection it makes the ROOT script run alongside the delegated ones
  * (measured against npm 11.19.0: `run inner --ws --include-workspace-root` prints
- * the root body too), so such a segment pins the root body as well. npm's boolean
- * coercion again: only the exact value `false` turns it off.
+ * the root body too), so such a segment pins the root body as well. Same boolean
+ * rules as the workspace flags (quotes stripped, `false` the only off-value; the
+ * separate `false` token is consumed too, measured).
  */
-function parseIncludeWorkspaceRoot(token: string): boolean | undefined {
-  const match = /^--include-workspace-root(?:=(.*))?$/.exec(token);
-  return match ? match[1] !== 'false' : undefined;
+function parseIncludeWorkspaceRoot(tokens: readonly string[], index: number): { enabled: boolean; next: number } | undefined {
+  return parseNpmBooleanFlag(tokens, index, /^--include-workspace-root(?:=(.*))?$/);
 }
 
 /** Whether a `--prefix` value names the very tree this plan reads (`.` or `./`). */
@@ -702,14 +729,17 @@ function npmGlobalFlagTokens(tokens: readonly string[], index: number): number |
  * (`npm run "$TARGET"`) is reported as dynamic instead of guessed at. A workspace
  * flag changes WHERE the script resolves (`npm run build -w @scope/pkg` runs the
  * workspace's `build`, not the root's), so such a segment yields a delegation and
- * never a same-manifest name. GLOBAL flags between `npm` and the verb do not hide
- * the verb when this scan models them (`npm --silent run inner`,
- * `npm --loglevel=error test`); an UNMODELLED one is reported as dynamic rather
- * than skipped, because npm's abbreviation surface is open-ended (`--ws` IS
- * `--workspaces` in npm 11) and a flag of unknown arity can hide the verb. `--` is
- * npm's own end-of-options where it stops parsing: before the verb it is consumed,
- * after the verb everything is forwarded — including a `-w` that is then an
- * ARGUMENT to the root script, not a delegation.
+ * never a same-manifest name; the flags are resolved with npm's own last-wins
+ * parsing (`--ws --ws=false` runs the root; a `-w` selector wins over the
+ * boolean). GLOBAL flags between `npm` and the verb do not hide the verb when
+ * this scan models them (`npm --silent run inner`, `npm --loglevel=error test`);
+ * an UNMODELLED one is reported as dynamic rather than skipped, because npm's
+ * abbreviation surface is open-ended (`--ws` IS `--workspaces` in npm 11) and a
+ * flag of unknown arity can hide the verb. `--` is npm's own end-of-options where
+ * it stops parsing for the WHOLE invocation: before the verb it ends the flag scan
+ * (`npm -- run inner --ws` runs the ROOT with `--ws` as an ARGUMENT, measured),
+ * and after the verb it is the script NAME that may follow (`npm run -- inner`),
+ * with everything later forwarded to the script.
  */
 function extractNpmScriptRefs(text: string): NpmScriptRefs {
   const names: string[] = [];
@@ -718,35 +748,55 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
   for (const tokens of shellSegments(text)) {
     for (let i = 0; i < tokens.length; i += 1) {
       if (unquote(tokens[i] ?? '') !== 'npm') continue;
-      // A workspace flag is a delegation; npm's own `--` ends the tokens npm parses;
-      // the global flags this scan models are skipped (`1` token, `2` when the flag
-      // takes a separate value). ANY other `-`-token is unmodelled: the whole
-      // segment is recorded as dynamic, never skipped, so no body is pinned behind a
-      // flag whose meaning (or arity) is a guess.
-      const targets: Omit<WorkspaceDelegation, 'script'>[] = [];
+      // npm's own config parsing is LAST-WINS PER KEY: the all-workspaces
+      // boolean's last occurrence decides (`npm run inner --ws --ws=false` runs the
+      // ROOT, measured), while `-w` is array-valued and its selectors accumulate
+      // (`-w a -w b` runs in both, and a selector wins over the boolean in either
+      // order, measured). A workspace flag is therefore not a delegation yet: the
+      // state below is read once the whole segment has been scanned. The global
+      // flags this scan models are skipped (`1` token, `2` when the flag takes a
+      // separate value); ANY other `-`-token is unmodelled: the whole segment is
+      // recorded as dynamic, never skipped, so no body is pinned behind a flag
+      // whose meaning (or arity) is a guess.
+      let allWorkspaces: boolean | undefined;
+      const selectors: string[] = [];
+      const readWorkspaceFlag = (flag: WorkspaceFlag): void => {
+        if (flag.kind === 'all') allWorkspaces = flag.enabled;
+        else selectors.push(flag.workspace);
+      };
       // `--include-workspace-root` makes the ROOT script run alongside the delegated
-      // ones, so such a segment pins the root body too.
+      // ones, so such a segment pins the root body too. The pin is sticky: a repeated
+      // flag with a later `false` keeps it (npm's last-wins false does not run the
+      // root, so this over-pins in the safe direction — a refusal, never a body that
+      // runs unpinned).
       let rootScript = false;
       let unmodelled = false;
+      // npm's end-of-options: after ANY `--` npm stops reading its own flags for the
+      // REST of the invocation. `npm -- run inner --ws` and `npm run -- inner --ws`
+      // both run the ROOT body with `--ws` as an ARGUMENT (measured), so once a `--`
+      // is seen the verb and the script name are the positionals that follow, and
+      // nothing after them is read as an npm flag.
+      let endOfOptions = false;
       let cursor = i + 1;
       while (cursor < tokens.length) {
         const workspaceFlag = parseWorkspaceFlag(tokens, cursor);
         if (workspaceFlag) {
-          if (workspaceFlag.delegation) targets.push(workspaceFlag.delegation);
+          readWorkspaceFlag(workspaceFlag);
           cursor = workspaceFlag.next;
           continue;
         }
         const token = unquote(tokens[cursor]!);
         if (token === '--') {
-          // npm's end-of-options BEFORE the verb: the verb still follows.
+          // End-of-options BEFORE the verb: the verb is the next positional.
+          endOfOptions = true;
           cursor += 1;
-          continue;
+          break;
         }
         if (!token.startsWith('-')) break;
-        const includeRoot = parseIncludeWorkspaceRoot(token);
-        if (includeRoot !== undefined) {
-          if (includeRoot) rootScript = true;
-          cursor += 1;
+        const includeRoot = parseIncludeWorkspaceRoot(tokens, cursor);
+        if (includeRoot) {
+          if (includeRoot.enabled) rootScript = true;
+          cursor = includeRoot.next;
           continue;
         }
         const consumed = npmGlobalFlagTokens(tokens, cursor);
@@ -763,24 +813,29 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
         script = 'test';
       } else if (verb === 'run' || verb === 'run-script') {
         while (after < tokens.length) {
-          const flag = parseWorkspaceFlag(tokens, after);
-          if (flag) {
-            if (flag.delegation) targets.push(flag.delegation);
-            after = flag.next;
-            continue;
+          if (!endOfOptions) {
+            const workspaceFlag = parseWorkspaceFlag(tokens, after);
+            if (workspaceFlag) {
+              readWorkspaceFlag(workspaceFlag);
+              after = workspaceFlag.next;
+              continue;
+            }
           }
           const token = unquote(tokens[after]!);
           // npm's end-of-options before the script NAME: `npm run -- inner` runs
-          // `inner` (it is not part of the script's arguments).
-          if (token === '--') {
+          // `inner` (it is not part of the script's arguments). A `--` that follows
+          // an earlier `--` (before the verb) is already positional: npm reads it as
+          // the script NAME and fails on it, so it is not consumed twice.
+          if (!endOfOptions && token === '--') {
+            endOfOptions = true;
             after += 1;
             continue;
           }
-          if (token.startsWith('-')) {
-            const includeRoot = parseIncludeWorkspaceRoot(token);
-            if (includeRoot !== undefined) {
-              if (includeRoot) rootScript = true;
-              after += 1;
+          if (!endOfOptions && token.startsWith('-')) {
+            const includeRoot = parseIncludeWorkspaceRoot(tokens, after);
+            if (includeRoot) {
+              if (includeRoot.enabled) rootScript = true;
+              after = includeRoot.next;
               continue;
             }
             const consumed = npmGlobalFlagTokens(tokens, after);
@@ -815,35 +870,65 @@ function extractNpmScriptRefs(text: string): NpmScriptRefs {
         dynamic.push(npmSegmentLabel(tokens, i));
         continue;
       }
-      // npm's own flags may also follow the script name — up to `--`, after which
-      // every token belongs to the script: `npm test -- -w @scope/a` runs the ROOT
-      // `test` and forwards `-w @scope/a` to it as an argument.
-      for (let k = after; k < tokens.length; k += 1) {
-        const flag = parseWorkspaceFlag(tokens, k);
-        if (flag) {
-          if (flag.delegation) targets.push(flag.delegation);
-          if (flag.next > k + 1) k = flag.next - 1;
-          continue;
+      if (!endOfOptions) {
+        // npm's own flags may also follow the script name — up to `--`, after which
+        // every token belongs to the script: `npm test -- -w @scope/a` runs the ROOT
+        // `test` and forwards `-w @scope/a` to it as an argument.
+        for (let k = after; k < tokens.length; k += 1) {
+          const flag = parseWorkspaceFlag(tokens, k);
+          if (flag) {
+            readWorkspaceFlag(flag);
+            if (flag.next > k + 1) k = flag.next - 1;
+            continue;
+          }
+          const raw = tokens[k]!;
+          const token = unquote(raw);
+          if (token === '--') break;
+          if (!token.startsWith('-')) {
+            // A token the SHELL can rewrite into an npm flag — `\--` becomes `--`, a
+            // `$SEP` becomes whatever the variable holds — cannot be dismissed as a
+            // plain argument: npm parses its own flags after the script name too, so
+            // the segment is recorded as dynamic instead of pinning a body npm may
+            // not run (measured: both spellings run bodies a silent skip pinned).
+            if (/[\\$`]/.test(raw)) {
+              unmodelled = true;
+              break;
+            }
+            continue;
+          }
+          const includeRoot = parseIncludeWorkspaceRoot(tokens, k);
+          if (includeRoot) {
+            if (includeRoot.enabled) rootScript = true;
+            k = includeRoot.next - 1;
+            continue;
+          }
+          const consumed = npmGlobalFlagTokens(tokens, k);
+          if (consumed === undefined) {
+            unmodelled = true;
+            break;
+          }
+          k += consumed - 1;
         }
-        const token = unquote(tokens[k]!);
-        if (token === '--') break;
-        if (!token.startsWith('-')) continue;
-        const includeRoot = parseIncludeWorkspaceRoot(token);
-        if (includeRoot !== undefined) {
-          if (includeRoot) rootScript = true;
-          continue;
-        }
-        const consumed = npmGlobalFlagTokens(tokens, k);
-        if (consumed === undefined) {
-          unmodelled = true;
-          break;
-        }
-        k += consumed - 1;
       }
       if (unmodelled) {
         dynamic.push(npmSegmentLabel(tokens, i));
         continue;
       }
+      // The bodies npm would run, from the flags as npm's last-wins parsing leaves
+      // them: the `-w` selectors win when any is present (either order, measured),
+      // and only a still-on all-workspaces boolean delegates when none is. A false
+      // boolean BESIDE a selector is not a combination npm resolves at all — it
+      // exits 1 ("Cannot use --no-workspaces and --workspace at the same time") —
+      // so the segment is recorded as dynamic, never pinned.
+      if (selectors.length && allWorkspaces === false) {
+        dynamic.push(npmSegmentLabel(tokens, i));
+        continue;
+      }
+      const targets: Omit<WorkspaceDelegation, 'script'>[] = selectors.length
+        ? selectors.map((workspace) => ({ workspace }))
+        : allWorkspaces === true
+          ? [{}]
+          : [];
       if (!PLAUSIBLE_SCRIPT_NAME.test(script)) {
         dynamic.push(`npm ${verb} ${script}`);
       } else if (targets.length) {
