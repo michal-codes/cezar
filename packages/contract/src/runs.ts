@@ -222,9 +222,12 @@ export const landingCheckSchema = z.object({
       outcome: z.enum(['passed', 'failed', 'not-run']),
     })
     .optional(),
-  /** The acknowledgement of a foreign subject (spec's trust model); nothing writes it yet. */
+  /** The acknowledgement of a foreign subject (spec's trust model), written when the request's
+   *  `acknowledge.digest` matched the digest recomputed over the materialized subject — only a
+   *  matched digest is ever recorded, and the check then proceeds. */
   ack: z.object({ digest: z.string(), at: z.string() }).optional(),
-  /** The preview a foreign subject gets instead of execution; nothing writes it yet. */
+  /** The preview a foreign subject gets instead of execution, written just before the
+   *  `could-not-run` / `foreign-subject-needs-ack` verdict — nothing runs, install included. */
   preview: z
     .object({
       subjectDigest: z.string(),
@@ -237,7 +240,7 @@ export const landingCheckSchema = z.object({
     .optional(),
   verdict: z.enum(['passed', 'failed', 'conflict', 'nothing-to-check', 'could-not-run']).optional(),
   /** Why, when the verdict is not `passed`: `dry-run`, `timeout`, `install-failed`, `no-commands`,
-   *  `commands-changed-vs-base`, `source-missing`, `unsupported-platform`, `tree-moved`, … */
+   *  `commands-changed-vs-base`, `unsupported-platform`, `tree-moved`, … */
   reason: z.string().optional(),
   results: z
     .array(
