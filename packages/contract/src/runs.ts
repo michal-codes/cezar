@@ -193,6 +193,16 @@ export const landingCheckSchema = z.object({
       changedVsBase: z.boolean().optional(),
       /** The script BODIES the digest covers, so the record says what was pinned, not just a hash. */
       resolvedBodies: z.record(z.string(), z.string()).optional(),
+      /**
+       * The resolver's own record of what it could NOT pin, one line each: a source it could not
+       * read or had to skip, a command whose body the frozen base does not declare. The same lines
+       * ride the check run's transcript as `note` events, where they are read live; this copy makes
+       * them DURABLE, so a reader of the record alone sees what the digest does not cover.
+       *
+       * Written only when non-empty: an absent key means "the resolver had nothing to flag", never
+       * "nobody recorded anything".
+       */
+      notes: z.array(z.string()).optional(),
     })
     .optional(),
   /**

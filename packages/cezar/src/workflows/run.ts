@@ -2487,6 +2487,11 @@ export class RunManager {
       digest: resolution.digest,
       ...(resolution.changedVsBase ? { changedVsBase: true } : {}),
       ...(Object.keys(resolvedBodies).length ? { resolvedBodies } : {}),
+      // The resolver's honesty notes, made durable: the same lines ride the transcript as `note`
+      // events (above), where they are read live — a reader of the RECORD alone must still see
+      // what the digest does not cover. The key is absent when there is nothing to flag, never an
+      // empty array, so "no notes" and "nobody wrote notes" cannot be confused.
+      ...(resolution.notes.length ? { notes: resolution.notes } : {}),
     };
     const materializedCheck = { ...check, subject: { ...subject, treeSha }, commands: plan };
     this.store.updateRun(runId, { landingCheck: materializedCheck });

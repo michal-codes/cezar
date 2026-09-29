@@ -3,9 +3,29 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendLedger } from '../dispatch/tree-fs.ts';
 import { RunStore, type RunRecord } from '../runs/store.ts';
+import { resolveCheckCommands } from './check-commands.ts';
+
+/**
+ * Every test in this file exercises the REAL resolver — except the one case the durable-notes
+ * feature must pin that today's resolver cannot produce: a plan with NOTHING to note (it records
+ * every source it consulted, so a resolution always has lines). `resolverNotes.drop` makes the
+ * wrapper return an empty notes list for that test only; nothing else about the resolution
+ * changes. See "the resolver's notes on the record's plan (PR 4.5)" below.
+ */
+const resolverNotes = vi.hoisted(() => ({ drop: false }));
+vi.mock('./check-commands.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./check-commands.ts')>();
+  return {
+    ...actual,
+    resolveCheckCommands: (options: Parameters<typeof actual.resolveCheckCommands>[0]) =>
+      resolverNotes.drop
+        ? { ...actual.resolveCheckCommands(options), notes: [] }
+        : actual.resolveCheckCommands(options),
+  };
+});
 import { RunManager } from './run.ts';
 
 /**
@@ -839,5 +859,94 @@ posix('a restart after materialization (PR 4.2)', () => {
     );
     expect(said).toHaveLength(1);
     expect(String(said[0]?.message)).toContain('runs this repository');
+  }, 60_000);
+});
+
+/**
+ * PR 4.5: the resolver's honesty notes are DURABLE on the record's plan.
+ *
+ * The resolver records, in `resolution.notes`, every source it consulted and every command whose
+ * body the frozen base does not declare — what it could NOT pin. Until now those lines only rode
+ * the check run's transcript as `note` events, so a reader of the RECORD alone could not see what
+ * the digest does not cover. The plan now carries them, and only when there is something to
+ * carry: an absent key must never be confused with an empty list.
+ */
+posix("the resolver's notes on the record's plan (PR 4.5)", () => {
+  /** A valid lockfile with no dependencies: the install step is `npm ci`, offline and green. */
+  const EMPTY_LOCKFILE = `${JSON.stringify({
+    name: 'fixture',
+    version: '1.0.0',
+    lockfileVersion: 3,
+    requires: true,
+    packages: { '': { name: 'fixture', version: '1.0.0' } },
+  })}\n`;
+
+  /** base (config + manifest) → `cez/parent` with one commit → a base-alone subject at its tip. */
+  async function notingPlanFixture(): Promise<{ parent: RunRecord; parentSha: string }> {
+    // `npm run env` is npm's own built-in script: the command RUNS green, while the frozen base
+    // declares no `env` script body — exactly the thing the resolver can only flag as a note.
+    await commit(
+      '.ai/agentic.config.json',
+      `${JSON.stringify({ version: 1, validation: { commands: ['npm run env'] } }, null, 2)}\n`,
+      'base',
+    );
+    await commit('package.json', '{"name":"fixture","private":true}\n', 'manifest');
+    await commit('package-lock.json', EMPTY_LOCKFILE, 'lockfile');
+    await git(repoRoot, 'checkout', '-q', '-b', 'cez/parent');
+    const parentSha = await commit('b.txt', 'parent\n', 'parent work');
+    await git(repoRoot, 'checkout', '-q', 'main');
+    const parent = mkRun({ title: 'parent', branch: 'cez/parent', status: 'running' });
+    return { parent, parentSha };
+  }
+
+  it('carries the notes the resolver produced on the record, line for line, and still emits them as events', async () => {
+    const { parent, parentSha } = await notingPlanFixture();
+    const started = await manager.startLandingCheck(parent.id, {});
+    if (!('runId' in started)) throw new Error(started.refused);
+    currentId = started.runId;
+    await settle(started.runId);
+
+    const final = store.getRun(started.runId);
+    expect(final?.status).toBe('done');
+    expect(final?.landingCheck?.verdict).toBe('passed');
+    expect(final?.landingCheck?.subject.baseSha).toBe(parentSha);
+
+    // The same resolver call the check itself made, over the same frozen base and the same
+    // materialized tree: the record carries ITS output — not a re-derivation, not a summary.
+    const resolution = resolveCheckCommands({ baseSha: parentSha, repoRoot: final?.worktreePath as string });
+    const plan = final?.landingCheck?.commands;
+    expect(plan?.source).toBe('agentic-config');
+    expect(plan?.digest).toBe(resolution.digest);
+    expect(plan?.notes).toEqual(resolution.notes);
+    expect(plan?.notes?.length ?? 0).toBeGreaterThan(0);
+    expect(plan?.notes).toContain(
+      'npm run env: the frozen base resolves no "env" script — the argv is pinned, its body is not',
+    );
+
+    // The durable copy is an ADDITION: the transcript still shows every line live.
+    const logged = events(started.runId)
+      .filter((event) => event.type === 'note')
+      .map((event) => String(event.message));
+    for (const note of resolution.notes) expect(logged).toContain(note);
+  }, 60_000);
+
+  it('omits the key entirely when there is nothing to note — never an empty array', async () => {
+    const { parent } = await notingPlanFixture();
+    // The resolver has no "nothing to note" case today (it records the sources it consulted), so
+    // the wrapper stands in for the future one — the record's shape is what this test is about.
+    resolverNotes.drop = true;
+    try {
+      const started = await manager.startLandingCheck(parent.id, {});
+      if (!('runId' in started)) throw new Error(started.refused);
+      currentId = started.runId;
+      await settle(started.runId);
+
+      const plan = store.getRun(started.runId)?.landingCheck?.commands;
+      expect(plan?.source).toBe('agentic-config'); // the plan IS written …
+      expect(plan?.notes).toBeUndefined(); // … with no notes key at all
+      expect(plan !== undefined && 'notes' in plan).toBe(false);
+    } finally {
+      resolverNotes.drop = false;
+    }
   }, 60_000);
 });
