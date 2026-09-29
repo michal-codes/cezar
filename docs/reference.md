@@ -6,6 +6,7 @@ Everything the [README](../README.md) leaves out: the full configuration, every 
 - [Cockpit tour](#cockpit-tour)
 - [Multiple projects, one cockpit](#multiple-projects-one-cockpit)
 - [Workflow format](#workflow-format)
+- [Landing check](#landing-check)
 - [How it runs agents](#how-it-runs-agents) (environment variables, troubleshooting)
 - [Coding agent backends](#coding-agent-backends)
 - [Remote access (host cezar on a server)](#remote-access-host-cezar-on-a-server)
@@ -21,7 +22,9 @@ Three words, no jargon — **task**, **skill**, **chain**:
 
 - 📋 **Tasks** are the unit of work. Every task is a **run**: `queued → running →
   review / done / failed / cancelled`, with a live event log, per-step token and
-  cost usage, cancel/delete, and — for anything with a diff — a review gate. Attach
+  cost usage, cancel/delete, and — opt-in — a review gate for anything with a diff
+  (`CEZ_REVIEW_GATE=1` or the Settings → Agents toggle; changed runs settle `done`
+  by default, and autonomous runs always skip it). Attach
   screenshots, PDFs, `.txt` or `.md` files to the task (paperclip, ⌘V or drag-drop;
   the agent gets each one as a real file on disk), or send follow-up messages into
   the live session while it works.
@@ -60,9 +63,12 @@ Five moves that make the cockpit worth the browser tab:
   unlimited) and reclaims the rest — directory only, the `cez/<id8>` branch is
   always kept, so the work stays recoverable. Settings → Resources shows every
   worktree's disk use with per-row delete and a **Reclaim now** button.
-- 🛡️ **Review gate.** A finished run with changes waits in `review`. Read the diff,
-  type notes that go straight back into the agent's session, or push a
-  `gh pr create --draft`. You stay the merge button.
+- 🛡️ **Review gate (opt-in).** By default a finished run with changes settles `done`
+  and leaves the diff in its worktree. Turn the gate on (`CEZ_REVIEW_GATE=1`, or
+  Settings → Agents) and a finished, non-autonomous run with changes waits in
+  `review` instead — autonomous runs always skip it. Read the diff, type notes that
+  go straight back into the agent's session, or push a `gh pr create --draft`. You
+  stay the merge button.
 - 📱 **Runs on your coding server, drives from your pocket.** The cockpit is a
   responsive web app streaming over SSE, so the box running cezar can be a
   **VPS, cloud, or dedicated server** you never sit in front of. Point a browser
@@ -277,7 +283,7 @@ that executes repository code unattended:
   with a marker naming how much was elided; the failing line is at the tail, so
   the old head-kept cap no longer hides the reason from the retried agent.
 - **Minimal environment.** A check gets no `GITHUB_TOKEN`/`GH_*`, no vendor API
-  or cloud credentials and no `CEZ_*`, and it runs a non-login shell. One hatch
+  or cloud credentials and no `CEZ_*`, and it runs a non-login shell (`bash --noprofile --norc`). One hatch
   applies: `CEZ_ENV_PASSTHROUGH` forwards exactly the host vars it names (a
   check that genuinely needs a CI flag, a tool's config dir or `SSH_AUTH_SOCK`),
   never one of those credential families even when named. `CEZ_AGENT_ENV_FULL`
@@ -296,6 +302,86 @@ shorthand — an ordered list of skill names, each becoming one agent step:
 name: triage-and-fix
 skills: [reproduce, root-cause, implement, self-review]
 ```
+
+---
+
+## Landing check
+
+A dispatch parent hands each child its own branch, and every child checks its own
+work — but nothing checked the *combination* a parent was about to land. The
+landing check closes that gap: cezar applies the merge-queue discipline locally to
+a dispatch tree. It merges the tree's branches into a scratch worktree, runs the
+repository's own gate on the frozen combination, and records the verdict as
+non-blocking evidence — no PR, no remote, no branch protection required.
+
+**The subject.** An invoking run (usually a dispatch parent, still `running` —
+freezing its tip is the point) asks for a check of run `:id`. The subject's base is
+**that run's branch tip frozen at request time**, so the parent's own commits are
+part of it; the sources are the tree's eligible children — `done` children with a
+branch, excluding `review`/failed/non-terminal children, empty tips (tip == fork
+point), children already landed, and duplicates — in dispatch-ledger order, or an
+explicit `sources` list when you name one. Sources are applied **by sha**, so a
+branch that moves while the check runs cannot change what was checked. The
+identity is the **merged tree sha**, recorded on the check run.
+
+**The verdict.** `landingCheck.verdict` is one of `passed`, `failed`, `conflict`,
+`nothing-to-check` or `could-not-run`, and **a check that could not run is not
+green** — only `passed` is. A gate command that exits non-zero stops the gate:
+later commands do not run and the check run settles `failed`. A merge conflict
+stops the check earlier still, records the conflicting files, aborts the merge
+and runs **no** command. `nothing-to-check` covers the cases where there is no
+gate to run: no command source declares anything, or the candidate moved the
+command list or a script body pinned from the frozen base. `could-not-run`
+covers everything that stopped the check before it could conclude — a
+`CEZ_DRY_RUN=1` dry run, a timeout, a failed install, a source that no longer
+resolves, a platform without a POSIX shell, a dirty worktree. The check run is
+an ordinary run: it settles `done` only on `passed` and `failed` otherwise
+(unless you cancel it).
+
+**Frozen-base commands and the install step.** The command list comes from the
+frozen base — an explicit list, then `.ai/agentic.config.json`, then the root
+`package.json` (a `Makefile` is surfaced, never run) — and so do the script bodies
+the digest pins, so a candidate cannot pick or quietly weaken its own gate; a
+candidate that changes either yields `nothing-to-check: commands-changed-vs-base`
+and executes nothing. When the frozen base declares a manifest, an install step
+runs **first** (`npm ci` with a lockfile, `npm install` without), and a failure
+there is `could-not-run: install-failed` with no gate command run — never green.
+The gate commands themselves run through the same hardened runner as any check
+step: 20-minute per-command and 45-minute whole-gate deadlines, a process group
+that is SIGTERMed, given 5 s, then SIGKILLed, a minimal environment and a
+tail-kept 20,000-character output cap (see
+[Workflow format](#workflow-format) above).
+
+**How to run it.** From inside a task:
+
+```bash
+cez task land-check [<run id>] [--sources a,b] [--commands "…"] [--wait]
+```
+
+`<run id>` defaults to `CEZ_TASK_ID`; `--wait` follows the check to its verdict
+and exits non-zero on anything but `passed`. From the API:
+`POST /api/v1/p/<projectId>/runs/:id/land-check` (or
+`/api/v1/runs/:id/land-check` for the boot project), with an optional body
+`{sources?, commands?}`. The route answers `201 {runId, ofRunId}` **before any
+command has run** — the check is its own run and queues for a `maxParallel` slot
+like any task — `404` for an unknown run, `409` while a landing check for the
+project is already in flight, and `400` on a shape violation.
+
+**What lands in the record.** `landingCheck` on the check run's record carries
+`ofRunId`, the `subject` (`baseRef`, `baseSha`, `sources[{ref, sha}]`, `order`,
+`treeSha`, and the `excluded` candidates with their reasons), the resolved
+`commands` plan (`source`, `digest`, `changedVsBase`, `resolvedBodies`), the
+`install` step when one ran, the `verdict` and `reason`, the per-command
+`results[]`, and the check's own `envNames` and `user`. `GET /runs` and
+`GET /runs/:id` add a derived, never-stored `landingCheckStale` flag: it
+re-checks each recorded sha against its ref at **read time** and reads `true`
+when the base or a source moved after the check ran; the key is absent on a run
+with nothing to be stale about, and the stored verdict text is never rewritten.
+
+The gate runs the repository's own code, as you, in a scratch worktree — it is
+**not a sandbox** and can read whatever that account can; the reduced environment
+limits the blast radius, nothing more. And nothing merges: no branch is pushed, no
+GitHub status is published, and the verdict blocks nothing — read it, then decide.
 
 ---
 
@@ -722,13 +808,17 @@ npm run uninstall-as-command    # removes cezar / cez / cezar-cli / cezar-run (e
 npm run dev          # server (API :4321) + Vite dev server, opens the cockpit in the browser
 npm run dev:server   # tsx packages/cezar/src/index.ts — the API server alone
 npm run dev:web      # Vite dev server alone (proxies /api to :4321)
+npm run test:unit    # node:test — fast core-module tests
 npm run build        # tsc → packages/cezar/dist/, vite build → packages/cezar/web/dist/, then the pack gate
 npm run typecheck    # server + web (tsc --noEmit)
-npm test             # vitest — server + cockpit unit suites
-npm run test:unit    # node:test — fast core-module tests
 npm run test:package # pack/install and exercise the built CLI
+npm test             # vitest — server + cockpit unit suites
 npm run test:e2e     # real-browser cockpit suite (agent-browser)
 ```
+
+The five validation commands are listed in the gate's cheap-first order
+(`npm run test:unit` → `npm run build` → `npm run typecheck` → `npm run test:package`
+→ `npm test`); `npm run test:e2e` is the separate real-browser QA layer.
 
 The stack is deliberately small: **TypeScript** (strict, ESM), **Hono** + SSE for
 the server, **Zod** at every boundary, **YAML** for workflows, and a **React 19 +
