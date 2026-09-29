@@ -183,13 +183,15 @@ describe('mergeRun', () => {
   })
 
   it('carries EVERY read-time field — the guard for the next one that gets forgotten', () => {
-    // Keyed on the same list `mergeRun` folds, so this goes red the moment a field is carried
-    // nowhere — which is how `landingCheckStale` was dropped while `usage` kept working.
-    const values: Record<(typeof READ_TIME_RUN_FIELDS)[number], unknown> = {
+    // Keyed on the read-time keys of `ApiRun` — what a stream `RunRecord` does not carry — so a
+    // NEW read-time field is a compile error until it has a row here. The loop walks this map, not
+    // `READ_TIME_RUN_FIELDS`, so a row `mergeRun` fails to fold (one missing from that list, say)
+    // is red below. It cannot see a field the server attaches but `ApiRun` never declares.
+    const values: Record<Exclude<keyof ApiRun, keyof RunRecord>, unknown> = {
       usage: SAMPLE,
       landingCheckStale: true,
     }
-    for (const field of READ_TIME_RUN_FIELDS) {
+    for (const field of Object.keys(values) as Array<keyof typeof values>) {
       const previous = { ...run('r1'), [field]: values[field] } as ApiRun
       expect(mergeRun(previous, run('r1', { status: 'done' }))[field]).toEqual(values[field])
     }
