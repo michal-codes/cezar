@@ -1,9 +1,10 @@
 import { QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter, Route, Routes, useParams } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createQueryClient } from '@/api/query-client'
+import { Toaster, resetToasts } from '@/components/ui/toaster'
 import type { ApiRun, LandingCheck, RunEvent } from '@open-mercato/cezar-api-client'
 
 import { LandingCheckCard } from './landing-check-card'
@@ -21,6 +22,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  act(() => resetToasts())
   vi.unstubAllGlobals()
 })
 
@@ -59,11 +61,14 @@ function output(over: Record<string, unknown>): RunEvent {
   return { seq, ts: '2026-09-29T10:00:00.000Z', type: 'check-output', ...over }
 }
 
+const jsonResponse = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+
 /** The card's `useRuns()` is the page's already-warm list; a stub keeps the test offline. */
 function stubRuns(runs: ApiRun[] = []) {
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => new Response(JSON.stringify(runs), { status: 200, headers: { 'content-type': 'application/json' } })),
+    vi.fn(async () => jsonResponse(runs)),
   )
 }
 
@@ -77,6 +82,29 @@ function renderCard(record: ApiRun, events: RunEvent[] = []) {
       </MemoryRouter>
     </QueryClientProvider>,
   )
+}
+
+/**
+ * The card with somewhere for a navigation to LAND (the ack follows the new check run's id) and a
+ * `<Toaster />` mounted, so a refused ack is asserted where the user would read it.
+ */
+function renderCardFollowingLandings(record: ApiRun, events: RunEvent[] = []) {
+  return render(
+    <QueryClientProvider client={createQueryClient()}>
+      <MemoryRouter initialEntries={['/tasks/check-run']}>
+        <Routes>
+          <Route path="/tasks/check-run" element={<LandingCheckCard run={record} events={events} />} />
+          <Route path="/tasks/:id" element={<LandedRunProbe />} />
+        </Routes>
+        <Toaster />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  )
+}
+
+function LandedRunProbe() {
+  const { id } = useParams()
+  return <div data-testid="landed-run">{id}</div>
 }
 
 describe('LandingCheckCard — per-command rows (sign-off a)', () => {
@@ -279,27 +307,121 @@ describe('LandingCheckCard — stale, the invoking link and preview', () => {
     await waitFor(() => expect(link?.textContent).toContain('Land the feature'))
   })
 
-  it('renders a preview block neutrally when one exists, with no acknowledge control', () => {
+})
+
+/** A foreign-subject preview, exactly what the engine writes before anything executes. */
+function previewCheck(over: Partial<LandingCheck> = {}): LandingCheck {
+  return check({
+    verdict: 'could-not-run',
+    reason: 'foreign-subject-needs-ack',
+    preview: {
+      subjectDigest: 'digest-1',
+      authors: ['someone-else'],
+      commands: ['npm test'],
+      installArgv: ['npm', 'ci'],
+      headSha: 'f'.repeat(40),
+      diffStat: '+2 −1',
+    },
+    ...over,
+  })
+}
+
+describe('LandingCheckCard — the acknowledgement round-trip (PR 5.1)', () => {
+  it('renders the preview neutrally — authors, install argv, commands, diffstat — with the deliberate control', () => {
     stubRuns()
-    renderCard(
-      run({
-        status: 'failed',
-        landingCheck: check({
-          verdict: 'could-not-run',
-          reason: 'foreign-subject-needs-ack',
-          preview: {
-            subjectDigest: 'digest',
-            authors: ['someone-else'],
-            commands: ['npm test'],
-            headSha: 'f'.repeat(40),
-            diffStat: '+2 −1',
-          },
-        }),
-      }),
-    )
+    renderCard(run({ status: 'failed', landingCheck: previewCheck() }))
+
     const preview = document.querySelector('[data-slot="landing-check-preview"]')
     expect(preview?.textContent).toContain('Preview — nothing was executed')
     expect(preview?.textContent).toContain('someone-else')
+    expect(preview?.textContent).toContain('install: npm ci')
+    expect(preview?.textContent).toContain('npm test')
+    expect(preview?.textContent).toContain('+2 −1')
+    // The consequence is legible at the click: it runs the gate as the operator, and it is not a
+    // sandbox. The block stays neutral — no green, no red.
+    expect(preview?.textContent).toContain('not a sandbox')
+    expect(preview?.querySelector('[data-tone="success"]')).toBeNull()
+    expect(preview?.querySelector('[data-tone="danger"]')).toBeNull()
+    expect(screen.getByRole('button', { name: /acknowledge and run/i })).not.toBeNull()
+  })
+
+  it('shows no control on a check that has no preview', () => {
+    stubRuns()
+    renderCard(run({ landingCheck: check({ verdict: 'could-not-run', reason: 'install-failed' }) }))
+    expect(document.querySelector('[data-slot="landing-check-preview"]')).toBeNull()
     expect(screen.queryByRole('button', { name: /acknowledge/i })).toBeNull()
+  })
+
+  it('posts the preview digest to the INVOKING run and follows the new check run', async () => {
+    const calls: Array<{ url: string; method: string; body: unknown }> = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+        const method = init?.method ?? 'GET'
+        calls.push({ url, method, body: init?.body === undefined ? undefined : JSON.parse(String(init.body)) })
+        return method === 'POST' ? jsonResponse({ runId: 'check-2', ofRunId: 'parent' }, 201) : jsonResponse([])
+      }),
+    )
+    renderCardFollowingLandings(run({ status: 'failed', landingCheck: previewCheck() }))
+
+    fireEvent.click(screen.getByRole('button', { name: /acknowledge and run/i }))
+
+    // The new check run's id is where the reader lands — the card never claims the verdict itself.
+    await waitFor(() => expect(screen.getByTestId('landed-run').textContent).toBe('check-2'))
+    const post = calls.find((call) => call.method === 'POST')
+    // `ofRunId` (the run whose combination is checked), never the check run's own id: the ack
+    // asks for a NEW check of the invoking run.
+    expect(post?.url).toBe('/api/v1/runs/parent/land-check')
+    expect(post?.body).toEqual({ acknowledge: { digest: 'digest-1' } })
+    // Nothing fired before the click.
+    expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1)
+  })
+
+  it('surfaces a refused ack (a check already in flight) and stays on the card', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+        init?.method === 'POST'
+          ? jsonResponse({ error: 'a landing check is already in flight for this project (run abcd1234) — wait for its verdict before starting another' }, 409)
+          : jsonResponse([]),
+      ),
+    )
+    renderCardFollowingLandings(run({ status: 'failed', landingCheck: previewCheck() }))
+
+    fireEvent.click(screen.getByRole('button', { name: /acknowledge and run/i }))
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-slot="toast"]')?.textContent).toContain('already in flight'),
+    )
+    // The server's words, not a navigate: the reader stays where the click happened.
+    expect(screen.queryByTestId('landed-run')).toBeNull()
+    expect(screen.getByRole('button', { name: /acknowledge and run/i })).not.toBeNull()
+  })
+})
+
+describe('LandingCheckCard — a dead run without a verdict (PR #1169 review, low)', () => {
+  it('paints no stage with the success tone and no stage as still in progress', () => {
+    stubRuns()
+    renderCard(run({ status: 'failed', landingCheck: check() }))
+
+    const stages = [...document.querySelectorAll('[data-slot="landing-check-stages"] [data-stage]')]
+    expect(stages.map((stage) => stage.getAttribute('data-stage'))).toEqual(['freeze', 'merge', 'gate'])
+    // The chip already reads could-not-run; a green freeze dot on the same card contradicts it.
+    expect(document.querySelectorAll('[data-slot="landing-check-stages"] [data-tone="success"]')).toHaveLength(0)
+    for (const stage of stages) expect(stage.querySelector('[data-tone="neutral"]')).not.toBeNull()
+    // Past tense: "applying the pinned sources one by one" reads as live work on a dead run.
+    expect(stages[1]?.textContent).toContain('the check ended before the sources were merged')
+    expect(stages[2]?.textContent).toContain('the gate never ran on this subject')
+    expect(document.body.textContent).not.toContain('applying the pinned sources one by one')
+  })
+
+  it('keeps a live run\'s trail as progress: success for what is done, pending for what is not', () => {
+    stubRuns()
+    renderCard(run({ status: 'running', landingCheck: check() }))
+    const stages = [...document.querySelectorAll('[data-slot="landing-check-stages"] [data-stage]')]
+    expect(stages[0]?.querySelector('[data-tone="success"]')).not.toBeNull()
+    expect(stages[1]?.querySelector('[data-tone="pending"]')).not.toBeNull()
+    expect(stages[1]?.textContent).toContain('applying the pinned sources one by one')
   })
 })
