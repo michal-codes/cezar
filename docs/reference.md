@@ -374,8 +374,9 @@ commit, or a source you named explicitly does not resolve.
 `ofRunId`, the `subject` (`baseRef`, `baseSha`, `sources[{ref, sha}]`, `order`,
 `treeSha`, and the `excluded` candidates with their reasons), the resolved
 `commands` plan (`source`, `digest`, `changedVsBase`, `resolvedBodies`), the
-`install` step when one ran, the `preview` a foreign subject gets instead of
-execution and its `ack` once acknowledged, the `verdict` and `reason`, the
+`install` step when the check reached it (`not-run` on a foreign preview), the
+`preview` a foreign subject gets instead of execution and its `ack` once
+acknowledged, the `verdict` and `reason`, the
 per-command `results[]`, and the check's own `envNames` and `user`. `GET /runs`
 and `GET /runs/:id` add a derived, never-stored `landingCheckStale` flag: it
 re-checks each recorded sha against its ref at **read time** and reads `true`
@@ -389,9 +390,9 @@ own identities — and an unreadable history counts as foreign, never as local. 
 foreign subject runs nothing, the install step included: the check freezes it,
 records a `preview` (`subjectDigest`, authors, resolved commands, install argv,
 head sha, diffstat) and the verdict `could-not-run` with reason
-`foreign-subject-needs-ack`. The acknowledgement is explicit and API/JSON-only
-(`cez task land-check` has no ack flag): a re-request (`POST
-…/runs/:id/land-check` with `{ acknowledge: { digest } }`) proceeds only when
+`foreign-subject-needs-ack`. The acknowledgement is a deliberate body field on
+the re-request, not a CLI flag (`cez task land-check` has no ack flag): `POST
+…/runs/:id/land-check` with `{ acknowledge: { digest } }` proceeds only when
 the recomputed `subjectDigest` still matches the frozen subject, so a moved
 branch, a moved resolved plan or a different install previews again; on a local
 subject the key is inert. The check card surfaces the preview, and its
