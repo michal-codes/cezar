@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AGENTIC_CONFIG_PATH,
+  CHECK_PLAN_DIGEST_VERSION,
   MAKEFILE_PATH,
   PACKAGE_JSON_PATH,
   PACKAGE_LOCK_PATH,
@@ -66,6 +67,15 @@ function candidate(dir: string, files: Record<string, string>): void {
 
 function pkg(scripts: Record<string, string>): string {
   return `${JSON.stringify({ name: 'fixture', private: true, scripts }, null, 2)}\n`;
+}
+
+/** The workspace shape: a root manifest with `workspaces` globs, and a named workspace manifest. */
+function workspaceRoot(scripts: Record<string, string>, workspaces: string[] = ['packages/*']): string {
+  return `${JSON.stringify({ name: 'fixture', private: true, workspaces, scripts }, null, 2)}\n`;
+}
+
+function pkgNamed(name: string, scripts: Record<string, string>): string {
+  return `${JSON.stringify({ name, private: true, scripts }, null, 2)}\n`;
 }
 
 function config(commands: string[]): string {
@@ -338,6 +348,22 @@ describe('check-commands — the command policy resolver', () => {
 
       expect(resolve(dir, baseSha).digest).toBe(resolve(dir, baseSha).digest);
     });
+
+    it('changes when a WORKSPACE script body changes — the delegation is in the payload (v3)', () => {
+      const files = (workspace: Record<string, string>): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run test:unit']),
+        'package.json': workspaceRoot({ 'test:unit': 'npm run test:unit -w @acme/pkg' }),
+        'packages/pkg/package.json': pkgNamed('@acme/pkg', workspace),
+      });
+      baseSha = freeze(dir, files({ 'test:unit': 'vitest run' }));
+      const first = resolve(dir, baseSha);
+      baseSha = freeze(dir, files({ 'test:unit': 'vitest run --silent' }), 'workspace body moved');
+      const second = resolve(dir, baseSha);
+
+      expect(first.digest).not.toBe(second.digest);
+      // The payload version is the contract for every consumer that compares digests.
+      expect(CHECK_PLAN_DIGEST_VERSION).toBe(3);
+    });
   });
 
   describe('the Makefile — surfaced, never run', () => {
@@ -518,7 +544,8 @@ describe('check-commands — the command policy resolver', () => {
       const poison = `touch ${join(dir, 'POISON')}`;
       baseSha = freeze(dir, {
         '.ai/agentic.config.json': config([poison, 'npm test']),
-        'package.json': pkg({ test: 'vitest run' }),
+        'package.json': workspaceRoot({ test: 'npm run probe', probe: 'npm run probe -w @fixture/poison' }),
+        'packages/poison/package.json': pkgNamed('@fixture/poison', { probe: poison }),
         [MAKEFILE_PATH]: `${poison}-target:\n\t${poison}\n`,
       });
       candidate(dir, { '.ai/agentic.config.json': config([poison, 'npm test', 'false']) });
@@ -529,9 +556,11 @@ describe('check-commands — the command policy resolver', () => {
 
       const calls = mocked.mock.calls;
       expect(calls.length).toBeGreaterThan(0);
+      // The `-w` probe is what makes `ls-tree` run, so the new verb is covered too.
+      expect(calls.map(([, args]) => (Array.isArray(args) ? args[0] : undefined))).toContain('ls-tree');
       for (const [program, args] of calls) {
         expect(program).toBe('git');
-        expect(['rev-parse', 'show']).toContain(Array.isArray(args) ? args[0] : undefined);
+        expect(['rev-parse', 'show', 'ls-tree']).toContain(Array.isArray(args) ? args[0] : undefined);
         expect(JSON.stringify(args)).not.toContain('POISON');
       }
       expect(existsSync(join(dir, 'POISON'))).toBe(false);
@@ -710,6 +739,126 @@ describe('check-commands — the command policy resolver', () => {
     });
   });
 
+  describe('the workspace manifests behind -w delegations (PR 3.2)', () => {
+    /** This repo's own gate shape: a thin root stub delegating the body with `-w`. */
+    const delegated = (root: Record<string, string>, workspace: Record<string, string>): Record<string, string> => ({
+      '.ai/agentic.config.json': config(['npm run test:unit']),
+      'package.json': workspaceRoot(root),
+      'packages/pkg/package.json': pkgNamed('@acme/pkg', workspace),
+    });
+    const delegating = { 'test:unit': 'npm run test:unit -w @acme/pkg' };
+
+    it('refuses when the candidate neuters a script behind a -w delegation — the root body unchanged', () => {
+      const files = (workspace: Record<string, string>): Record<string, string> => delegated(delegating, workspace);
+      baseSha = freeze(dir, files({ 'test:unit': 'node --import tsx --test test/unit/*.test.ts' }));
+      candidate(dir, files({ 'test:unit': 'exit 0' }));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('nothing-to-check');
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.changedVsBase).toBe(true);
+      expect(commands(resolution)).toEqual([]);
+      expect(resolution.diff).toContain('@@ workspace:packages/pkg/package.json#test:unit @@');
+      expect(resolution.diff).toContain('- node --import tsx --test test/unit/*.test.ts');
+      expect(resolution.diff).toContain('+ exit 0');
+      expect(notes(resolution)).toContain('→ packages/pkg/package.json');
+    });
+
+    it('covers a workspace script recursively, and its pre*/post* hooks', () => {
+      const files = (inner: string, hook: string): Record<string, string> =>
+        delegated(delegating, { 'test:unit': 'npm run inner', inner, 'pretest:unit': hook });
+      baseSha = freeze(dir, files('tsc -b', 'node pre.js'));
+      candidate(dir, files('exit 0', 'node pre.js'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ workspace:packages/pkg/package.json#inner @@');
+      expect(resolution.diff).toContain('+ exit 0');
+
+      candidate(dir, files('tsc -b', 'node pre-moved.js'));
+      const hookDrifted = resolve(dir, baseSha);
+      expect(hookDrifted.reason).toBe('commands-changed-vs-base');
+      expect(hookDrifted.diff).toContain('@@ workspace:packages/pkg/package.json#pretest:unit @@');
+      expect(hookDrifted.diff).toContain('+ node pre-moved.js');
+    });
+
+    it('resolves the workspace by path, by --workspace=<name>, and by -ws/--workspaces', () => {
+      const root = (delegation: string): Record<string, string> => delegated({ 'test:unit': `npm run test:unit ${delegation}` }, { 'test:unit': 'vitest run' });
+      for (const delegation of ['-w packages/pkg', '--workspace=@acme/pkg', '-ws']) {
+        baseSha = freeze(dir, root(delegation), `delegation ${delegation}`);
+
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status, delegation).toBe('resolved');
+        expect(notes(resolution), delegation).toContain('→ packages/pkg/package.json');
+      }
+    });
+
+    it('pins --workspaces in every manifest that defines the script', () => {
+      const files = (first: string): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm test']),
+        'package.json': workspaceRoot({ test: 'npm test --workspaces' }),
+        'packages/a/package.json': pkgNamed('@acme/a', { test: first }),
+        'packages/b/package.json': pkgNamed('@acme/b', { test: 'vitest run' }),
+      });
+      baseSha = freeze(dir, files('vitest run --pool forks'));
+      candidate(dir, files('exit 0'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ workspace:packages/a/package.json#test @@');
+      expect(resolution.diff).toContain('+ exit 0');
+      expect(resolution.diff).not.toContain('packages/b/package.json#test');
+      expect(notes(resolution)).toContain('npm --workspaces → packages/a/package.json, packages/b/package.json');
+    });
+
+    it('refuses when the candidate deletes the manifest the delegation resolves to', () => {
+      const files: Record<string, string> = delegated(delegating, { 'test:unit': 'vitest run' });
+      baseSha = freeze(dir, files);
+      rmSync(join(dir, 'packages/pkg/package.json'));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.reason).toBe('commands-changed-vs-base');
+      expect(resolution.diff).toContain('@@ workspace:packages/pkg/package.json#test:unit @@');
+      expect(resolution.diff).toContain('(no such script in the candidate)');
+    });
+
+    it('is honest when the name matches no manifest: a note, nothing pinned, no false drift', () => {
+      const files = (workspace: Record<string, string>): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run test:unit']),
+        'package.json': workspaceRoot({ 'test:unit': 'npm run test:unit -w @acme/other' }),
+        'packages/pkg/package.json': pkgNamed('@acme/pkg', workspace),
+      });
+      baseSha = freeze(dir, files({ 'test:unit': 'vitest run' }));
+      candidate(dir, files({ 'test:unit': 'exit 0' }));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).toContain('no workspace manifest named or at "@acme/other"');
+      expect(notes(resolution)).toContain('not pinned');
+    });
+
+    it('never reads a workspace manifest when no -w delegation appears — guard', () => {
+      const files = (workspace: Record<string, string>): Record<string, string> => ({
+        '.ai/agentic.config.json': config(['npm run test:unit']),
+        'package.json': workspaceRoot({ 'test:unit': 'vitest run' }),
+        'packages/pkg/package.json': pkgNamed('@acme/pkg', workspace),
+      });
+      baseSha = freeze(dir, files({ test: 'vitest run' }));
+      candidate(dir, files({ test: 'exit 0' }));
+
+      const resolution = resolve(dir, baseSha);
+
+      expect(resolution.status).toBe('resolved');
+      expect(notes(resolution)).not.toContain('packages/pkg/package.json');
+    });
+  });
+
   describe('the install lifecycle — npm 11’s full set (F2)', () => {
     for (const hook of ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare']) {
       it(`pins the lifecycle hook the install step runs: ${hook}`, () => {
@@ -823,6 +972,25 @@ describe('check-commands — the command policy resolver', () => {
 
       expect(resolution.status).toBe('resolved');
       expect(notes(resolution)).not.toContain('could not be read');
+    });
+
+    it('an ENOBUFS on the workspace manifest behind a delegation is could-not-run, never a silent unpinned note', () => {
+      baseSha = freeze(dir, {
+        '.ai/agentic.config.json': config(['npm run test:unit']),
+        'package.json': workspaceRoot({ 'test:unit': 'npm run test:unit -w @acme/pkg' }),
+        'packages/pkg/package.json': pkgNamed('@acme/pkg', { 'test:unit': 'vitest run' }),
+      });
+      const restore = failRead('packages/pkg/package.json', 'ENOBUFS', 0);
+      try {
+        const resolution = resolve(dir, baseSha);
+
+        expect(resolution.status).toBe('could-not-run');
+        expect(resolution.reason).toBe('unreadable-source');
+        expect(commands(resolution)).toEqual([]);
+        expect(notes(resolution)).toContain('ENOBUFS');
+      } finally {
+        restore();
+      }
     });
   });
 
