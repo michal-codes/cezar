@@ -301,6 +301,40 @@ posix('materialization', () => {
     expect(reversed.headSha).not.toBe(result.headSha);
   });
 
+  it('materializes the same subject to the SAME commit on a later run — the digest binds that head', async () => {
+    const base = await git(root, 'rev-parse', 'HEAD');
+    await git(root, 'checkout', '-q', '-b', 'feat/same', base);
+    const sha = await commit('same.txt', 'same\n', 'same');
+    await git(root, 'checkout', '-q', 'main');
+
+    const firstWorktree = await scratchAt(base);
+    const first = await materializeLandingSubject({
+      worktreePath: firstWorktree,
+      baseSha: base,
+      sources: [{ ref: 'feat/same', sha }],
+      git: gitIn(firstWorktree),
+    });
+    expect(first.status).toBe('materialized');
+    if (first.status !== 'materialized') return;
+
+    // A second later, in another scratch worktree: the same subject. A merge commit carries its
+    // identity and its DATE, so without pinning, this HEAD would differ from the first — and the
+    // acknowledgement digest binds the materialized head, so a preview's digest could never match
+    // the run that acks it.
+    await nextSecond();
+    const secondWorktree = await scratchAt(base);
+    const second = await materializeLandingSubject({
+      worktreePath: secondWorktree,
+      baseSha: base,
+      sources: [{ ref: 'feat/same', sha }],
+      git: gitIn(secondWorktree),
+    });
+    expect(second.status).toBe('materialized');
+    if (second.status !== 'materialized') return;
+    expect(second.treeSha).toBe(first.treeSha);
+    expect(second.headSha).toBe(first.headSha);
+  }, 60_000);
+
   it('stops on a conflict, records the U-files, aborts the merge and runs NOTHING', async () => {
     const base = await git(root, 'rev-parse', 'HEAD');
     await commit('shared.txt', 'base\n', 'shared base');
@@ -424,12 +458,12 @@ posix('staleness', () => {
 
 describe('the verdict vocabulary: only an unbroken run of `passed` is green', () => {
   it('maps every seam outcome onto the record vocabulary with a reason for the non-green ones', () => {
-    expect(landingResultOf('passed', 0, 't')).toEqual({ outcome: 'passed' });
-    expect(landingResultOf('failed', 1, 't')).toEqual({ outcome: 'failed' });
-    expect(landingResultOf('timed-out', -1, 't')).toEqual({ outcome: 'could-not-run', reason: 'timeout' });
-    expect(landingResultOf('skipped', -1, 't')).toEqual({ outcome: 'could-not-run', reason: 'dry-run' });
-    expect(landingResultOf('cancelled', -1, 't')).toEqual({ outcome: 'could-not-run', reason: 'cancelled' });
-    expect(landingResultOf('could-not-run', -1, 't')).toEqual({ outcome: 'could-not-run', reason: 'unsupported-platform' });
+    expect(landingResultOf('passed')).toEqual({ outcome: 'passed' });
+    expect(landingResultOf('failed')).toEqual({ outcome: 'failed' });
+    expect(landingResultOf('timed-out')).toEqual({ outcome: 'could-not-run', reason: 'timeout' });
+    expect(landingResultOf('skipped')).toEqual({ outcome: 'could-not-run', reason: 'dry-run' });
+    expect(landingResultOf('cancelled')).toEqual({ outcome: 'could-not-run', reason: 'cancelled' });
+    expect(landingResultOf('could-not-run')).toEqual({ outcome: 'could-not-run', reason: 'unsupported-platform' });
   });
 
   it('is green only for an unbroken run of passed, and names the first non-green reason', () => {
@@ -518,6 +552,7 @@ describe('the acknowledgement digest', () => {
     baseSha: 'a'.repeat(40),
     sources: [{ ref: 'cez/child', sha: 'b'.repeat(40) }],
     treeSha: 'c'.repeat(40),
+    headSha: 'e'.repeat(40),
     commandsDigest: 'd'.repeat(64),
     installArgv: ['npm', 'install'],
   };
@@ -532,6 +567,7 @@ describe('the acknowledgement digest', () => {
       baseSha: input.baseSha,
       sources: [{ ref: 'cez/child', sha: 'b'.repeat(40) }],
       treeSha: input.treeSha,
+      headSha: input.headSha,
       commandsDigest: input.commandsDigest,
       installArgv: ['npm', 'install'],
     });
@@ -542,6 +578,7 @@ describe('the acknowledgement digest', () => {
     expect(moved({ baseRef: 'cez/other' })).not.toBe(first.digest);
     expect(moved({ baseSha: '1'.repeat(40) })).not.toBe(first.digest);
     expect(moved({ treeSha: '2'.repeat(40) })).not.toBe(first.digest);
+    expect(moved({ headSha: '6'.repeat(40) })).not.toBe(first.digest);
     expect(moved({ commandsDigest: '3'.repeat(64) })).not.toBe(first.digest);
     expect(moved({ sources: [{ ref: 'cez/child', sha: '4'.repeat(40) }] })).not.toBe(first.digest);
     expect(moved({ sources: [{ ref: 'cez/renamed', sha: input.sources[0]!.sha }] })).not.toBe(first.digest);

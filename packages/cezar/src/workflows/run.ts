@@ -115,19 +115,16 @@ import {
   type CheckOutcome,
   type CheckOutcomeStatus,
 } from './check-runner.ts';
-import { resolveCheckCommands, type CheckCommandResolution } from './check-commands.ts';
+import { resolveCheckCommands } from './check-commands.ts';
 import {
   detectForeignSubject,
   deriveLandingCandidates,
   gitIn,
-  landingCheckStale,
   landingResultOf,
   landingSubjectDigest,
   materializeLandingSubject,
   verdictFromResults,
-  type LandingCandidateSet,
   type LandingResultEntry,
-  type LandingSource,
   type LandingVerdict,
 } from './landing-check.ts';
 import { buildCheckEnv } from '../core/agent-env.ts';
@@ -558,6 +555,15 @@ const NO_HOLDS: AccountHolds = { deadline: new Set(), inFlight: new Set() };
 const LANDING_CHECK_WORKFLOW = 'landing-check';
 /** The install step's id: always first, always the same id, so retries and the UI agree. */
 const INSTALL_STEP_ID = 'install';
+/**
+ * What every landing check says on its own transcript before the gate runs: it executes
+ * repository-authored shell with the operator's identity, in a scratch worktree, and the reduced
+ * environment withholds ambient credentials — nothing else (spec §Verdict, §Trust model). A check
+ * that never runs a command (a conflict, a preview, a refused plan) does not claim it.
+ */
+export const LANDING_NOT_A_SANDBOX_NOTE =
+  "not a sandbox — this gate runs this repository's own commands as you, in a scratch worktree; " +
+  'the reduced environment withholds ambient credentials and nothing else';
 /** The event sink one step receives — the shape every `emit` in this module already has. */
 type RunEventEmit = (event: { type: string; stepId?: string; [k: string]: unknown }) => void;
 
@@ -2498,6 +2504,7 @@ export class RunManager {
       baseSha: subject.baseSha,
       sources,
       treeSha,
+      headSha: materialized.headSha,
       commandsDigest: resolution.digest,
       ...(installArgv ? { installArgv } : {}),
     }).digest;
@@ -2583,6 +2590,38 @@ export class RunManager {
   }
 
   /**
+   * A landing check that resumes after materialization — `subject.treeSha` is set and no verdict
+   * was ever written, so `prepareLandingCheck` (the only place that ever built the
+   * `state.landingCheckRun` recorder) was skipped. Left alone, the re-run walks the gate steps with
+   * nothing recording the outcomes and settles `done` with `verdict: undefined` (the #1167 review's
+   * probe 3). Two things are owed here:
+   *
+   *  - the recorder, re-initialised before the gate loop, so THIS attempt re-records its own
+   *    results. The interrupted attempt's entries are REPLACED, never appended to: one `results`
+   *    list describes one pass, and a merged list would fold two attempts' outcomes into one
+   *    verdict.
+   *  - the SUBJECT, still in the worktree. A worktree that no longer holds it (deleted by hand, or
+   *    reclaimed) would be re-created at the frozen base, and a gate passing on the base ALONE
+   *    would be recorded as a green verdict about a subject that was never checked. That lie is
+   *    what this refusal exists to make impossible — nothing runs.
+   *
+   * Returns the run error for the one outcome that is not runnable, or undefined when the gate may
+   * run.
+   */
+  private async resumeMaterializedLandingCheck(
+    runId: string,
+    subjectTreeSha: string,
+    state: ActiveRun,
+  ): Promise<string | undefined> {
+    state.landingCheckRun = { results: [] };
+    const worktree = this.store.getRun(runId)?.worktreePath;
+    const tree = worktree ? await gitIn(worktree)(['rev-parse', 'HEAD^{tree}']) : undefined;
+    if (tree?.ok && tree.stdout.trim() === subjectTreeSha) return undefined;
+    this.recordLandingVerdict(runId, { verdict: 'could-not-run', reason: 'worktree-lost' });
+    return 'landing check could not run — the check worktree no longer holds the materialized subject (worktree-lost); no command was run';
+  }
+
+  /**
    * The install step, executed FIRST under the same timeout, gate-deadline and process-group kill
    * rules as every gate command (`check-runner.ts`), and recorded with its own argv and exit code.
    * A failed install means the gate commands cannot run at all — `could-not-run`, never green.
@@ -2652,7 +2691,7 @@ export class RunManager {
     const state = this.active.get(runId);
     const check = this.store.getRun(runId)?.landingCheck;
     if (!state?.landingCheckRun || !check) return;
-    const mapped = landingResultOf(outcome.status, outcome.exitCode, startedAt);
+    const mapped = landingResultOf(outcome.status);
     const entry: LandingResultEntry = {
       command,
       exitCode: outcome.exitCode,
@@ -2726,7 +2765,10 @@ export class RunManager {
         ? undefined
         : decided.verdict === 'failed'
           ? decided.reason
-          : (carried ?? decided.reason ?? 'cancelled');
+          : // Nothing recorded at all means no command ever reported — name THAT, rather than a
+            // cancellation that never happened (a carried `cancelled` is a seam outcome, and the
+            // seam only ever reports it through a result entry).
+            (carried ?? decided.reason ?? (recorded.length === 0 ? 'no-results' : 'cancelled'));
     this.recordLandingVerdict(runId, { verdict: decided.verdict, ...(reason ? { reason } : {}) });
   }
 
@@ -4707,7 +4749,8 @@ export class RunManager {
     // resolved from the frozen base, and where the install step runs — all before the workflow's
     // first command. A non-green outcome sets `runError`, so the ordinary settlement below
     // records it `failed`; a green gate settles `done` like any other run.
-    if (this.store.getRun(runId)?.landingCheck?.subject.treeSha === undefined && this.store.getRun(runId)?.landingCheck) {
+    const landingCheck = this.store.getRun(runId)?.landingCheck;
+    if (landingCheck && landingCheck.subject.treeSha === undefined) {
       const prepared = await this.prepareLandingCheck(runId, state, emit);
       if (state.cancelled) {
         this.dropActive(runId, state);
@@ -4715,6 +4758,21 @@ export class RunManager {
       }
       if (prepared.workflow) workflow = prepared.workflow;
       if (prepared.error) runError = prepared.error;
+    } else if (landingCheck && landingCheck.verdict === undefined && landingCheck.subject.treeSha !== undefined) {
+      const resumed = await this.resumeMaterializedLandingCheck(runId, landingCheck.subject.treeSha, state);
+      if (resumed) {
+        // Nothing may run: the gate steps are on the record from the interrupted attempt, and
+        // walking them would execute repository code against a worktree that is not the subject.
+        runError = resumed;
+        workflow = { name: LANDING_CHECK_WORKFLOW, source: 'built-in', steps: [] };
+      }
+    }
+    // The gate is about to execute repository-authored shell as the operator (spec §Verdict,
+    // §Trust model): say so once, on the check run's own transcript. A run whose verdict is
+    // already recorded ran nothing and does not claim otherwise.
+    const gateCheck = this.store.getRun(runId)?.landingCheck;
+    if (gateCheck && gateCheck.verdict === undefined) {
+      emit({ type: 'note', message: LANDING_NOT_A_SANDBOX_NOTE });
     }
 
     let i = 0;
@@ -4874,8 +4932,22 @@ export class RunManager {
     state.askPark = undefined;
 
     // The landing check's verdict, if this run is one and nothing settled it yet: an unbroken run
-    // of `passed` commands is the only green outcome, and everything else records why.
-    if (state.landingCheckRun) this.finalizeLandingCheck(runId);
+    // of `passed` commands is the only green outcome, and everything else records why. EVERY
+    // landing check reaching this line finalises, with the recorder built right here when the
+    // paths above did not build one — "a check never settles without a verdict" must not rest on a
+    // single construction site (AGENTS.md § grep the TYPE, not the field).
+    const landingRecord = this.store.getRun(runId)?.landingCheck;
+    if (landingRecord) {
+      state.landingCheckRun ??= { results: [] };
+      this.finalizeLandingCheck(runId);
+      // A verdict that is not `passed` is not a green run: the gate's own failure sets `runError`
+      // on its own, but a check that reached the end of the loop without ever running a command
+      // would otherwise settle `done` over a `could-not-run` verdict.
+      const settled = this.store.getRun(runId)?.landingCheck;
+      if (!runError && settled?.verdict !== undefined && settled.verdict !== 'passed') {
+        runError = `landing check ${settled.verdict}${settled.reason ? ` — ${settled.reason}` : ''}`;
+      }
+    }
 
     // Final autosave: the branch always ends holding the finished state.
     this.clearAutosaveTimer(state);
