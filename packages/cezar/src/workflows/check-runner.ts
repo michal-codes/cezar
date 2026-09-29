@@ -247,6 +247,7 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
     let cancelled = false;
     let killTimer: NodeJS.Timeout | undefined;
     let limitTimer: NodeJS.Timeout | undefined;
+    let releaseTimer: NodeJS.Timeout | undefined;
 
     const child = spawn(shell, ['--noprofile', '--norc', '-c', options.command], {
       cwd: options.cwd,
@@ -290,8 +291,25 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
       killTimer.unref?.();
     };
 
+    /**
+     * Drop the read ends of the child's pipes.
+     *
+     * `close` fires only once the leader has exited AND every stdio stream has
+     * closed. A grandchild that left the process group (`setsid`/`detached`)
+     * and inherited stdio holds those pipes — and the group signals in
+     * `terminateGroup` cannot reach it, so the group looks empty, no SIGKILL is
+     * armed and the promise would never settle (review probe: `settled=false`
+     * after 5 s). Destroying the streams we hold is the one close that is always
+     * within our reach.
+     */
+    const releaseStdio = (): void => {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    };
+
     const cleanup = (): void => {
       if (limitTimer) clearTimeout(limitTimer);
+      if (releaseTimer) clearTimeout(releaseTimer);
       // The SIGKILL escalation is the only promise still owed to a process group
       // that outlived its leader: drop it only once the group is VERIFIABLY
       // empty. Clearing it here unconditionally is what let a SIGTERM-ignoring
@@ -350,13 +368,8 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
       settle('could-not-run', -1, `could not run: failed to spawn: ${err.message}`);
     });
 
-    child.on('exit', () => {
-      // The leader is gone; anything still in its group is an orphan that would
-      // otherwise hold the pipes (and the tree) for as long as it likes.
-      terminateGroup();
-    });
-
-    child.on('close', (code, signal) => {
+    /** The one place an outcome is derived from the leader's exit status. */
+    const finish = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (timedOut) {
         settle('timed-out', -1, timeoutReason());
         return;
@@ -374,6 +387,26 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
         return;
       }
       settle(code === 0 ? 'passed' : 'failed', code);
+    };
+
+    child.on('exit', (code, signal) => {
+      // The leader is gone; anything still in its group is an orphan that would
+      // otherwise hold the pipes (and the tree) for as long as it likes.
+      terminateGroup();
+      // `close` normally follows within a tick. If a group-escaping grandchild
+      // holds the pipes, give the group kill its grace and then cut them — the
+      // leader's exit status is already known, so the outcome is its own either
+      // way. Deliberately NOT unref'd: this timer is the promise's last
+      // guarantee, and an unref'd timer may not run at all once nothing else
+      // holds the loop. `finish` is idempotent, so a 'close' that lands first
+      // simply wins.
+      if (settled || releaseTimer) return;
+      releaseTimer = setTimeout(() => {
+        releaseStdio();
+        finish(code, signal);
+      }, graceMs);
     });
+
+    child.on('close', finish);
   });
 }

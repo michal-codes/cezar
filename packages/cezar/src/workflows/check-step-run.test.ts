@@ -158,6 +158,68 @@ posix('check steps through the run loop', () => {
     expect(String(outputs[1]?.text)).toMatch(/whole-gate deadline/);
   }, 30_000);
 
+  it('does not loop back for a check the gate deadline has made unable to execute', async () => {
+    writeFileSync(configPath, JSON.stringify({ checkTimeoutMs: 60_000, checkGateTimeoutMs: 1_200 }));
+    const workflow: WorkflowDef = {
+      name: 'check-onfail-gate',
+      source: 'built-in',
+      steps: [
+        { id: 'check-1', name: 'Check 1', command: 'sleep 0.4' },
+        { id: 'check-2', name: 'Check 2', command: 'sleep 5', onFail: { retry: 'check-1', max: 2 } },
+      ],
+    };
+    const record = manager.startRun(workflow, { task: 'verify', worktree: false });
+    currentId = record.id;
+    await settle(record.id);
+
+    const final = store.getRun(record.id);
+    expect(final?.status).toBe('failed');
+    expect(final?.error).toMatch(/timed out/);
+    // `check-2` could not execute — the gate deadline expired while it ran — and
+    // looping back cannot change that: every retry re-runs the earlier step (an
+    // agent step in a real workflow) to launch a command that runs nothing. So
+    // each check is attempted exactly once, and no retry note is emitted at all.
+    expect(final?.steps.map(({ id, status }) => ({ id, status }))).toEqual([
+      { id: 'check-1', status: 'done' },
+      { id: 'check-2', status: 'failed' },
+    ]);
+    expect(
+      events(record.id)
+        .filter((e) => e.type === 'check-output')
+        .map((e) => e.stepId),
+    ).toEqual(['check-1', 'check-2']);
+    expect(
+      events(record.id).some((e) => e.type === 'note' && String(e.message).includes('check failed — retrying from')),
+    ).toBe(false);
+    // Not silent either: the skip is a note on the wire.
+    expect(events(record.id).some((e) => e.type === 'note' && String(e.message).includes('not retrying from'))).toBe(
+      true,
+    );
+  }, 30_000);
+
+  it('still loops back for a check that genuinely failed (the non-green guard)', async () => {
+    // The gate rule above must not swallow the ordinary `onFail` retry: an exit
+    // status the agent could act on keeps looping, `max` times.
+    const workflow: WorkflowDef = {
+      name: 'check-onfail-failing',
+      source: 'built-in',
+      steps: [{ id: 'check-1', name: 'Check 1', command: 'exit 3', onFail: { retry: 'check-1', max: 2 } }],
+    };
+    const record = manager.startRun(workflow, { task: 'verify', worktree: false });
+    currentId = record.id;
+    await settle(record.id);
+
+    const final = store.getRun(record.id);
+    expect(final?.status).toBe('failed');
+    expect(final?.steps.map(({ id, status }) => ({ id, status }))).toEqual([{ id: 'check-1', status: 'failed' }]);
+    expect(events(record.id).filter((e) => e.type === 'check-output' && e.stepId === 'check-1')).toHaveLength(3);
+    expect(
+      events(record.id).filter(
+        (e) => e.type === 'note' && String(e.message).includes('check failed — retrying from'),
+      ),
+    ).toHaveLength(2);
+  }, 30_000);
+
   it('is dry-run aware by DEFAULT: `checkTimeoutMs` and `checkGateTimeoutMs` are the documented defaults', async () => {
     const config = await loadConfig(repoRoot);
     expect(config.checkTimeoutMs).toBe(20 * 60_000);
