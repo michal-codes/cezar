@@ -39,6 +39,7 @@ function serve(resources: Partial<WorkspaceConfigResponse['resources']> = {}) {
     resources: {
       maxParallel: 2,
       maxMonitoringSessions: 2,
+      idleTimeoutMinutes: 15,
       monitoringWakeIntervalMinutes: null,
       autoResumeOnUsageLimit: true,
       memoryLimitMb: null,
@@ -91,13 +92,14 @@ function renderResources() {
 }
 
 const parallelSelect = () =>
-  document.querySelector<HTMLSelectElement>('[data-slot="resources-max-parallel"]')
+  document.querySelector<HTMLInputElement>('[data-slot="resources-max-parallel"]')
 const memoryInput = () =>
   document.querySelector<HTMLInputElement>('[data-slot="resources-memory-limit"]')
 const saveMemory = () =>
   document.querySelector<HTMLButtonElement>('[data-action="resources-save-memory"]')
 const puts = () => requests.filter((r) => r.method === 'PUT' && r.url === '/api/v1/workspace/config')
-const monitoringSelect = () => document.querySelector<HTMLSelectElement>('[data-slot="resources-max-monitoring"]')
+const monitoringSelect = () => document.querySelector<HTMLInputElement>('[data-slot="resources-max-monitoring"]')
+const idleTimeout = () => document.querySelector<HTMLInputElement>('[data-slot="resources-idle-timeout"]')
 const dispatchInput = () =>
   document.querySelector<HTMLInputElement>('[data-slot="resources-dispatch-max-concurrent"]')
 const saveDispatch = () =>
@@ -130,6 +132,7 @@ describe('Global settings → Resources', () => {
     await waitFor(() => expect(parallelSelect()).not.toBeNull())
 
     fireEvent.change(parallelSelect()!, { target: { value: '6' } })
+    fireEvent.keyDown(parallelSelect()!, { key: 'Enter' })
 
     await waitFor(() => expect(puts()).toHaveLength(1))
     expect(puts()[0]?.body).toEqual({ resources: { maxParallel: 6 } })
@@ -151,8 +154,45 @@ describe('Global settings → Resources', () => {
     await waitFor(() => expect(monitoringSelect()).not.toBeNull())
     expect(screen.getByText(/Capacity: 4 active \+ 2 monitoring/)).not.toBeNull()
     fireEvent.change(monitoringSelect()!, { target: { value: '3' } })
+    fireEvent.blur(monitoringSelect()!)
     await waitFor(() => expect(puts()).toHaveLength(1))
     expect(puts()[0]?.body).toEqual({ resources: { maxMonitoringSessions: 3 } })
+  })
+
+  it('saves the waiting-session idle timeout and allows disabling it', async () => {
+    serve({ idleTimeoutMinutes: 15 })
+    renderResources()
+    await waitFor(() => expect(idleTimeout()).not.toBeNull())
+    expect(idleTimeout()!.value).toBe('15')
+    fireEvent.change(idleTimeout()!, { target: { value: '0' } })
+    fireEvent.blur(idleTimeout()!)
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { idleTimeoutMinutes: 0 } })
+  })
+
+  it('is a typed integer field with arrows, not a dropdown — stepping saves once', async () => {
+    serve({ maxParallel: 2, maxMonitoringSessions: 2 })
+    renderResources()
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+    expect(parallelSelect()!.tagName).toBe('INPUT')
+    expect(monitoringSelect()!.tagName).toBe('INPUT')
+
+    const increase = screen.getByRole('button', { name: 'Increase Max parallel tasks' })
+    fireEvent.click(increase)
+    fireEvent.click(increase)
+    expect(parallelSelect()!.value).toBe('4')
+    await waitFor(() => expect(puts()).toHaveLength(1))
+    expect(puts()[0]?.body).toEqual({ resources: { maxParallel: 4 } })
+  })
+
+  it('refuses a limit outside the range the server accepts', async () => {
+    serve({ maxParallel: 2 })
+    renderResources()
+    await waitFor(() => expect(parallelSelect()).not.toBeNull())
+    fireEvent.change(parallelSelect()!, { target: { value: '40' } })
+    fireEvent.blur(parallelSelect()!)
+    expect(screen.getByText('Enter a whole number from 1 to 16.')).not.toBeNull()
+    expect(puts()).toHaveLength(0)
   })
 
   /**

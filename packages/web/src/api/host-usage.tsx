@@ -105,6 +105,12 @@ export interface HostUsageState {
   /** Client receipt stamp of the latest sample — the widget's `stale` clock. */
   lastFrameAt?: number
   history: HostUsagePoint[]
+  /**
+   * The hub REFUSED the `host` topic for this origin (`{"type":"error","topic":"host"}`, the ws
+   * upgrade guard's trust rule) rather than staying quiet. The card must say what happened and
+   * read the authenticated route instead of showing `sampling…` forever.
+   */
+  topicUnavailable?: boolean
 }
 
 export interface HostUsageStore {
@@ -113,6 +119,8 @@ export interface HostUsageStore {
    *  pushes, and a selector then only re-renders the component whose slice changed. */
   get(): HostUsageState
   push(sample: HostUsage, receivedAt: number, writer: HostUsageWriter): void
+  /** The hub refused this origin's `host` subscription - see `HostUsageState.topicUnavailable`. */
+  markTopicUnavailable(): void
   /** For tests: forget every sample and the writer, as a fresh mount would. */
   reset(): void
 }
@@ -158,7 +166,13 @@ export function createHostUsageStore(): HostUsageStore {
         !replay &&
         lastPoint !== undefined &&
         Date.parse(sample.sampledAt) - Date.parse(lastPoint.sampledAt) > HOST_HISTORY_GAP_MS
-      const base = writerChanged || gap ? [] : previous.history
+      // The line belongs to the transport that can honestly draw one: a local cockpit receives a
+      // point every 2 s, while the route writer answers on mount and on a reconnect/visibility
+      // reconcile. Plotting those sparse points on a 2 s-scaled line (and announcing their count
+      // as seconds) would state a rate nobody measured, so remote keeps the instantaneous bar and
+      // no chart at all.
+      const charted = nextWriter !== 'route'
+      const base = writerChanged || gap || !charted ? [] : previous.history
       // The ring carries the EFFECTIVE percentage, the same number the card and the widget render:
       // a line of host-wide utilization under an effective core count is the scope mix the spec
       // forbids, and the two surfaces must never disagree about which series they are drawing.
@@ -167,13 +181,25 @@ export function createHostUsageStore(): HostUsageStore {
       // arriving sample legitimately starts the new line, a plain replay never doubles it.
       const lastKept = base[base.length - 1]
       const appendPoint =
-        effectiveCpuPct !== undefined && lastKept?.sampledAt !== sample.sampledAt
+        charted && effectiveCpuPct !== undefined && lastKept?.sampledAt !== sample.sampledAt
       const history = appendPoint
         ? [...base, { sampledAt: sample.sampledAt, receivedAt, cpuPct: effectiveCpuPct }].slice(
             -HOST_HISTORY_LENGTH,
           )
         : base
-      state = { latest: sample, lastFrameAt: receivedAt, history }
+      state = {
+        latest: sample,
+        lastFrameAt: receivedAt,
+        history,
+        // A refusal is a fact about the ORIGIN, not about one sample: the route-fallback pushes
+        // (the very path the refusal switches on) must not clear it.
+        ...(previous.topicUnavailable === true ? { topicUnavailable: true } : {}),
+      }
+      for (const listener of listeners) listener()
+    },
+    markTopicUnavailable() {
+      if (state.topicUnavailable === true) return
+      state = { ...state, topicUnavailable: true }
       for (const listener of listeners) listener()
     },
     reset() {
@@ -246,6 +272,48 @@ export function useHostLastFrameAt(): number | undefined {
   )
 }
 
+/**
+ * Whether this cockpit's `host` subscription was REFUSED by the hub (trust rule, not a quiet
+ * socket). The card uses it to stop claiming `live` and to explain the fallback.
+ */
+export function useHostTopicUnavailable(): boolean {
+  const store = useContext(HostUsageContext)
+  return useSyncExternalStore(
+    store ? store.subscribe : noopSubscribe,
+    () => store?.get().topicUnavailable === true,
+    () => false,
+  )
+}
+
+/**
+ * The age of the MEASUREMENT, ticking once every second while a reader is mounted.
+ *
+ * `sampledAt` is the server's own stamp for the sample, so an answer served from the sampler's
+ * small cache cannot read as fresher than it is - and the ticking clock is what keeps a cockpit
+ * that stopped receiving anything (a dead socket, a stalled route read, a server that went away)
+ * counting up instead of freezing at its last fresh-looking value. The receipt stamp is the
+ * fallback when the server stamp is unreadable, and a slightly ahead server clock clamps at zero.
+ * This is NOT the widget's `stale` clock, which stays receipt-based on purpose: staleness means
+ * "nothing is arriving", and that must not depend on the server's clock.
+ */
+export function useHostSampleAgeSeconds(): number | undefined {
+  const sample = useHostUsage()
+  const lastFrameAt = useHostLastFrameAt()
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1_000)
+    return () => clearInterval(timer)
+  }, [])
+
+  if (sample === undefined) return undefined
+  const sampledAtMs = Date.parse(sample.sampledAt)
+  if (!Number.isNaN(sampledAtMs)) return Math.max(0, Math.round((now - sampledAtMs) / 1_000))
+  return lastFrameAt === undefined
+    ? undefined
+    : Math.max(0, Math.round((now - lastFrameAt) / 1_000))
+}
+
 // ---- the writers -------------------------------------------------------------------------
 
 /**
@@ -259,10 +327,18 @@ function useHostFrames(writer: HostUsageWriter, enabled: boolean): void {
 
   useEffect(() => {
     if (!store || !enabled || transport !== 'local') return
-    return subscribeTopic('host', (data) => {
-      const parsed = hostUsageSchema.safeParse(data)
-      if (parsed.success) store.push(parsed.data, Date.now(), writer)
-    })
+    return subscribeTopic(
+      'host',
+      (data) => {
+        const parsed = hostUsageSchema.safeParse(data)
+        if (parsed.success) store.push(parsed.data, Date.now(), writer)
+      },
+      // A refused subscription answers with `{type:'error', topic:'host'}` and then silence. That
+      // is not `sampling…`: record it, so the card can name the reason and fall back to the
+      // authenticated route (a dev-server proxy whose page origin differs from the server's
+      // authority is the known case - the hub's trust rule is same-origin by design).
+      () => store.markTopicUnavailable(),
+    )
   }, [store, enabled, transport, writer])
 }
 
@@ -290,15 +366,21 @@ export function useHostUsageSubscription(options: { enabled?: boolean } = {}): v
  * store so the card and the widget read one shape in both transports.
  *
  * `staleTime` stays 0 so a remount or a visibility/reconnect reconcile always refreshes; the rate
- * is bounded by the card being on screen, not by a timer.
+ * is bounded by the card being on screen, not by a timer. It has to be set EXPLICITLY: the
+ * workspace default is five minutes, and a remount inside that window would render a
+ * five-minute-old sample as `updated 0 s ago` while the effect below never fetched again.
  */
 export function useHostUsageRoute() {
   const store = useContext(HostUsageContext)
   const transport = useHostTransport()
+  const topicUnavailable = useHostTopicUnavailable()
   const query = useQuery({
     queryKey: workspaceQueryKeys.hostUsage,
     queryFn: ({ signal }) => readWorkspaceHostUsage(signal),
-    enabled: transport === 'remote',
+    // Remote cockpits read the route by design; a LOCAL cockpit whose `host` topic the hub refused
+    // falls back to the same authenticated same-origin read instead of an eternal `sampling…`.
+    enabled: transport === 'remote' || topicUnavailable,
+    staleTime: 0,
     retry: false,
   })
 

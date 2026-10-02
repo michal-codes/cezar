@@ -40,6 +40,12 @@ export interface EffectiveHostView {
   memIsEffective: boolean
   /** The host core count, for the labelled host-context line; absent without a container. */
   hostCpuCount?: number
+  /**
+   * The probe could not read this process's cgroup at all, so the host figures below are NOT known
+   * to be the process's capacity (review MAJOR). Distinct from "read fine, no limit": the card
+   * must say "no cgroup information available", never "no limit detected".
+   */
+  cgroupUnknown: boolean
 }
 
 export function effectiveHostView(sample: HostUsage): EffectiveHostView {
@@ -55,6 +61,7 @@ export function effectiveHostView(sample: HostUsage): EffectiveHostView {
       memTotalBytes: sample.memTotalBytes,
       ...(sample.memUsedBytes === undefined ? {} : { memUsedBytes: sample.memUsedBytes }),
       memIsEffective: false,
+      cgroupUnknown: sample.cgroupProbe === 'unavailable',
     }
   }
 
@@ -94,6 +101,7 @@ export function effectiveHostView(sample: HostUsage): EffectiveHostView {
     ...(memUsedBytes === undefined ? {} : { memUsedBytes }),
     memIsEffective: memLimited,
     ...(sample.hostCpuCount === undefined ? {} : { hostCpuCount: sample.hostCpuCount }),
+    cgroupUnknown: sample.cgroupProbe === 'unavailable',
   }
 }
 

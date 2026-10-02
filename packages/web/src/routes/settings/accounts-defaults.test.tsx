@@ -62,6 +62,7 @@ const PROVIDERS = {
     { provider: 'claude', status: 'connected', enabled: true },
     { provider: 'codex', status: 'connected', enabled: true },
     { provider: 'opencode', status: 'connected', enabled: true },
+    { provider: 'cursor', status: 'connected', enabled: true },
     { provider: 'pi', status: 'connected', enabled: true },
   ],
 }
@@ -88,6 +89,7 @@ function serve({
     resources: {
       maxParallel: 2,
       maxMonitoringSessions: 2,
+      idleTimeoutMinutes: 15,
       monitoringWakeIntervalMinutes: null,
       autoResumeOnUsageLimit: true,
       memoryLimitMb: null,
@@ -129,7 +131,10 @@ function serve({
       // (it renders "Checking…") and keeps this file about the defaults block.
       if (url === '/api/v1/health' && method === 'GET') return json({ checks: [], bootProject: 'boot' })
       if (url.startsWith('/api/v1/open-targets')) return json({ targets: [] })
-      if (url === '/api/v1/models?runner=codex') return json({ models: [] })
+      if (url.startsWith('/api/v1/models?runner=')) {
+        const runner = url.includes('cursor') ? 'cursor' : 'codex'
+        return json({ runner, models: [], source: 'unavailable', stale: false })
+      }
       return new Promise<never>(() => {})
     }),
   )
@@ -219,7 +224,7 @@ describe('Agent accounts → Defaults for new projects', () => {
     )
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     // The built-in fallback, rendered rather than thrown.
     expect(rowFor('claude', '')?.getAttribute('aria-checked')).toBe('true')
   })
@@ -228,9 +233,9 @@ describe('Agent accounts → Defaults for new projects', () => {
     serve()
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     expect(rows().map((r) => r.getAttribute('data-value'))).toEqual([
-      'claude', 'claude', 'codex', 'opencode', 'pi',
+      'claude', 'claude', 'codex', 'opencode', 'cursor', 'pi',
     ])
     expect(rows()[1]?.textContent).toContain('~/.claude-klaudiusz')
   })
@@ -239,7 +244,7 @@ describe('Agent accounts → Defaults for new projects', () => {
     serve()
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     expect(rowFor('claude', '')?.getAttribute('aria-checked')).toBe('true')
   })
 
@@ -247,7 +252,7 @@ describe('Agent accounts → Defaults for new projects', () => {
     serve()
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     fireEvent.click(rowFor('codex')!)
 
     await waitFor(() => expect(configPuts()).toHaveLength(1))
@@ -261,7 +266,7 @@ describe('Agent accounts → Defaults for new projects', () => {
     serve()
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     fireEvent.click(rowFor('claude', 'klaudiusz')!)
 
     await waitFor(() => expect(selections()).toHaveLength(1))
@@ -288,7 +293,7 @@ describe('Agent accounts → Defaults for new projects', () => {
     serve({ accounts: { ...ACCOUNTS, defaults: { claude: 'klaudiusz' } } })
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     fireEvent.click(rowFor('claude', '')!)
 
     await waitFor(() => expect(selections()).toHaveLength(1))
@@ -320,7 +325,7 @@ describe('Agent accounts → Defaults for new projects', () => {
     serve()
     renderAccounts()
 
-    await waitFor(() => expect(rows()).toHaveLength(5))
+    await waitFor(() => expect(rows()).toHaveLength(6))
     const pane = defaults()
     expect(pane?.textContent).toContain('has not chosen for itself')
     expect(pane?.textContent).toContain('keeps its own')

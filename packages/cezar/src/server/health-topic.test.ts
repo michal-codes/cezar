@@ -28,6 +28,7 @@ function stubHub() {
     registerTopic: (name, publisher) => {
       registrations.push(name);
       topics.set(name, publisher);
+      return () => { topics.delete(name); };
     },
     attach: () => undefined,
     close: () => undefined,

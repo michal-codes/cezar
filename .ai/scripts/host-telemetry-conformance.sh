@@ -37,7 +37,8 @@ import { createCgroupProbe } from "./packages/cezar/src/core/cgroup-probe.ts";
   await new Promise((resolve) => setTimeout(resolve, 250));
   const second = sampler.sampleHostUsage();
   console.log(JSON.stringify({ facts: facts ?? null, container: second.container ?? null,
-    hostCpuCount: second.hostCpuCount ?? null, firstSampleHadCpu: first.cpuPct !== undefined,
+    hostCpuCount: second.hostCpuCount ?? null, cgroupProbe: second.cgroupProbe ?? null,
+    firstSampleHadCpu: first.cpuPct !== undefined,
     secondSampleHadCpu: second.cpuPct !== undefined }, null, 2));
 })();
 '
@@ -93,7 +94,22 @@ fi
 run_in_container "cgroupns - docker --cgroupns=host --cpus=2" \
   --cgroupns=host --cpus=2 -v "$REPO_ROOT":/app:ro -w /app
 
+# The two rows the first review of this asset asked for (they pin the cases the dev host cannot
+# show): a cpuset pin read through the namespace-host layout, and a process whose cgroup files are
+# not visible AT ALL - which must say "unavailable" rather than claim an unconstrained host.
+if [ -n "$cpuset_core" ]; then
+  run_in_container "cpuset-ancestor - docker --cgroupns=host --cpuset-cpus=$cpuset_core" \
+    --cgroupns=host --cpuset-cpus="$cpuset_core" -v "$REPO_ROOT":/app:ro -w /app
+else
+  log "SKIP cpuset-ancestor: the docker daemon accepts none of this shell's cores"
+fi
+
+run_in_container "unreadable - docker --tmpfs /sys/fs/cgroup (no cgroup files visible)" \
+  --tmpfs /sys/fs/cgroup -v "$REPO_ROOT":/app:ro -w /app
+
 log ""
 log "Expected: host => container null; cpus => cpuQuotaCores 2 + memLimitBytes;"
 log "          cpuset => cpuAffinityCores 1 with no quota (cpu.max stays max);"
-log "          cgroupns => the same quota as cpus, read from the owned scope."
+log "          cgroupns => the same quota as cpus, read from the owned scope;"
+log "          cpuset-ancestor => cpuAffinityCores 1 through the namespace-host layout;"
+log "          unreadable => cgroupProbe 'unavailable' and NO container key."

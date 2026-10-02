@@ -106,6 +106,32 @@ describe('host sampler', () => {
     sampler.dispose();
   });
 
+  it('never fabricates a cpuPct from the hub\u2019s start-then-snapshot order (review BLOCKER)', () => {
+    // The hub registers `start(onHostUsage)` and `snapshot(sampleHostUsage)` and calls them back to
+    // back, so the 0\u21921 prime and the snapshot's own `os.cpus()` read are milliseconds apart. A
+    // single CPU tick inside that window used to compute 50 % or 100 % - the red bar on a card that
+    // is supposed to show `sampling\u2026`. A minimum window makes the order irrelevant.
+    const probe = cpuTimesProbe();
+    const sampler = createHostSampler({ cpuTimes: probe.source, readMeminfo: () => undefined, now });
+
+    const stop = sampler.onHostUsage(() => {});
+    try {
+      // One CPU tick lands inside the millisecond window - the worst case.
+      probe.advance({ busy: 10 });
+      expect(sampler.sampleHostUsage().cpuPct).toBeUndefined();
+      // …and it stays absent on a second immediate read for the same reason.
+      expect(sampler.sampleHostUsage().cpuPct).toBeUndefined();
+      // A REAL interval later the delta is honest again.
+      nowMs += HOST_SAMPLE_INTERVAL_MS;
+      probe.advance({ busy: 1_000 });
+      // A full interval, all of it busy in the synthetic counter: 1000 / 1000 = 100 %.
+      expect(sampler.sampleHostUsage().cpuPct).toBe(100);
+    } finally {
+      stop();
+    }
+    sampler.dispose();
+  });
+
   it('returns the cached sample while it is fresh and carries cpuPct', () => {
     const probe = cpuTimesProbe();
     const sampler = createHostSampler({ cpuTimes: probe.source, readMeminfo: () => undefined, now });
@@ -257,5 +283,38 @@ describe('host sampler', () => {
 
   it('keeps the stale bound at three sampling intervals', () => {
     expect(HOST_SAMPLE_STALE_MS).toBe(3 * HOST_SAMPLE_INTERVAL_MS);
+  });
+
+  it('survives a throwing tick: the interval keeps going and the next read publishes', () => {
+    vi.useFakeTimers();
+    const probe = cpuTimesProbe();
+    let calls = 0;
+    const sampler = createHostSampler({
+      cpuTimes: () => {
+        calls += 1;
+        // The prime (1) is fine; the first timer tick (2) throws - a /proc file that vanished
+        // mid-read, a probe that hiccuped. Before the fix that exception escaped the timer
+        // callback and took the whole cockpit down.
+        if (calls === 2) throw new Error('boom');
+        return probe.source();
+      },
+      readMeminfo: () => undefined,
+      now: () => Date.now(),
+    });
+    const listener = vi.fn();
+    const stop = sampler.onHostUsage(listener);
+
+    probe.advance({ idle: 600, busy: 400 });
+    expect(() => vi.advanceTimersByTime(HOST_SAMPLE_INTERVAL_MS)).not.toThrow();
+    expect(listener).not.toHaveBeenCalled();
+
+    // The next tick re-reads and publishes a real delta (two intervals of 40 % busy).
+    probe.advance({ idle: 600, busy: 400 });
+    vi.advanceTimersByTime(HOST_SAMPLE_INTERVAL_MS);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener.mock.calls[0]?.[0]).toMatchObject({ cpuPct: 40 });
+
+    stop();
+    sampler.dispose();
   });
 });

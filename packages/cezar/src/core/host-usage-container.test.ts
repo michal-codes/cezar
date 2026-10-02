@@ -274,6 +274,22 @@ describe('the sampler with a cgroup probe', () => {
       cgroupProbe: () => undefined,
       now: () => 1_000,
     });
-    expect('container' in sampler.sampleHostUsage()).toBe(false);
+    const sample = sampler.sampleHostUsage();
+    expect('container' in sample).toBe(false);
+    // "Could not read" is NOT "read and found no limit" (spec review MAJOR): the payload says so,
+    // so a consumer never derives a capacity ceiling from an absence it cannot interpret.
+    expect(sample.cgroupProbe).toBe('unavailable');
+    expect(hostUsageSchema.safeParse(sample).success).toBe(true);
+  });
+
+  it('distinguishes "unreadable" from "unconstrained" in the composition itself', () => {
+    const base = { cpuCount: CPU_COUNT, hostCpuCount: HOST_CORES, memTotalBytes: HOST_MEMORY, now: 1_000 };
+    // The probe could not read anything at all -> an explicit "unknown".
+    expect(composeHostContainer({ ...base, facts: undefined })).toEqual({
+      cgroupProbe: 'unavailable',
+    });
+    // The probe read fine and found no finite limit -> nothing at all, the byte-identical v1
+    // payload every plain host has always shipped.
+    expect(composeHostContainer({ ...base, facts: facts({ memUsedBytes: 1024 }) })).toEqual({});
   });
 });

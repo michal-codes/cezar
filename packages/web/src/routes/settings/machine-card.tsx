@@ -1,6 +1,7 @@
 import {
   useHostHistory,
-  useHostLastFrameAt,
+  useHostSampleAgeSeconds,
+  useHostTopicUnavailable,
   useHostTransport,
   useHostUsage,
   useHostUsageRoute,
@@ -23,10 +24,13 @@ import { cn } from '@/lib/utils'
  * `GET /api/v1/workspace/host-usage` and folds each answer (with its one warm-up read) into the
  * store, and the header says `last known`.
  *
- * The 60 s sparkline and the receipt stamp now live in the per-app store rather than in component
- * state, so the sidebar widget and this card draw the same line and the same age. Values are read
- * through `effectiveHostView`, the one place that decides which number is effective: a limit whose
- * value is missing shows `—`, never the host figure.
+ * The 60 s sparkline lives in the per-app store rather than in component state, so the sidebar
+ * widget and this card draw the same line - local-only, because a remote cockpit's sparse route
+ * answers cannot honestly be plotted on a 2 s-scaled line. The age line ticks every second and is
+ * the age of the sample's own `sampledAt`, so a cockpit that has stopped receiving data counts up
+ * instead of freezing at a fresh-looking value. Values are read through `effectiveHostView`, the
+ * one place that decides which number is effective: a limit whose value is missing shows `—`,
+ * never the host figure.
  *
  * One more muted line reads the dispatch governor's snapshot off the same sample (spec
  * `.ai/specs/2026-09-20-adaptive-admission-governor.md`): the ceiling the admission gate enforces
@@ -47,18 +51,18 @@ const clampPct = (value: number): number => Math.min(100, Math.max(0, value))
 export function MachineCard() {
   useHostUsageSubscription({ enabled: !useIsDesktop() })
   const transport = useHostTransport()
+  const topicUnavailable = useHostTopicUnavailable()
   const { isError } = useHostUsageRoute()
   const sample = useHostUsage()
   const history = useHostHistory()
-  const lastFrameAt = useHostLastFrameAt()
+  const ageSeconds = useHostSampleAgeSeconds()
 
   const view = sample === undefined ? undefined : effectiveHostView(sample)
   const cpuPct = view?.cpuPct
   const local = transport === 'local'
-  const ageSeconds =
-    lastFrameAt === undefined
-      ? undefined
-      : Math.max(0, Math.round((Date.now() - lastFrameAt) / 1000))
+  // `live` is the transport AND the hub's answer: a refused `host` subscription is not live, it is
+  // a fallback route read, and the header has to say so.
+  const live = local && !topicUnavailable
   const memTotal = view?.memTotalBytes ?? 0
   const usedPct =
     view?.memUsedBytes !== undefined && memTotal > 0
@@ -116,12 +120,12 @@ export function MachineCard() {
       className="rounded-xl border border-border bg-card/60 p-4"
     >
       <header className="flex min-w-0 items-center gap-2">
-        <StatusDot tone={local ? 'success' : 'neutral'} pulse={local} />
+        <StatusDot tone={live ? 'success' : 'neutral'} pulse={live} />
         <h2 id="machine-card-title" className="text-sm font-semibold">
           Machine
         </h2>
         <span data-slot="machine-card-mode" className="text-[11px] text-soft-foreground">
-          {local ? 'live' : 'last known'}
+          {live ? 'live' : 'last known'}
         </span>
         <span
           data-slot="machine-card-freshness"
@@ -137,6 +141,12 @@ export function MachineCard() {
         </p>
       ) : null}
 
+      {topicUnavailable ? (
+        <p data-slot="machine-card-transport" className="mt-2 text-[11.5px] text-soft-foreground">
+          Live updates unavailable - the server refused this origin's host topic, so the card reads
+          the authenticated route instead.
+        </p>
+      ) : null}
       {admissionText === undefined ? null : (
         <p data-slot="machine-card-admission" className="mt-2 text-[11.5px] text-soft-foreground">
           {admissionText}
@@ -179,7 +189,7 @@ export function MachineCard() {
                 viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`}
                 preserveAspectRatio="none"
                 role="img"
-                aria-label={`CPU over the last ${history.length * 2} seconds`}
+                aria-label={`CPU over the last up to ${history.length * 2} seconds`}
               >
                 <polyline
                   points={points}
@@ -215,7 +225,8 @@ export function MachineCard() {
               </div>
             </div>
 
-            {sample?.swapTotalBytes === undefined ? null : (
+            {typeof sample?.swapTotalBytes === 'number' &&
+            typeof sample?.swapUsedBytes === 'number' ? (
               <div
                 data-slot="machine-card-swap"
                 className="grid grid-cols-[86px_1fr] items-center gap-3"
@@ -225,7 +236,7 @@ export function MachineCard() {
                   {formatMem(sample.swapUsedBytes)} / {formatMem(sample.swapTotalBytes)}
                 </span>
               </div>
-            )}
+            ) : null}
 
             {sample?.loadAvg === undefined ? null : (
               <div
@@ -268,7 +279,9 @@ export function MachineCard() {
       >
         {view?.hasContainer === true
           ? 'Effective values come from this process\u2019s own cgroup; host totals are labelled.'
-          : 'Host totals - no cgroup limit detected for this process.'}
+          : view?.cgroupUnknown === true
+            ? 'No cgroup information available for this process - host totals only.'
+            : 'Host totals - no cgroup limit tighter than the host detected for this process.'}
       </p>
     </section>
   )

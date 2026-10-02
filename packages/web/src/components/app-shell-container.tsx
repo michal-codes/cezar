@@ -1,7 +1,7 @@
 import { memo, useMemo, type ReactNode } from 'react'
 import { useLocation } from 'react-router'
 
-import { useHealth, useProjectRuns, useProjects, useRuns, useSkillsUpdate, useTodos } from '@/api/queries'
+import { useHealth, useProjectRuns, useProjects, useRunsForProject, useSkillsUpdate, useStarCount, useTodos } from '@/api/queries'
 import type { HealthResponse, SkillsUpdateState } from '@open-mercato/cezar-api-client'
 import { AppShell, type RepoChip } from '@/components/app-shell'
 import { CommandPalette } from '@/components/command-palette'
@@ -58,6 +58,7 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
   const { pathname } = useLocation()
   const projectId = useActiveProjectId()
   const health = useHealth()
+  const starCount = useStarCount()
   // The global inbox is opt-in (#471). With the capability off there is no Inbox nav item to
   // badge and the endpoint can only answer [], so the query parks rather than polls.
   const inboxAvailable = health.data?.capabilities.followups === true
@@ -69,15 +70,17 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
   // mobile drawer, and grouped sidebar). Routes reuse this TanStack Query cache entry.
   const skillsUpdate = useSkillsUpdate(projectId ?? '', projectId !== null)
   const skillsUpdateAvailable = skillsUpdateMarkerOf(skillsUpdate.data)
-  // Unread done items (#unread-done-items) for the Tasks badge. Reads the same active-scope run
-  // list the sidebar quick-list and Tasks table already hold — one cache entry, no extra fetch.
-  const unreadDoneCountSelector = useMemo(() => unreadDoneCount, [])
-  const runs = useRuns(unreadDoneCountSelector)
   const registry = useProjects().data
   const titleContext = pageTitleContext(pathname)
   const bootProjectId = registry?.bootProject ?? health.data?.bootProject ?? null
+  // Unread done items (#unread-done-items) for the Tasks badge. This shell sits ABOVE the routed
+  // project provider, so name the URL project explicitly instead of reading the module scope.
+  const unreadDoneCountSelector = useMemo(() => unreadDoneCount, [])
+  const runs = useRunsForProject(projectId, bootProjectId, unreadDoneCountSelector)
   const isBootProject = projectId !== null && projectId === bootProjectId
   const activeProject = registry?.projects.find((project) => project.id === projectId)
+  const bootProject = registry?.projects.find((project) => project.id === bootProjectId)
+  const tracker = projectId === null ? bootProject?.tracker : activeProject?.tracker
   const titleRunId = titleContext.taskId
   const titleLabel = useProjectRuns(
     projectId ?? '',
@@ -158,6 +161,10 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
         repo={repo}
         version={health.data?.version ?? null}
         latestVersion={health.data?.latestVersion ?? null}
+        // The ⭐ ask's count. Same honesty rule as the chips above: `available: false` — offline,
+        // a rate-limited IP, or promos silenced with `CEZ_NO_BANNER=1` — is `null` here, and
+        // AppShell renders no chip for it rather than a button that cannot count.
+        starCount={starCount.data?.available ? (starCount.data.count ?? null) : null}
         // `?? null` rather than `?? 0`: no badge while the inbox is unknown, and no badge when it
         // is known to be empty — AppShell renders neither for a falsy count.
         inboxCount={todos.data?.length ?? null}
@@ -174,6 +181,7 @@ export const AppShellContainer = memo(function AppShellContainer({ children }: {
         inboxAvailable={inboxAvailable}
         // Hidden unless health reports the opt-in automations capability (#801).
         automationsAvailable={automationsAvailable}
+        tracker={tracker}
         banner={banner}
         singleProject={health.data?.capabilities.singleProject === true}
         taskQuickList={taskQuickList}
