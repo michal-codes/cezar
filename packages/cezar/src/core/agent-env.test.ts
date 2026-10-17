@@ -376,6 +376,8 @@ describe('buildCheckEnv — the minimal check env', () => {
     AWS_SECRET_ACCESS_KEY: 'aws-probe',
     GOOGLE_APPLICATION_CREDENTIALS: '/home/dev/gcp.json',
     CLOUD_ML_REGION: 'us-east5',
+    CLOUDSDK_AUTH_ACCESS_TOKEN: 'ya29-probe',
+    CLOUDSDK_CONFIG: '/home/dev/.config/gcloud',
     NPM_TOKEN: 'npm-probe',
     CEZ_CHECK_PROBE: 'cez-probe',
   };
@@ -394,6 +396,8 @@ describe('buildCheckEnv — the minimal check env', () => {
     expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
     expect(env.CLOUD_ML_REGION).toBeUndefined();
+    expect(env.CLOUDSDK_AUTH_ACCESS_TOKEN).toBeUndefined();
+    expect(env.CLOUDSDK_CONFIG).toBeUndefined();
     expect(env.NPM_TOKEN).toBeUndefined();
     expect(env.CEZ_CHECK_PROBE).toBeUndefined();
     // Not named, and the name patterns read `_AUTH_` as credential-shaped.
@@ -427,7 +431,7 @@ describe('buildCheckEnv — the minimal check env', () => {
     const env = buildCheckEnv({
       ...HOST,
       CEZ_ENV_PASSTHROUGH:
-        'GITHUB_TOKEN,GITHUB_ENTERPRISE_TOKEN,GH_DEBUG,ANTHROPIC_API_KEY,AWS_SECRET_ACCESS_KEY,GOOGLE_APPLICATION_CREDENTIALS,CLOUD_ML_REGION,CEZ_CHECK_PROBE',
+        'GITHUB_TOKEN,GITHUB_ENTERPRISE_TOKEN,GH_DEBUG,ANTHROPIC_API_KEY,AWS_SECRET_ACCESS_KEY,GOOGLE_APPLICATION_CREDENTIALS,CLOUD_ML_REGION,CLOUDSDK_AUTH_ACCESS_TOKEN,CLOUDSDK_CONFIG,CEZ_CHECK_PROBE',
     });
     expect(env.GITHUB_TOKEN).toBeUndefined();
     expect(env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
@@ -437,6 +441,8 @@ describe('buildCheckEnv — the minimal check env', () => {
     expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
     expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
     expect(env.CLOUD_ML_REGION).toBeUndefined();
+    expect(env.CLOUDSDK_AUTH_ACCESS_TOKEN).toBeUndefined();
+    expect(env.CLOUDSDK_CONFIG).toBeUndefined();
     expect(env.CEZ_CHECK_PROBE).toBeUndefined();
   });
 
