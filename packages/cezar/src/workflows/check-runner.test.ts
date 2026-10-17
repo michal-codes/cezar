@@ -70,6 +70,13 @@ describe('capCheckOutput — the tail is kept', () => {
     const capped = capCheckOutput('…tail…', 5, 5_000);
     expect(capped).toContain(checkTruncationMarker(4_995));
   });
+
+  it('never starts a kept tail with a lone surrogate', () => {
+    const capped = capCheckOutput(`${'x'.repeat(10)}😀END`, 4);
+    expect(capped).toContain('END');
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(loneSurrogate.test(capped)).toBe(false);
+  });
 });
 
 describe('runCheckCommand — outcomes', () => {
@@ -96,6 +103,27 @@ describe('runCheckCommand — outcomes', () => {
     expect(outcome.status).toBe('could-not-run');
     expect(outcome.ok).toBe(false);
     expect(outcome.reason).toMatch(/could not run/);
+  });
+
+  it('records a command Node refuses to spawn (a NUL byte) as could-not-run instead of throwing', async () => {
+    // `spawn` validates arguments synchronously; a workflow command is only `z.string()`, so a
+    // YAML `\u0000` reaches this seam. "Never throws" is the contract every caller relies on.
+    const outcome = await runCheckCommand({ cwd, command: 'echo hi\u0000there' });
+    expect(outcome.status).toBe('could-not-run');
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toMatch(/could not run: failed to spawn/);
+  });
+
+  it('decodes a multi-byte character split across stdout chunks', async () => {
+    // A UTF-8 sequence can straddle two pipe reads. Decoding each Buffer on its own turns the
+    // euro sign below into two U+FFFD; the stream decoder must hold the partial sequence.
+    const outcome = await runCheckCommand({
+      cwd,
+      command: `node -e "process.stdout.write(Buffer.from([0xE2,0x82])); setTimeout(() => process.stdout.write(Buffer.from([0xAC])), 30)"`,
+    });
+    expect(outcome.status).toBe('passed');
+    expect(outcome.output).toBe('€');
+    expect(outcome.output).not.toContain('\uFFFD');
   });
 });
 

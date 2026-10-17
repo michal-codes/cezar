@@ -23,7 +23,7 @@
  * read as "it passed" — that is the whole point of the status union.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { accessSync, constants, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { buildCheckEnv } from '../core/agent-env.ts';
@@ -57,8 +57,16 @@ export function checkTruncationMarker(elidedChars: number): string {
 export function capCheckOutput(text: string, cap = CHECK_OUTPUT_CAP, totalChars?: number): string {
   const total = totalChars ?? text.length;
   if (total <= cap) return text;
-  const tail = text.length > cap ? text.slice(-cap) : text;
-  return `${checkTruncationMarker(Math.max(0, total - cap))}\n${tail}`;
+  let start = Math.max(0, text.length - cap);
+  // Slice on a code-point boundary: a low surrogate at the cut means its high
+  // half is outside the window. Keeping it would put a lone surrogate in the
+  // transcript (and in JSON); drop both halves and account for them instead.
+  if (start > 0 && start < text.length) {
+    const code = text.charCodeAt(start);
+    if (code >= 0xdc00 && code <= 0xdfff) start += 1;
+  }
+  const tail = text.slice(start);
+  return `${checkTruncationMarker(Math.max(0, total - tail.length))}\n${tail}`;
 }
 
 /**
@@ -243,15 +251,25 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
     let limitTimer: NodeJS.Timeout | undefined;
     let releaseTimer: NodeJS.Timeout | undefined;
 
-    const child = spawn(shell, ['--noprofile', '--norc', '-c', options.command], {
-      cwd: options.cwd,
-      env,
-      // Its own process group: the only handle that reaches a grandchild.
-      detached: true,
-      // A check has no conversation to hold open — stdin is /dev/null, so a
-      // command that reads it sees EOF instead of hanging on our pipes.
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    let child: ChildProcess;
+    try {
+      child = spawn(shell, ['--noprofile', '--norc', '-c', options.command], {
+        cwd: options.cwd,
+        env,
+        // Its own process group: the only handle that reaches a grandchild.
+        detached: true,
+        // A check has no conversation to hold open — stdin is /dev/null, so a
+        // command that reads it sees EOF instead of hanging on our pipes.
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      // Node validates spawn arguments synchronously (a NUL byte in the command,
+      // cwd or env throws). "Never throws" is this seam's contract: record the
+      // refusal as an outcome so the caller still emits a check-output event.
+      const message = error instanceof Error ? error.message : String(error);
+      resolve(nothing('could-not-run', `could not run: failed to spawn: ${message}`));
+      return;
+    }
 
     /** Is anything at all still in the child's process group? */
     const groupAlive = (): boolean => {
@@ -315,8 +333,8 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
       options.signal?.removeEventListener('abort', onAbort);
     };
 
-    const collect = (chunk: Buffer): void => {
-      const text = chunk.toString('utf8');
+    const collect = (chunk: string | Buffer): void => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
       totalChars += text.length;
       output += text;
       // Rolling window so a chatty command cannot grow memory without bound; the
@@ -358,6 +376,10 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
     // after registration so an abort that raced the spawn setup is not lost.
     if (options.signal?.aborted) onAbort();
 
+    // Decode per stream, not per chunk: a multi-byte code point can straddle
+    // two pipe reads, and `chunk.toString()` would turn both halves into U+FFFD.
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
     child.stdout?.on('data', collect);
     child.stderr?.on('data', collect);
 
