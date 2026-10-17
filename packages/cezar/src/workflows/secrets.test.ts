@@ -604,18 +604,23 @@ describe('project and workspace secrets in check steps', () => {
       status: 'running',
       graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
     });
+    store.addStep(running.id, { id: 'agent', name: 'Agent', kind: 'agent' });
     store.updateStep(running.id, 'agent', { status: 'running', sessionId: 'legacy-agent-session' });
 
     manager.dispose();
     store.flush();
     store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
     manager = new RunManager(store, repoRoot, { projectId: project, secrets });
-    (manager as unknown as { continueRun: () => { ok: false; error: string } }).continueRun = () => ({
-      ok: false, error: 'probe — cannot resume',
-    });
-    await manager.recover();
-
-    expect(store.redactRunText(running.id, credential)).toBe(credential);
+    const continueSpy = vi
+      .spyOn(manager as unknown as { continueRun: () => { ok: false; error: string } }, 'continueRun')
+      .mockReturnValue({ ok: false, error: 'probe — cannot resume' });
+    try {
+      await manager.recover();
+      expect(continueSpy).toHaveBeenCalledTimes(1);
+      expect(store.redactRunText(running.id, credential)).toBe(credential);
+    } finally {
+      continueSpy.mockRestore();
+    }
   }, 40_000);
 
   it('reserves a continuation in active before awaiting its rehydration', async () => {
@@ -672,6 +677,61 @@ describe('project and workspace secrets in check steps', () => {
         if (Date.now() > failedDeadline) throw new Error('gated continuation did not settle');
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
+    } finally {
+      release();
+      spy.mockRestore();
+    }
+  }, 40_000);
+
+  it('clears secrets that resolve after a cancel during rehydration', async () => {
+    const credential = 'cancel-during-rehydration-secret-0123456789';
+    await secrets.set(scope, 'CANCEL_KEY', credential);
+    const waiting = store.createRun({ title: 'cancel during rehydration', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(waiting.id, {
+      status: 'waiting',
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
+    store.updateStep(waiting.id, 'agent', { status: 'waiting', sessionId: 'legacy-agent-session' });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const internals = manager as unknown as { rehydrateResumeRedaction: (id: string) => Promise<void> };
+    const realRehydrate = internals.rehydrateResumeRedaction.bind(manager);
+    let registered!: () => void;
+    const registration = new Promise<void>((resolve) => { registered = resolve; });
+    const spy = vi.spyOn(internals, 'rehydrateResumeRedaction').mockImplementation(async (id) => {
+      await gate;
+      await realRehydrate(id);
+      registered();
+    });
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'cancel probe' })).toEqual({ ok: true });
+      const activeDeadline = Date.now() + 5_000;
+      while (!manager.isActive(waiting.id)) {
+        if (Date.now() > activeDeadline) throw new Error('continuation never reserved the run');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      expect(manager.cancel(waiting.id)).toBe(true);
+      expect(store.getRun(waiting.id)?.status).toBe('cancelled');
+      expect(store.redactRunText(waiting.id, credential)).toBe(credential);
+
+      release();
+      await registration;
+      const cleanDeadline = Date.now() + 5_000;
+      while (store.redactRunText(waiting.id, credential) !== credential) {
+        if (Date.now() > cleanDeadline) throw new Error('resolved rehydration left the cancelled run redacted');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(store.getRun(waiting.id)?.status).toBe('cancelled');
     } finally {
       release();
       spy.mockRestore();

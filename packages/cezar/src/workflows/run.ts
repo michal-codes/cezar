@@ -3928,6 +3928,10 @@ export class RunManager {
     await this.rehydrateResumeRedaction(runId);
     if (state.cancelled) {
       this.dropActive(runId, state);
+      // A cancel during the await above already released the registry through `dropActive`; the
+      // resolve that completed after it may have registered the checks audience again. Release
+      // it unless a newer owner claimed the run while this continuation was unwinding.
+      if (!this.active.has(runId)) this.store.clearRunSecrets(runId);
       return;
     }
     if (state.cwd === this.repoRoot) {
