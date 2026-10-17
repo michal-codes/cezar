@@ -10,17 +10,18 @@
  * `CEZ_CLAUDE_BIN` says exactly that: the same `scripts/mock-claude.mjs`, with
  * the check steps still running for real.
  *
- * Naming is switched off too (`CEZ_AUTONAME=0`): a dry run disabled it
- * implicitly (`autoNamingActive`), these fixtures assert on the mock's
+ * Naming is switched off too (`CEZ_AUTONAME=0`) by default: a dry run disabled
+ * it implicitly (`autoNamingActive`), these fixtures assert on the mock's
  * argv/stdin capture files by INDEX, and a namer invocation would slide every
- * line by one. Restoring is the caller's job — the return value undoes
- * everything this function set.
+ * line by one. The branch-naming fixtures pass `autoName: true` because the
+ * namer is what they are testing. Restoring is the caller's job — the return
+ * value undoes everything this function set.
  */
 import { fileURLToPath } from 'node:url';
 
 const MOCK_CLAUDE = fileURLToPath(new URL('../../scripts/mock-claude.mjs', import.meta.url));
 
-export function mockAgentWithRealChecks(): () => void {
+export function mockAgentWithRealChecks(options: { autoName?: boolean } = {}): () => void {
   const saved: Record<string, string | undefined> = {
     CEZ_DRY_RUN: process.env.CEZ_DRY_RUN,
     CEZ_CLAUDE_BIN: process.env.CEZ_CLAUDE_BIN,
@@ -28,7 +29,7 @@ export function mockAgentWithRealChecks(): () => void {
   };
   delete process.env.CEZ_DRY_RUN;
   process.env.CEZ_CLAUDE_BIN = MOCK_CLAUDE;
-  process.env.CEZ_AUTONAME = '0';
+  process.env.CEZ_AUTONAME = options.autoName ? '1' : '0';
   return () => {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];

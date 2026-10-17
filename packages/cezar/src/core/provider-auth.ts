@@ -1,11 +1,15 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { extname, isAbsolute } from 'node:path';
 import { AGENT_MODELS_LOCKED_ENV } from './agent-model-policy.ts';
 import { profileEnv } from './agent-profiles.ts';
 import { resolveClaudeBin } from './claude-bin.ts';
 import { quoteExecutable, withEnvPrefix } from './shell-env.ts';
+import { probeJunieAuthentication } from './junie-auth-probe.ts';
+import { spawnableCommand } from './windows-shim.ts';
 
-export const PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi'] as const;
+export const PROVIDER_IDS = ['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 export type ProviderConnectionState =
   | 'connected'
@@ -45,6 +49,10 @@ export type RunProviderCommand = (
    *  2026-07-29-agent-profiles). Optional so every existing caller and the test kit keep their
    *  three-argument signature; absent means the default profile, which needs nothing. */
   env?: Record<string, string>,
+  /** Written to the probe's stdin, which is then closed. Only Copilot needs it: the CLI ships no
+   *  non-interactive auth-status command, so its state is read by driving its ACP server. Optional
+   *  so every existing caller and the test kit keep their shorter signature. */
+  stdin?: string,
 ) => Promise<ProviderCommandResult>;
 
 /**
@@ -66,8 +74,12 @@ interface ProviderDescriptor {
   executable: () => string;
   statusArgs: readonly string[];
   loginArgs: readonly string[];
+  /** The CLI's own self-update, where it has one; others update the way they were installed. */
+  updateArgs?: readonly string[];
   installHint: string;
   parse: (result: ProviderCommandResult) => ProviderConnectionState | null;
+  /** See {@link RunProviderCommand}'s `stdin`. */
+  stdin?: () => string;
   /**
    * An answer available WITHOUT spawning the CLI at all, checked before `runCommand` — `undefined`
    * defers to the normal probe. Every other backend's own CLI self-reports API-key vs. subscription
@@ -80,6 +92,10 @@ interface ProviderDescriptor {
    * spawn entirely removes that race instead of racing to out-guess it.
    */
   precheck?: () => ProviderConnectionState | undefined;
+  /** A more specific hint than "try again" for an exit-0/1 answer `parse` could not read. */
+  unrecognizedHint?: (result: ProviderCommandResult) => string | undefined;
+  /** The `CEZ_*_BIN` override `executable` honours — only so a report can say the binary came from it. */
+  overrideEnv: string;
 }
 
 const COMMAND_TIMEOUT_MS = 10_000;
@@ -136,7 +152,11 @@ const RUNTIME_AUTH_VERIFY_COOLDOWN_MS = 60_000;
  *  wrong answer, and it is now paid in the background; fixing it properly means per-provider
  *  timestamps and merging partial probe results. */
 function cacheTtlFor(rows: readonly ProviderStatus[]): number {
-  return rows.every((row) => row.status === 'connected') ? CONNECTED_TTL_MS : UNSETTLED_TTL_MS;
+  // Junie deliberately remains `unknown` after a successful handshake, so it must not force
+  // every other provider's cached credential result onto the short negative-answer window.
+  return rows.filter((row) => row.provider !== 'junie').every((row) => row.status === 'connected')
+    ? CONNECTED_TTL_MS
+    : UNSETTLED_TTL_MS;
 }
 const UNKNOWN_HINT = 'Authentication could not be verified. Try again.';
 const TIMEOUT_HINT = 'Authentication check timed out. Try again.';
@@ -220,6 +240,16 @@ function parseOpenCodeStatus(result: ProviderCommandResult): ProviderConnectionS
   const storedSummaries = lines
     .map((line) => line.match(/^[^a-z0-9]*(\d+)\s+credentials?$/)?.[1])
     .filter((count): count is string => count !== undefined);
+
+  // OpenCode 2.x replaced the summary with one row per stored credential, with the literal
+  // `stored` state in the final column. Keep this shape deliberately narrow: a successful empty
+  // response is the valid no-credentials answer, while any other output without either the 1.x
+  // summary or 2.x rows remains inconclusive rather than being guessed as disconnected.
+  if (storedSummaries.length === 0) {
+    if (lines.length === 0) return 'disconnected';
+    const storedRows = lines.filter((line) => /^.+\s{2,}.+\s+stored$/.test(line));
+    return storedRows.length === lines.length && storedRows.length > 0 ? 'connected' : null;
+  }
   if (storedSummaries.length !== 1) return null;
   const storedCount = Number(storedSummaries[0]);
   if (!Number.isSafeInteger(storedCount)) return null;
@@ -238,6 +268,21 @@ function parseOpenCodeStatus(result: ProviderCommandResult): ProviderConnectionS
   return storedCount > 0 || environmentCount > 0 ? 'connected' : 'disconnected';
 }
 
+/**
+ * Dead code, on purpose: `probe()` special-cases `descriptor.id === 'junie'` and returns before
+ * `descriptor.parse` is ever reached, because a real Auth CHECK requires driving the ACP
+ * handshake itself (`initialize` → `authenticate` → `session/prompt`, confirmed live to be the
+ * only path that actually surfaces "no usable entitlement") — this synchronous
+ * execFile-and-regex probe has no seam for that. `junie --help`'s `Authentication:` section is
+ * write-only (`--auth=<token>`, `--<provider>-api-key=<key>`) so there is no `auth status`-shaped
+ * subcommand to parse in the first place. Kept only because `ProviderDescriptor.parse` is
+ * required on every entry — this is the junie descriptor's metadata-only placeholder, not a
+ * live code path.
+ */
+function parseJunieStatus(_result: ProviderCommandResult): ProviderConnectionState | null {
+  return null;
+}
+
 function parsePiStatus(result: ProviderCommandResult): ProviderConnectionState | null {
   if (result.exitCode !== 0) return null;
   const lines = normalizedLines(result.stdout);
@@ -253,17 +298,58 @@ function parsePiStatus(result: ProviderCommandResult): ProviderConnectionState |
   return null;
 }
 
+/**
+ * Copilot CLI has **no** non-interactive auth-status command — `login` is its only auth
+ * subcommand and it is interactive (verified against 1.0.88;
+ * `.ai/runs/2026-09-27-copilot-cli-runner/copilot-acp-notes.md`). What it does have is an ACP
+ * server that answers the question definitively and cheaply: `session/new` returns a `sessionId`
+ * for an entitled credential and the JSON-RPC error `-32000 "Authentication required"` without
+ * one. Nothing is prompted, so no AI credits are spent, and the server exits when stdin closes.
+ */
+function copilotAcpProbeStdin(): string {
+  const initialize = {
+    jsonrpc: '2.0',
+    id: 0,
+    method: 'initialize',
+    params: { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false } },
+  };
+  // A throwaway cwd: the probe must not touch the user's repo, and `session/new` requires one.
+  const newSession = { jsonrpc: '2.0', id: 1, method: 'session/new', params: { cwd: tmpdir(), mcpServers: [] } };
+  return `${JSON.stringify(initialize)}\n${JSON.stringify(newSession)}\n`;
+}
+
+function parseCopilotStatus(result: ProviderCommandResult): ProviderConnectionState | null {
+  const output = `${result.stdout}\n${result.stderr}`;
+  // Order matters: an authenticated answer also contains the `initialize` result, and an
+  // unauthenticated one contains BOTH that result and the error, so the error is checked first.
+  if (/"Authentication required"/i.test(output)) return 'disconnected';
+  if (/"sessionId"\s*:\s*"/.test(output)) return 'connected';
+  return null;
+}
+
+/** Telemetry 298c2e1f: a `copilot` that answered with no JSON-RPC frame never started an ACP
+ *  server — an old Copilot CLI, or another program of that name (AWS Copilot) first on PATH. */
+function copilotUnrecognizedHint(result: ProviderCommandResult): string | undefined {
+  if (/"jsonrpc"\s*:/.test(`${result.stdout}\n${result.stderr}`)) return undefined;
+  return 'The `copilot` command did not start GitHub Copilot CLI\'s ACP server. Update it with '
+    + '`npm i -g @github/copilot`, or point CEZ_COPILOT_BIN at the GitHub Copilot CLI if another '
+    + 'program named `copilot` comes first on PATH.';
+}
+
 const DESCRIPTORS: readonly ProviderDescriptor[] = [
   {
     id: 'claude',
+    overrideEnv: 'CEZ_CLAUDE_BIN',
     executable: () => resolveClaudeBin(),
     statusArgs: ['auth', 'status', '--json'],
     loginArgs: ['auth', 'login'],
+    updateArgs: ['update'],
     installHint: 'Install Claude Code, then run `claude auth login`.',
     parse: parseClaudeStatus,
   },
   {
     id: 'codex',
+    overrideEnv: 'CEZ_CODEX_BIN',
     executable: () => process.env.CEZ_CODEX_BIN ?? 'codex',
     statusArgs: ['login', 'status'],
     loginArgs: ['login'],
@@ -272,17 +358,21 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
   },
   {
     id: 'opencode',
+    overrideEnv: 'CEZ_OPENCODE_BIN',
     executable: () => process.env.CEZ_OPENCODE_BIN ?? 'opencode',
     statusArgs: ['auth', 'list'],
     loginArgs: ['auth', 'login'],
+    updateArgs: ['upgrade'],
     installHint: 'Install OpenCode, then run `opencode auth login`.',
     parse: parseOpenCodeStatus,
   },
   {
     id: 'cursor',
+    overrideEnv: 'CEZ_CURSOR_AGENT_BIN',
     executable: () => process.env.CEZ_CURSOR_AGENT_BIN ?? 'agent',
     statusArgs: ['status', '--format', 'json'],
     loginArgs: ['login'],
+    updateArgs: ['update'],
     installHint:
       'Install the Cursor CLI (`curl https://cursor.com/install -fsS | bash`), then run `agent login` (or set CURSOR_API_KEY).',
     parse: parseCursorStatus,
@@ -291,11 +381,34 @@ const DESCRIPTORS: readonly ProviderDescriptor[] = [
   },
   {
     id: 'pi',
+    overrideEnv: 'CEZ_PI_BIN',
     executable: () => process.env.CEZ_PI_BIN ?? 'pi',
     statusArgs: ['--list-models'],
     loginArgs: ['/login'],
     installHint: 'Install pi, then run `pi /login`.',
     parse: parsePiStatus,
+  },
+  {
+    id: 'junie',
+    overrideEnv: 'CEZ_JUNIE_BIN',
+    executable: () => process.env.CEZ_JUNIE_BIN ?? 'junie',
+    statusArgs: [],
+    loginArgs: [],
+    installHint: 'Install Junie (https://junie.jetbrains.com/cli), then run `junie` once and log in.',
+    parse: parseJunieStatus,
+  },
+  {
+    id: 'copilot',
+    overrideEnv: 'CEZ_COPILOT_BIN',
+    executable: () => process.env.CEZ_COPILOT_BIN ?? 'copilot',
+    // `--no-auto-update`, as the runner passes: a status check must not download a CLI, nor run a
+    // cached newer package than the one a run will launch (telemetry 298c2e1f).
+    statusArgs: ['--acp', '--no-auto-update'],
+    loginArgs: ['login'],
+    installHint: 'Install GitHub Copilot CLI (`npm i -g @github/copilot`), then run `copilot login`.',
+    parse: parseCopilotStatus,
+    stdin: copilotAcpProbeStdin,
+    unrecognizedHint: copilotUnrecognizedHint,
   },
 ];
 
@@ -325,11 +438,14 @@ function defaultRunProviderCommand(
   args: readonly string[],
   timeoutMs: number,
   env?: Record<string, string>,
+  stdin?: string,
 ): Promise<ProviderCommandResult> {
+  // A Windows `.cmd` shim runs as `node <script>`: execFile throws EINVAL on the shim (a330744e).
+  const [file, argv] = spawnableCommand(executable, args);
   return new Promise((resolve) => {
-    execFile(
-      executable,
-      args,
+    const child = execFile(
+      file,
+      argv,
       {
         timeout: timeoutMs,
         windowsHide: true,
@@ -355,6 +471,9 @@ function defaultRunProviderCommand(
         });
       },
     );
+    // Closing stdin is what makes a stdin-driven probe terminate at all: the Copilot ACP server
+    // reads until EOF. A probe with no payload closes it immediately, exactly as before.
+    child.stdin?.end(stdin ?? '');
   });
 }
 
@@ -387,11 +506,76 @@ export interface RuntimeAuthFailureReport {
   transitioned: boolean;
 }
 
+/** Why a CLI status probe ended `unknown` — a closed set, so a report can group on it. */
+export type InconclusiveProbeReason =
+  | 'spawn_threw'
+  | 'spawn_error'
+  | 'timeout'
+  | 'unexpected_exit'
+  | 'unrecognized_output';
+
+/**
+ * What an inconclusive probe can tell telemetry without its output: the shape of what came back
+ * and how the binary was found. Never stdout/stderr text or a path — the CLI's output can carry an
+ * account email or a token.
+ */
+export interface InconclusiveProbe {
+  provider: ProviderId;
+  reason: InconclusiveProbeReason;
+  profile: 'default' | 'named';
+  /** `override` (a `CEZ_*_BIN`), `absolute` (a resolved install location) or `path` (a bare name). */
+  binSource: 'override' | 'absolute' | 'path';
+  /** The executable's extension from a closed set: `.exe`, `.cmd`, …, `none` or `other`. */
+  binExt: string;
+  errorCode: string | null;
+  exitCode: number | null;
+  stdoutBytes: number;
+  stdoutJson: boolean;
+  stderrBytes: number;
+  /** The CLI's own `--version`, as a bare semver; one extra spawn, paid only by a caller that
+   *  is going to send the report. */
+  cliVersion: () => Promise<string | null>;
+}
+
+const BIN_EXTENSIONS = new Set(['.exe', '.cmd', '.bat', '.com', '.ps1', '.js', '.mjs', '.cjs', '.sh']);
+const VERSION_TIMEOUT_MS = 5_000;
+
+function binExtension(executable: string): string {
+  const ext = extname(executable).toLowerCase();
+  if (!ext) return 'none';
+  return BIN_EXTENSIONS.has(ext) ? ext : 'other';
+}
+
+function parsesAsJson(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isSilentSuccess(result: ProviderCommandResult): boolean {
+  return result.exitCode === 0 && !result.errorCode && !result.timedOut
+    && result.stdout.trim() === '' && result.stderr.trim() === '';
+}
+
+/** The first semver in a `--version` answer; anything else in it is dropped. */
+export function cliVersionFrom(output: string): string | null {
+  // `v` optional: AWS Copilot answers `copilot version: v1.34.1`, which `\b` alone never matched.
+  return output.match(/(?<![\w.])v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]{1,24})?)/)?.[1] ?? null;
+}
+
 export class ProviderAuthService {
   private readonly runCommand: RunProviderCommand;
   private readonly now: () => number;
   private readonly platform: NodeJS.Platform;
   private readonly createAuthFailureId: () => string;
+  private readonly probeJunie: () => Promise<{ connected: boolean; hint?: string; notInstalled?: boolean }>;
+  private readonly onInconclusive?: (probe: InconclusiveProbe) => void;
+  /** Once per provider, reason and account kind per process: the background re-check runs every
+   *  minute while a provider is logged out, and one broken install must not become a report a minute. */
+  private readonly reportedInconclusive = new Set<string>();
   private readonly runtimeFailures = new Map<ProviderId, RuntimeAuthFailure>();
   /** One self-check at a time per provider, and not more often than the cooldown. Both guard the
    *  same thing — a CLI spawn per auth-shaped error line — from the two directions it can arrive
@@ -420,11 +604,24 @@ export class ProviderAuthService {
     now?: () => number;
     platform?: NodeJS.Platform;
     createAuthFailureId?: () => string;
+    /** Working directory the junie ACP probe opens its session in. Defaults to `process.cwd()`,
+     *  but the server passes the boot project root so this agrees with the model catalog's own
+     *  discovery cwd (`server.ts`'s `bootRoot`) instead of silently diverging from it. */
+    cwd?: string;
+    probeJunie?: () => Promise<{ connected: boolean; hint?: string; notInstalled?: boolean }>;
+    /** Told when a CLI probe ends `unknown`, at most once per provider/reason/account kind. */
+    onInconclusive?: (probe: InconclusiveProbe) => void;
   }) {
+    this.onInconclusive = options?.onInconclusive;
     this.runCommand = options?.runCommand ?? defaultRunProviderCommand;
     this.now = options?.now ?? Date.now;
     this.platform = options?.platform ?? process.platform;
     this.createAuthFailureId = options?.createAuthFailureId ?? randomUUID;
+    // Bounded to the SAME budget every other provider's status probe respects (#M2 review) — the
+    // discovery module's own 15s default exists for the explicit "Check again" / model-picker
+    // path, not for a status read that runs on every poll and warm-up.
+    this.probeJunie = options?.probeJunie
+      ?? (() => probeJunieAuthentication({ cwd: options?.cwd ?? process.cwd(), timeoutMs: COMMAND_TIMEOUT_MS }));
   }
 
   /**
@@ -580,6 +777,13 @@ export class ProviderAuthService {
     return withEnvPrefix(command, env, this.platform);
   }
 
+  /** The agent CLI's self-update command (`opencode upgrade`), or null when it has none. */
+  updateCommand(provider: ProviderId): string | null {
+    const descriptor = descriptorFor(provider);
+    if (!descriptor.updateArgs) return null;
+    return [quoteExecutable(descriptor.executable(), this.platform), ...descriptor.updateArgs].join(' ');
+  }
+
   installHint(provider: ProviderId): string {
     return descriptorFor(provider).installHint;
   }
@@ -717,6 +921,28 @@ export class ProviderAuthService {
   }
 
   private async probe(descriptor: ProviderDescriptor, configDir?: string | null): Promise<ProviderStatus> {
+    // Junie exposes no read-only auth status command. Its prompt-free model probe establishes
+    // both authentication and model access; invoking `junie --version` cannot establish either.
+    if (descriptor.id === 'junie') {
+      try {
+        const result = await this.probeJunie();
+        if (result.notInstalled) return { provider: 'junie', status: 'not-installed', hint: descriptor.installHint };
+        return result.connected
+          ? { provider: 'junie', status: 'connected' }
+          : { provider: 'junie', status: 'unknown', hint: result.hint };
+      } catch (error) {
+        // Same distinction as the try path above: a missing binary is "not-installed" (so the
+        // GUI never offers a runner that cannot run), everything else stays "unknown" (#M1).
+        if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+          return { provider: 'junie', status: 'not-installed', hint: descriptor.installHint };
+        }
+        return {
+          provider: 'junie',
+          status: 'unknown',
+          hint: `Junie authentication check failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+    }
     const precheck = descriptor.precheck?.();
     if (precheck !== undefined) return { provider: descriptor.id, status: precheck };
     let result: ProviderCommandResult;
@@ -725,24 +951,94 @@ export class ProviderAuthService {
     // implementation an extra argument it never asked for would be a change in the zero-config
     // path for no gain.
     const env = configDir ? profileEnv(descriptor.id, configDir) : undefined;
+    const executable = descriptor.executable();
+    const inconclusive = (
+      reason: InconclusiveProbeReason,
+      hint: string,
+      outcome?: ProviderCommandResult,
+    ): ProviderStatus => {
+      this.reportInconclusive(descriptor, executable, env, configDir ? 'named' : 'default', reason, outcome);
+      return { provider: descriptor.id, status: 'unknown', hint };
+    };
+    // Never pass a trailing `undefined`: the existing three- and four-argument calls are the
+    // zero-config path and the injected test kit asserts them literally, so only a descriptor
+    // that actually has a stdin payload reaches the five-argument form.
+    const run = (): Promise<ProviderCommandResult> => {
+      const stdin = descriptor.stdin?.();
+      return stdin !== undefined
+        ? this.runCommand(executable, descriptor.statusArgs, COMMAND_TIMEOUT_MS, env, stdin)
+        : env === undefined
+          ? this.runCommand(executable, descriptor.statusArgs, COMMAND_TIMEOUT_MS)
+          : this.runCommand(executable, descriptor.statusArgs, COMMAND_TIMEOUT_MS, env);
+    };
     try {
-      result = await (env === undefined
-        ? this.runCommand(descriptor.executable(), descriptor.statusArgs, COMMAND_TIMEOUT_MS)
-        : this.runCommand(descriptor.executable(), descriptor.statusArgs, COMMAND_TIMEOUT_MS, env));
-    } catch {
-      return { provider: descriptor.id, status: 'unknown', hint: UNKNOWN_HINT };
+      result = await run();
+      // A CLI that exits 0 having printed nothing at all did not answer — `claude auth status
+      // --json` does this intermittently (telemetry 35838a52). Ask once more before giving up.
+      if (isSilentSuccess(result) && descriptor.parse(result) === null) result = await run();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      const thrown: ProviderCommandResult = {
+        stdout: '',
+        stderr: '',
+        exitCode: null,
+        ...(typeof code === 'string' ? { errorCode: code } : {}),
+      };
+      // A shim `spawnableCommand` could not unwrap: say which setting to change, not "try again".
+      const hint = /\.(?:cmd|bat|ps1)$/i.test(executable)
+        ? `\`${executable}\` is a Windows script shim cezar cannot start without a shell. Point ${descriptor.overrideEnv} at the CLI's .exe or its .js entry point.`
+        : UNKNOWN_HINT;
+      return inconclusive('spawn_threw', hint, thrown);
     }
     if (result.errorCode === 'ENOENT') {
       return { provider: descriptor.id, status: 'not-installed', hint: descriptor.installHint };
     }
-    if (result.timedOut) {
-      return { provider: descriptor.id, status: 'unknown', hint: TIMEOUT_HINT };
-    }
-    if (result.errorCode) {
-      return { provider: descriptor.id, status: 'unknown', hint: UNKNOWN_HINT };
-    }
+    if (result.timedOut) return inconclusive('timeout', TIMEOUT_HINT, result);
+    if (result.errorCode) return inconclusive('spawn_error', UNKNOWN_HINT, result);
     const status = descriptor.parse(result);
     if (status !== null) return { provider: descriptor.id, status };
-    return { provider: descriptor.id, status: 'unknown', hint: UNKNOWN_HINT };
+    // Exit 0 and 1 are the codes vendors answer status with; anything else is the CLI failing.
+    if (result.exitCode === 0 || result.exitCode === 1) {
+      return inconclusive('unrecognized_output', descriptor.unrecognizedHint?.(result) ?? UNKNOWN_HINT, result);
+    }
+    return inconclusive('unexpected_exit', UNKNOWN_HINT, result);
+  }
+
+  private reportInconclusive(
+    descriptor: ProviderDescriptor,
+    executable: string,
+    env: Record<string, string> | undefined,
+    profile: 'default' | 'named',
+    reason: InconclusiveProbeReason,
+    result?: ProviderCommandResult,
+  ): void {
+    if (!this.onInconclusive) return;
+    const key = `${descriptor.id}\u0000${reason}\u0000${profile}`;
+    if (this.reportedInconclusive.has(key)) return;
+    this.reportedInconclusive.add(key);
+    const errorCode = result?.errorCode;
+    try {
+      this.onInconclusive({
+        provider: descriptor.id,
+        reason,
+        profile,
+        binSource: process.env[descriptor.overrideEnv] ? 'override' : isAbsolute(executable) ? 'absolute' : 'path',
+        binExt: binExtension(executable),
+        // Node's own codes (`EINVAL`, `ERR_CHILD_PROCESS_STDIO_MAXBUFFER`) — anything else is dropped.
+        errorCode: errorCode && /^[A-Z][A-Z0-9_]{1,63}$/.test(errorCode) ? errorCode : null,
+        exitCode: result?.exitCode ?? null,
+        stdoutBytes: result?.stdout.length ?? 0,
+        stdoutJson: result ? parsesAsJson(result.stdout) : false,
+        stderrBytes: result?.stderr.length ?? 0,
+        cliVersion: async () => {
+          const answer = await (env === undefined
+            ? this.runCommand(executable, ['--version'], VERSION_TIMEOUT_MS)
+            : this.runCommand(executable, ['--version'], VERSION_TIMEOUT_MS, env));
+          return cliVersionFrom(answer.stdout) ?? cliVersionFrom(answer.stderr);
+        },
+      });
+    } catch {
+      // a report must never cost the probe its answer
+    }
   }
 }

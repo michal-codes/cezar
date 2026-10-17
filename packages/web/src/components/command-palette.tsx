@@ -22,7 +22,7 @@ import { shortAge } from '@/lib/format'
 import { orderProjects as orderRegistry } from '@/lib/project-order'
 import { isUnread } from '@/lib/read-state'
 import { orderSkillsByUsage } from '@/lib/skills'
-import { runTitle } from '@/lib/task-groups'
+import { lastActivityAt, runTitle } from '@/lib/task-groups'
 import { useCommandShortcut, useKeyShortcut } from '@/lib/use-command-shortcut'
 import { useProjectOrder } from '@/lib/use-project-order'
 
@@ -134,9 +134,11 @@ export function mergeTasks(
     seenAt: run.seenAt,
     archived: run.archived,
     autoResumeAt: run.autoResumeAt,
+    awaitingAnswerSince: run.awaitingAnswerSince,
     workflow: run.workflow,
     branch: run.branch,
     startedAt: run.startedAt,
+    lastActivityAt: lastActivityAt(run),
   }))
   const live = new Set(mine.map(taskKey))
   const theirs = (indexed ?? [])

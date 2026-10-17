@@ -1,12 +1,28 @@
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { StreamRedaction } from './stream-redaction.ts';
 import { collectSecretValues, redactDeep, redactSecrets } from '../core/secret-redaction.ts';
 // Sibling module, files only — a draft belongs to a run and is deleted with it (#939).
 import { deleteRunDrafts } from './drafts.ts';
+import { deleteRunLayouts, pruneOrphanLayouts } from './layouts.ts';
+import { failureKind, taskFailedLabel } from './failure-kind.ts';
+import { track } from '../telemetry.ts';
+import { reportAgentError } from './agent-error-telemetry.ts';
 // Pure, dependency-free reference helpers — the same sanity bound the marker parser applies.
 import { MAX_REF } from './task-refs.ts';
 // Type-only module (zod + nothing else), so this cannot cycle back into the store.
@@ -92,6 +108,9 @@ const stepStateSchema = z.object({
    *  a PAIR. Without it, changing the project's account would silently make Continue resume
    *  against the wrong account's session store. Absent = the discovered default. */
   profileId: z.string().optional(),
+  /** Canonical provider/model identity resolved for this step. Optional so older runs.json files
+   *  remain readable and auto-model steps can retain an absent identity. */
+  modelIdentity: z.string().optional(),
   /** Dollar cost reported by the claude CLI for this step's turns. */
   costUsd: z.number().optional(),
 });
@@ -107,6 +126,16 @@ const queuedMessageSchema = z.object({
   images: z.array(z.string()).optional(),
   createdAt: z.string(),
 });
+
+/** One authoritative PR association for a task. Older records project their scalar fields
+ * into this list on first append, so no migration is needed. */
+const prRefSchema = z.object({
+  number: z.number().int().positive().max(MAX_REF),
+  url: z.string().url().optional(),
+  origin: z.enum(['created', 'marker', 'legacy', 'derived']),
+  at: z.string().datetime(),
+});
+export type RunPrRef = z.infer<typeof prRefSchema>;
 
 /** Exported for `./run-index.ts`, the read-only reader of the same file. Nothing else should
  *  parse `runs.json` — see `reconcileLoadedRun` for why a second parser is a correctness risk. */
@@ -253,6 +282,37 @@ export const runRecordSchema = z.object({
    *  `reconcileLoadedRun` retire it on any other status, so no caller has to. */
   askParked: z.boolean().optional(),
   /**
+   * When the run's session ended — the inactivity timer, a crash, a cezar restart — while a
+   * `CEZ:ASK` question was still unanswered. The run is `failed` on the record (no process, no
+   * slot), but the question is still the user's to answer, so the cockpit keeps it under
+   * "needs you" instead of filing it as an outcome; Continue (or the ask card) reopens the session
+   * with the answer. Additive and optional (BACKWARD_COMPATIBILITY §3). Invariant: only a
+   * `failed` run carries it — `updateRun` and `reconcileLoadedRun` retire it on any other status,
+   * so a Continue, a Finish or a cancel clears it without the caller's help.
+   */
+  awaitingAnswerSince: z.string().datetime().optional().catch(undefined),
+  /**
+   * A run a `checkout: 'pr-head'` automation launched on a pull request's head (spec
+   * 2026-10-06-agentic-e2e-checks Phase 3). `headSha` is what was fetched and tested — also the
+   * run's `baseBranch` — and `ref` the namespaced `refs/cezar/pr/<n>` holding it. Its presence
+   * is what refuses `POST /runs/:id/pr`: the branch would contain the whole foreign PR.
+   */
+  prHead: z
+    .object({
+      number: z.number().int().positive(),
+      repo: z.string(),
+      headRepo: z.string(),
+      headRef: z.string(),
+      headSha: z.string(),
+      baseRef: z.string(),
+      ref: z.string(),
+    })
+    .optional()
+    .catch(undefined),
+  /** The PR head came from a fork the automation admitted (`allowForkHeads`): untrusted code, so
+   *  its check steps never receive any secrets. */
+  untrustedHead: z.boolean().optional().catch(undefined),
+  /**
    * Exact deadline at which a run stopped by a provider USAGE LIMIT resumes itself
    * (spec 2026-08-03-auto-resume-after-usage-limit) — the reset instant the provider named plus a
    * short grace. Present only while such a resume is pending: the run is `failed`, the timer is
@@ -281,6 +341,8 @@ export const runRecordSchema = z.object({
    *  regex-extracted from the task prompt, upgradable by the namer's
    *  cross-checked output. Display tier — never gates actions. */
   prNumber: z.number().optional(),
+  /** Ordered, deduplicated PR associations. Optional for pre-list runs.json records. */
+  prRefs: z.array(prRefSchema).max(8).optional().catch(undefined),
   issueNumber: z.number().optional(),
   /** Provenance for an `issueNumber` seeded by referenced-issue discovery.
    *  Persisted so ambiguity can revoke only the janitor's own value, including
@@ -313,7 +375,8 @@ export const runRecordSchema = z.object({
   worktree: z.literal(false).optional(),
   /** Task worktree (spec 006) — absent for in-place runs and after explicit cleanup. */
   worktreePath: z.string().optional(),
-  /** The task's own branch (`cez/<id8>`), created off `baseBranch`. */
+  /** The task's own branch, created off `baseBranch`: `cez/<id8>` unless branch naming
+   *  instructions named it (spec 2026-10-11-branch-naming-instructions) — read it, never recompute it. */
   branch: z.string().optional(),
   /** Stable baseline for session git views: a worktree's fork ref, or an in-place run's starting commit. */
   baseBranch: z.string().optional(),
@@ -346,6 +409,9 @@ export const runRecordSchema = z.object({
    *  runs, on every run not yet opened, and on one `setUnread` put back to unread
    *  (#775) — the unread rule treats all three alike. */
   seenAt: z.string().optional(),
+  /** Highest `seq` handed out for this run, ephemeral frames included, so a restart resumes the
+   *  counter without parsing the transcript. Absent on older records, which fall back to that parse. */
+  lastSeq: z.number().int().nonnegative().optional(),
   currentStepId: z.string().optional(),
   error: z.string().optional(),
   steps: z.array(stepStateSchema),
@@ -370,6 +436,21 @@ export const runRecordSchema = z.object({
    *  `workflowStepSchema` only with that in mind: a narrowing here silently eats
    *  queued runs rather than degrading them. */
   workflowDef: workflowDefSchema.optional().catch(undefined),
+  /** Where a graph workflow's walk has been (spec 2026-09-30-workflow-node-editor, phase 3):
+   *  per-loop counters and every edge taken, in order, as `<node>.<port>-><target>` (`to` empty
+   *  when an unwired port ended the run). Written by `executeGraph` for the task view's live
+   *  graph; absent on v1 runs and on every record that predates it. Capped (`GRAPH_TAKEN_CAP`). */
+  graphState: z
+    .object({
+      loops: z.record(z.string(), z.number()),
+      taken: z.array(z.string()),
+      /** The node being run — where a restart resumes the walk. Absent once the walk ended. */
+      cursor: z.string().optional(),
+      /** `{{nodes.<id>.<field>}}` values so far, restored on resume. */
+      outputs: z.record(z.string(), z.record(z.string(), z.union([z.string(), z.number()]))).optional(),
+    })
+    .optional()
+    .catch(undefined),
 });
 
 export type StepState = z.infer<typeof stepStateSchema>;
@@ -385,11 +466,16 @@ export interface RunEvent {
   [key: string]: unknown;
 }
 
+/** A layout file this young may belong to a run another process has not saved to the index yet. */
+const ORPHAN_LAYOUT_GRACE_MS = 10 * 60_000;
 const MAX_RUNS_KEPT = 300;
+/** Every save rewrites the whole index, and a live run touches its record at event rate. */
+const SAVE_DEBOUNCE_MS = 1_000;
 const MAX_ARCHIVED_KEPT = 500;
 
-const PR_URL_RE = /https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/;
-const ISSUE_URL_RE = /https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+/;
+// Any host: GitHub Enterprise lives on arbitrary domains (`isGithubHost` can't be asked from a regex).
+const PR_URL_RE = /https:\/\/[^/\s]+\/[^/\s]+\/[^/\s]+\/pull\/\d+/;
+const ISSUE_URL_RE = /https:\/\/[^/\s]+\/[^/\s]+\/[^/\s]+\/issues\/\d+/;
 // The transcript auto-link is convenience only (the cockpit's own `gh pr create` path sets the
 // URL authoritatively). Adopt a PR URL ONLY when the agent actually CREATED one — a task that
 // reviews or merely references an existing PR must not get mislabeled with its number (#fake-pr).
@@ -399,6 +485,8 @@ const CREATED_PR_RE =
 /** Referenced-tier working-set cap (spec 2026-07-16-pr-autodiscovery): past
  *  this many distinct PRs the conversation is a survey, not a subject. */
 const MAX_PR_CANDIDATES = 8;
+/** Enough for any command line or path; a longer tool input is file content, not a reference. */
+const MAX_TOOL_INPUT_HAYSTACK_CHARS = 8_192;
 
 /** The repository a project IS, as `resolveRepoHandle` reports it. `null`/absent means "unknown",
  *  which is a real and common state (no `gh`, no remote, a non-git root) — never an error. */
@@ -434,6 +522,9 @@ function refUrlRepo(url: string): string | undefined {
  * Note what this does not touch: `referenced*Candidates` keep recording every URL as evidence.
  * The fix changes what is *promoted*, never what is *collected* (the #526 rule).
  */
+// Compares `owner/repo` only: `RepoHandle` carries no host, so the same slug on another GitHub
+// host (Enterprise vs github.com) reads as in-repo. Rare enough to accept; add a host to the
+// handle if it ever bites.
 function isRepoScopedRef(url: string, task: string, handle?: RepoHandle | null): boolean {
   if (!handle) return true;
   const repo = refUrlRepo(url);
@@ -463,6 +554,14 @@ function clearPendingAutoResume(run: RunRecord): void {
 }
 
 /**
+ * Archiving is resigning from a task, so it also resigns from the question the task was left
+ * waiting on — an archived run must not keep a "needs you" signal alive in the attention layer.
+ */
+function clearAwaitingAnswer(run: RunRecord): void {
+  run.awaitingAnswerSince = undefined;
+}
+
+/**
  * Archiving is resigning from a task, so it retires the pin too (#935) — a pin on a task the
  * user has filed away is stale by definition, and the archived view collapses into one bucket
  * anyway, so a surviving pin would be invisible state waiting to surprise whoever unarchives.
@@ -476,6 +575,16 @@ function clearPendingAutoResume(run: RunRecord): void {
 function clearPin(run: RunRecord): void {
   delete run.pinned;
   delete run.pinnedAt;
+}
+
+function parseSeq(line: string): number | undefined {
+  if (line.trim() === '') return undefined;
+  try {
+    const seq = (JSON.parse(line) as { seq?: unknown }).seq;
+    return typeof seq === 'number' ? seq : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function eventTextFragments(event: Record<string, unknown>): string[] {
@@ -495,7 +604,7 @@ function eventTextFragments(event: Record<string, unknown>): string[] {
       fragments.push(it.input);
     } else if (it.input !== undefined) {
       try {
-        fragments.push(JSON.stringify(it.input));
+        fragments.push(JSON.stringify(it.input).slice(0, MAX_TOOL_INPUT_HAYSTACK_CHARS));
       } catch {
         // circular input — skip it
       }
@@ -606,6 +715,81 @@ function refUrlNumber(url: string | undefined): number | undefined {
   return Number.isInteger(n) && n > 0 && n < MAX_REF ? n : undefined;
 }
 
+const PR_REF_CAP = 8;
+const PR_REF_RANK: Record<RunPrRef['origin'], number> = {
+  created: 0,
+  marker: 1,
+  legacy: 2,
+  derived: 3,
+};
+
+function legacyPrRefs(run: RunRecord): RunPrRef[] {
+  const at = run.createdAt;
+  const refs: RunPrRef[] = [];
+  const created = refUrlNumber(run.pullRequestUrl);
+  if (created !== undefined) refs.push({ number: created, url: run.pullRequestUrl, origin: 'created', at });
+  const declared = run.markerRefs?.pr;
+  const referenced = refUrlNumber(run.referencedPullRequestUrl);
+  if (declared !== undefined) {
+    refs.push({
+      number: declared,
+      ...(referenced === declared && run.referencedPullRequestUrl
+        ? { url: run.referencedPullRequestUrl }
+        : {}),
+      origin: 'marker',
+      at,
+    });
+  }
+  else if (referenced !== undefined && referenced !== created) refs.push({ number: referenced, url: run.referencedPullRequestUrl, origin: 'legacy', at });
+  if (run.prNumber !== undefined && !refs.some((ref) => ref.number === run.prNumber)) {
+    refs.push({ number: run.prNumber, origin: 'derived', at });
+  }
+  return refs;
+}
+
+function primaryPrRef(refs: RunPrRef[]): RunPrRef | undefined {
+  return refs.reduce<RunPrRef | undefined>((best, ref) =>
+    !best || PR_REF_RANK[ref.origin] < PR_REF_RANK[best.origin] ? ref : best,
+  undefined);
+}
+
+function appendPrRefToRun(run: RunRecord, ref: Omit<RunPrRef, 'at'> & { at?: string }): boolean {
+  const hadList = !!run.prRefs;
+  const refs = run.prRefs ?? legacyPrRefs(run);
+  const at = ref.at ?? new Date().toISOString();
+  const existing = refs.find(
+    (candidate) =>
+      candidate.number === ref.number &&
+      (!candidate.url || !ref.url || candidate.url === ref.url),
+  );
+  let changed = !hadList;
+  if (existing) {
+    if (PR_REF_RANK[ref.origin] < PR_REF_RANK[existing.origin]) {
+      existing.origin = ref.origin;
+      changed = true;
+    }
+    if (!existing.url && ref.url) {
+      existing.url = ref.url;
+      changed = true;
+    }
+  } else {
+    refs.push({ ...ref, at });
+    changed = true;
+    while (refs.length > PR_REF_CAP) {
+      const primary = primaryPrRef(refs);
+      const removable = refs.findIndex((candidate) => candidate !== primary && candidate.origin === 'derived');
+      refs.splice(removable >= 0 ? removable : primary ? refs.findIndex((candidate) => candidate !== primary) : 0, 1);
+    }
+  }
+  run.prRefs = refs;
+  const primary = primaryPrRef(refs);
+  const nextNumber = primary?.number;
+  if (run.prNumber !== nextNumber) changed = true;
+  if (nextNumber === undefined) delete run.prNumber;
+  else run.prNumber = nextNumber;
+  return changed;
+}
+
 /**
  * The PR declaration the REFERENCED tier is allowed to act on.
  *
@@ -671,9 +855,14 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
     !opts?.keepLive &&
     (run.status === 'running' || run.status === 'queued' || run.status === 'waiting')
   ) {
+    // A run parked on an unanswered `CEZ:ASK` still owes the user that question — the same
+    // answer `RunManager.recover()` gives, so this reader and the manager agree on "needs you".
+    const askParked = run.status === 'waiting' && run.askParked === true;
     run.status = 'failed';
     run.error = 'interrupted — cezar process exited during the run';
     run.finishedAt = run.finishedAt ?? new Date().toISOString();
+    // Stamped from `finishedAt`, so every cold read of the same record agrees on the instant.
+    if (askParked) run.awaitingAnswerSince = run.finishedAt;
     for (const step of run.steps) {
       if (step.status === 'running' || step.status === 'waiting') step.status = 'failed';
     }
@@ -686,6 +875,8 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
   // hours) — `RunManager.recover()` re-arms it from this field. It can only mean
   // anything on a `failed` run, so anywhere else it is stale bookkeeping.
   if (run.status !== 'failed') run.autoResumeAt = undefined;
+  // Likewise an unanswered question only means anything on the `failed` run it stopped.
+  if (run.status !== 'failed') run.awaitingAnswerSince = undefined;
   // The wake counter is intentionally process-local, so a restarted process
   // starts a fresh epoch instead of displaying a stale cap.
   run.monitoringWakeCapReached = undefined;
@@ -729,6 +920,8 @@ export function reconcileLoadedRun(run: RunRecord, opts?: { keepLive?: boolean }
  */
 export class RunStore extends EventEmitter {
   private runs = new Map<string, RunRecord>();
+  /** The backend of each run's latest session (`session.started`), naming its agent errors. */
+  private sessionBackends = new Map<string, string>();
   /** Ids this process removed on purpose — see `forget`, which is the only thing that writes it. */
   private forgotten = new Set<string>();
   private saveTimer: NodeJS.Timeout | null = null;
@@ -761,6 +954,8 @@ export class RunStore extends EventEmitter {
           for (const run of parsed.data) {
             store.runs.set(run.id, reconcileLoadedRun(run, opts));
           }
+          // Only behind an index that actually loaded — an unreadable one would orphan every layout.
+          pruneOrphanLayouts(dataDir, new Set(store.runs.keys()), ORPHAN_LAYOUT_GRACE_MS);
         } else {
           store.indexReadHealth = { state: 'unavailable', omittedRuns: Array.isArray(raw) ? raw.length : 0, reason: 'Task index could not be loaded by this server' };
         }
@@ -930,7 +1125,31 @@ export class RunStore extends EventEmitter {
     if (normalized.status && normalized.status !== 'waiting') {
       normalized.askParked = undefined;
     }
+    // An unanswered question belongs to the `failed` run its closed session left behind: the
+    // Continue that answers it (`running`/`queued`), and every settlement, retire it.
+    if (normalized.status && normalized.status !== 'failed') {
+      normalized.awaitingAnswerSince = undefined;
+    }
+    // Seed the list from the old values BEFORE applying a patch. Callers that update a scalar
+    // projection often provide the replacement URL/number in the same patch; seeding afterward
+    // would make the historical association unrecoverable.
+    if (!run.prRefs && !normalized.prRefs) run.prRefs = legacyPrRefs(run);
+    // Counted on the transition only (#1438); an auto-resumed attempt failing again repeats a failure already counted.
+    if (normalized.status === 'failed' && run.status !== 'failed' && run.autoResumeAttempts === undefined) {
+      const kind = failureKind(normalized.error ?? run.error);
+      if (kind) track('task_failed', { label: taskFailedLabel(run.runner, kind) });
+    }
     Object.assign(run, this.redactPatch(normalized, id));
+    // Keep legacy writers (including workflow resume/naming paths) in sync without requiring
+    // every caller to know about the additive list. The list's provenance still decides the
+    // compatibility scalar, so an inferred number cannot displace a declared/created one.
+    if (normalized.pullRequestUrl) {
+      const number = refUrlNumber(normalized.pullRequestUrl);
+      if (number !== undefined) appendPrRefToRun(run, { number, url: normalized.pullRequestUrl, origin: 'created' });
+    }
+    if (normalized.prNumber !== undefined) {
+      appendPrRefToRun(run, { number: normalized.prNumber, origin: 'derived' });
+    }
     this.touch(run);
     return run;
   }
@@ -983,6 +1202,20 @@ export class RunStore extends EventEmitter {
     this.touch(run);
   }
 
+  /**
+   * Replace the step list of a run that has not started any step yet (#1078): a queued run whose
+   * workflow changed on disk is re-resolved at dequeue, and the step rail must show the steps
+   * that will actually run. Refused (returns false) once any step has left `pending`, so a run
+   * with history can never have it rewritten.
+   */
+  replacePendingSteps(runId: string, steps: Array<Pick<StepState, 'id' | 'name' | 'kind'>>): boolean {
+    const run = this.runs.get(runId);
+    if (!run || run.steps.some((s) => s.status !== 'pending' || s.iterations > 0)) return false;
+    run.steps = steps.map((s) => ({ ...s, status: 'pending', iterations: 0, tokensUsed: 0 }));
+    this.touch(run);
+    return true;
+  }
+
   updateStep(runId: string, stepId: string, patch: Partial<Omit<StepState, 'id'>>): void {
     const run = this.runs.get(runId);
     const step = run?.steps.find((s) => s.id === stepId);
@@ -1024,6 +1257,7 @@ export class RunStore extends EventEmitter {
     run.archivedAt = archived ? new Date().toISOString() : undefined;
     if (archived) {
       clearPendingAutoResume(run);
+      clearAwaitingAnswer(run);
       clearPin(run);
     }
     this.touch(run);
@@ -1054,10 +1288,16 @@ export class RunStore extends EventEmitter {
   archiveFinished(): number {
     let count = 0;
     for (const run of this.runs.values()) {
-      if (!run.archived && ['done', 'failed', 'cancelled'].includes(run.status)) {
+      // An unanswered question is a gate, not an outcome — like `review`, the bulk sweep leaves it.
+      if (
+        !run.archived &&
+        ['done', 'failed', 'cancelled'].includes(run.status) &&
+        run.awaitingAnswerSince === undefined
+      ) {
         run.archived = true;
         run.archivedAt = new Date().toISOString();
         clearPendingAutoResume(run);
+        clearAwaitingAnswer(run);
         clearPin(run);
         this.touch(run);
         count++;
@@ -1109,6 +1349,8 @@ export class RunStore extends EventEmitter {
    *   - and a `failed` run with a pending `autoResumeAt` is not a done item AT ALL
    *     (`isScheduledResume`, spec 2026-08-03-auto-resume-after-usage-limit): it has an
    *     appointment to pick the work back up, so there is no outcome to have missed.
+   *   - nor is a `failed` run still `awaitingAnswerSince` a question: it sits under
+   *     "needs you", and its signal is that, not an unread outcome.
    *
    *  Keeping the two rules identical is what makes the returned count the number the
    *  cockpit's unread badge was showing. The `autoResumeAt` clause is the one that drifted
@@ -1131,6 +1373,7 @@ export class RunStore extends EventEmitter {
         !run.archived &&
         (run.status === 'done' || run.status === 'failed') &&
         !(run.status === 'failed' && run.autoResumeAt !== undefined) &&
+        !(run.status === 'failed' && run.awaitingAnswerSince !== undefined) &&
         run.finishedAt !== undefined &&
         (run.seenAt === undefined || run.seenAt < run.finishedAt);
       if (!unread) continue;
@@ -1154,6 +1397,11 @@ export class RunStore extends EventEmitter {
     // appends at agent-event rates are effectively free.
     appendFileSync(this.eventsPath(runId), `${JSON.stringify(full)}\n`, 'utf8');
     this.emit('event', { runId, event: full });
+    if (full.type === 'session.started' && typeof full.backend === 'string') this.sessionBackends.set(runId, full.backend);
+    if ((full.type === 'error' || full.type === 'session.error') && typeof full.message === 'string') {
+      reportAgentError(this.sessionBackends.get(runId) ?? run.runner, { type: full.type, message: full.message, fatal: full.fatal });
+    }
+    if (this.janitorSettled(run)) return full;
 
     // The janitor trick: agents print the PR URL after `gh pr create` — the
     // first one spotted in the transcript becomes the run's PR link. Scans v1
@@ -1174,6 +1422,7 @@ export class RunStore extends EventEmitter {
         const created = CREATED_PR_RE.test(claim) ? createdPrUrl(`${claim} ${haystack}`) : undefined;
         if (created) {
           this.updateRun(runId, { pullRequestUrl: created });
+          this.recordPrRef(runId, { number: refUrlNumber(created)!, url: created, origin: 'created' });
           // Adopting the created tier can RELEASE a declaration the referenced tier was holding
           // (see `referencedPrDeclaration`), so re-resolve here too: the about-PR must come back
           // whether the marker arrived before the creation evidence or after it.
@@ -1203,6 +1452,19 @@ export class RunStore extends EventEmitter {
       if (changed) this.touch(run);
     }
     return full;
+  }
+
+  /**
+   * True when no event can change the janitor's answer any more: the created PR is adopted, and the
+   * issue working set is capped so `trackReferencedIssues` could only re-derive what it already
+   * stored — except seeding `issueNumber`, which stays open while that field is empty.
+   */
+  private janitorSettled(run: RunRecord): boolean {
+    return (
+      run.pullRequestUrl !== undefined &&
+      (run.referencedIssueCandidates?.length ?? 0) >= MAX_PR_CANDIDATES &&
+      !(run.markerRefs?.issue === undefined && run.referencedIssueUrl && run.issueNumber === undefined)
+    );
   }
 
   /**
@@ -1296,12 +1558,9 @@ export class RunStore extends EventEmitter {
       ...(refs.pr !== undefined ? { pr: refs.pr } : {}),
       ...(refs.issue !== undefined ? { issue: refs.issue } : {}),
     };
-    // `prNumber` is the about-PR as well (it is what paints a numeric-only chip), so a
-    // re-declaration naming the created PR only FILLS it — it never overwrites the number the
-    // task came in with, which is still the PR this task is about.
-    if (refs.pr !== undefined && (run.prNumber === undefined || refs.pr !== refUrlNumber(run.pullRequestUrl))) {
-      run.prNumber = refs.pr;
-    }
+    // `prNumber` remains a compatibility projection; the ordered list decides which association
+    // is primary, while `referencedPullRequestUrl` retains its existing marker semantics below.
+    if (refs.pr !== undefined) this.recordPrRef(runId, { number: refs.pr, origin: 'marker' });
     if (refs.issue !== undefined) {
       run.issueNumber = refs.issue;
       delete run.referencedIssueNumberSeeded;
@@ -1323,6 +1582,14 @@ export class RunStore extends EventEmitter {
       );
     }
     this.touch(run);
+    return run;
+  }
+
+  /** Record an authoritative PR association and recompute the compatibility scalar projection. */
+  recordPrRef(runId: string, ref: Omit<RunPrRef, 'at'> & { at?: string }): RunRecord | undefined {
+    const run = this.runs.get(runId);
+    if (!run || !Number.isInteger(ref.number) || ref.number <= 0 || ref.number >= MAX_REF) return run;
+    if (appendPrRefToRun(run, ref)) this.touch(run);
     return run;
   }
 
@@ -1438,13 +1705,15 @@ export class RunStore extends EventEmitter {
     return existed;
   }
 
-  /** Write the index out now (used on shutdown). */
-  flush(options: { throwOnError?: boolean } = {}): void {
+  /** Write the index out now. `flush()` is also a mid-run checkpoint (usage, automation launches),
+   *  so indentation is opt-in: only a real shutdown passes `pretty`, leaving the hand-editable file
+   *  the README promises behind a clean exit while every in-run save stays compact. */
+  flush(options: { throwOnError?: boolean; pretty?: boolean } = {}): void {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.saveNow(options.throwOnError);
+    this.saveNow(options.throwOnError, options.pretty ?? false);
   }
 
   // ---- internals -----------------------------------------------------------
@@ -1454,6 +1723,12 @@ export class RunStore extends EventEmitter {
   private nextSeq(runId: string): number {
     const next = (this.seqs.get(runId) ?? this.rehydrateSeq(runId)) + 1;
     this.seqs.set(runId, next);
+    // The high-water mark rides whatever index save happens next — a status flip, a usage update,
+    // the shutdown flush — rather than scheduling one per seq. An ephemeral `item.delta` stream
+    // touches nothing else, so scheduling here would rewrite the whole index once a second for a
+    // run whose transcript never changed; `rehydrateSeq` recovers the tail from disk on its own.
+    const run = this.runs.get(runId);
+    if (run) run.lastSeq = next;
     return next;
   }
 
@@ -1463,11 +1738,45 @@ export class RunStore extends EventEmitter {
    *  resumed event, even across a reload (the frozen-transcript symptom class
    *  of #424). One file read on the first post-restart append per run. */
   private rehydrateSeq(runId: string): number {
+    const persisted = this.runs.get(runId)?.lastSeq;
+    if (persisted !== undefined) return Math.max(persisted, this.tailSeq(runId));
     let max = 0;
     for (const event of this.readEvents(runId)) {
       if (typeof event.seq === 'number' && event.seq > max) max = event.seq;
     }
     return max;
+  }
+
+  /** The `seq` of the last parseable line. Only trusted next to a persisted `lastSeq`: files from
+   *  before it may carry a counter that restarted mid-file, so their maximum is not their tail. */
+  private tailSeq(runId: string): number {
+    let fd: number | undefined;
+    try {
+      fd = openSync(this.eventsPath(runId), 'r');
+      let position = fstatSync(fd).size;
+      let tail: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+      while (position > 0) {
+        const length = Math.min(64 * 1024, position);
+        position -= length;
+        const chunk = Buffer.allocUnsafe(length);
+        const bytesRead = readSync(fd, chunk, 0, length, position);
+        const combined = Buffer.concat([chunk.subarray(0, bytesRead), tail]);
+        let end = combined.length;
+        while (end > 0) {
+          const newline = combined.lastIndexOf(0x0a, end - 1);
+          if (newline === -1 && position > 0) break;
+          const seq = parseSeq(combined.subarray(newline + 1, end).toString('utf8'));
+          if (seq !== undefined) return seq;
+          end = Math.max(newline, 0);
+        }
+        tail = Buffer.from(combined.subarray(0, end));
+      }
+      return 0;
+    } catch {
+      return 0;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
   }
 
   private eventsPath(runId: string): string {
@@ -1497,6 +1806,7 @@ export class RunStore extends EventEmitter {
    *  which is exactly how long a deletion has to outlive its own index entry. */
   private forget(id: string): boolean {
     this.forgotten.add(id);
+    this.sessionBackends.delete(id);
     return this.runs.delete(id);
   }
 
@@ -1513,6 +1823,7 @@ export class RunStore extends EventEmitter {
         rmSync(this.handoffPath(stale.id), { force: true });
         rmSync(this.imagesDir(stale.id), { recursive: true, force: true });
         deleteRunDrafts(this.dataDir, stale.id);
+        deleteRunLayouts(this.dataDir, stale.id); // spec 2026-10-07-task-workspace §5.3
       } catch {
         // best effort
       }
@@ -1525,15 +1836,15 @@ export class RunStore extends EventEmitter {
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
       this.saveNow();
-    }, 300);
+    }, SAVE_DEBOUNCE_MS);
     this.saveTimer.unref?.();
   }
 
-  private saveNow(throwOnError = false): void {
+  private saveNow(throwOnError = false, pretty = false): void {
     const indexPath = join(this.dataDir, 'runs.json');
     const tmpPath = `${indexPath}.tmp`;
     try {
-      writeFileSync(tmpPath, JSON.stringify(this.mergeWithIndexOnDisk(indexPath), null, 2), 'utf8');
+      writeFileSync(tmpPath, JSON.stringify(this.mergeWithIndexOnDisk(indexPath), null, pretty ? 2 : undefined), 'utf8');
       renameSync(tmpPath, indexPath);
     } catch (err) {
       if (throwOnError) throw new Error('Could not persist automation run provenance; the launch was not confirmed.');
@@ -1578,8 +1889,8 @@ export class RunStore extends EventEmitter {
    * over rather than overwrite.
    *
    * Validated one record at a time, and only for the ids we are actually adopting, which is the
-   * difference between this and `open()`'s whole-array parse. `saveNow` runs on a 300 ms debounce
-   * for as long as an agent is streaming, so this runs several times a second on the main thread of
+   * difference between this and `open()`'s whole-array parse. `saveNow` runs on a 1 s debounce
+   * for as long as an agent is streaming, so this runs about once a second on the main thread of
    * the process also serving the cockpit's SSE, while retention lets the index reach
    * `MAX_RUNS_KEPT + MAX_ARCHIVED_KEPT` records — and in the ordinary single-process case every one
    * of them is ours, so a `z.array(...)` parse would spend all of its time validating records the

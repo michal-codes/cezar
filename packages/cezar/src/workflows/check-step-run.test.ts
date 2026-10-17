@@ -192,7 +192,7 @@ posix('check steps through the run loop', () => {
       events(record.id).some((e) => e.type === 'note' && String(e.message).includes('check failed — retrying from')),
     ).toBe(false);
     // Not silent either: the skip is a note on the wire.
-    expect(events(record.id).some((e) => e.type === 'note' && String(e.message).includes('not retrying from'))).toBe(
+    expect(events(record.id).some((e) => e.type === 'note' && String(e.message).includes('not retrying'))).toBe(
       true,
     );
   }, 30_000);
@@ -213,9 +213,14 @@ posix('check steps through the run loop', () => {
     expect(final?.status).toBe('failed');
     expect(final?.steps.map(({ id, status }) => ({ id, status }))).toEqual([{ id: 'check-1', status: 'failed' }]);
     expect(events(record.id).filter((e) => e.type === 'check-output' && e.stepId === 'check-1')).toHaveLength(3);
+    // The graph engine compiles `onFail` into a loop node, so the retry is announced by the loop
+    // transition rather than the v1 step-loop wording — one note per repeat.
     expect(
       events(record.id).filter(
-        (e) => e.type === 'note' && String(e.message).includes('check failed — retrying from'),
+        (e) =>
+          e.type === 'note' &&
+          String(e.message).includes('loop "check-1-retry"') &&
+          String(e.message).includes(', back to "check-1"'),
       ),
     ).toHaveLength(2);
   }, 30_000);

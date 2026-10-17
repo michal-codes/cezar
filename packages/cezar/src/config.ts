@@ -85,6 +85,12 @@ const configSchema = z.object({
    */
   systemPrompt: z.string().trim().min(1).max(20_000).optional().catch(undefined),
   /**
+   * Free-text branch naming instructions (spec 2026-10-11-branch-naming-instructions): the
+   * creation-time namer derives the task branch from the first prompt under these rules.
+   * Absent = `cez/<id8>`. `.catch(undefined)` keeps it additive-safe like `systemPrompt`.
+   */
+  branchNaming: z.string().trim().min(1).max(4_000).optional().catch(undefined),
+  /**
    * Per-runner default model preset (Settings → Agents, redesign R6 1.5): the
    * model id the composer preselects for that runner. Missing = auto (the
    * runner decides). A capability (`model`), never a vendor config format.
@@ -96,8 +102,33 @@ const configSchema = z.object({
       claude: z.string().trim().min(1).max(200).optional(),
       codex: z.string().trim().min(1).max(200).optional(),
       opencode: z.string().trim().min(1).max(200).optional(),
+      junie: z.string().trim().min(1).max(200).optional(),
       cursor: z.string().trim().min(1).max(200).optional(),
       pi: z.string().trim().min(1).max(200).optional(),
+      copilot: z.string().trim().min(1).max(200).optional(),
+    })
+    .optional()
+    .catch(undefined),
+  /**
+   * Per-runner "auto is the default" override (#906). Additive and independent
+   * of `defaultModels` on purpose: absence of a preset cannot express an
+   * explicit auto, because the answer then falls through to the coding agent's
+   * OWN settings file — so a user whose `~/.claude/settings.json` names a model
+   * had no way to say "ignore that, run with no `--model` flag" short of
+   * editing the vendor's file by hand.
+   *
+   * A separate boolean rather than an `"auto"` sentinel inside `defaultModels`
+   * because an older cezar reading this file would pass such a sentinel
+   * straight to `--model`; a key it has never heard of it simply ignores.
+   * `true` means auto; anything else is no opinion, and the writers delete the
+   * key rather than storing `false`.
+   */
+  defaultModelsAuto: z
+    .object({
+      claude: z.boolean().optional(),
+      codex: z.boolean().optional(),
+      opencode: z.boolean().optional(),
+      pi: z.boolean().optional(),
     })
     .optional()
     .catch(undefined),

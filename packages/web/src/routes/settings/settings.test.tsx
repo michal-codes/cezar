@@ -70,6 +70,7 @@ const AGENTS_CONFIG = {
   baseBranch: null,
   defaultRunner: 'claude',
   systemPrompt: null,
+  branchNaming: null,
   defaultModels: {},
   maxParallel: 2,
   memoryLimitMb: null,
@@ -85,7 +86,7 @@ function gateSeededClient(singleProject = false) {
   const client = createQueryClient()
   client.setQueryData(queryKeys.health, {
     bootProject: 'boot',
-    capabilities: { localHandoff: true, followups: true, singleProject },
+    capabilities: { localHandoff: true, terminal: false, followups: true, singleProject },
   })
   client.setQueryData(workspaceQueryKeys.projects, {
     projects: [],
@@ -121,7 +122,7 @@ afterEach(() => {
   document.documentElement.classList.remove('light')
 })
 
-const PROJECT_SECTIONS = ['tracker', 'agents', 'agent-config', 'worktrees', 'bookmarklets', 'prompt-templates']
+const PROJECT_SECTIONS = ['tracker', 'secrets', 'integrations', 'agents', 'instructions', 'tasks', 'agent-config', 'worktrees', 'bookmarklets']
 const GLOBAL_SECTIONS = [
   'appearance',
   'notifications',
@@ -129,8 +130,11 @@ const GLOBAL_SECTIONS = [
   'skills',
   // Agent accounts (spec 2026-07-29-agent-profiles) sit beside Projects: both describe the
   // machine and the person at it, not any one repo.
+  'workspace-secrets',
   'accounts',
   'projects',
+  // Telemetry consent (docs/telemetry.md) — one answer per machine.
+  'privacy',
 ]
 
 describe('the section registry', () => {
@@ -157,7 +161,7 @@ describe('the section registry', () => {
     // Accounts survives: a single-project cockpit still runs on ONE of possibly several logins,
     // so "which account" is orthogonal to "how many projects".
     expect(visibleSettingsSections('global', { singleProject: true }).map((s) => s.id)).toEqual([
-      'appearance', 'notifications', 'resources', 'skills', 'accounts',
+      'appearance', 'notifications', 'resources', 'skills', 'workspace-secrets', 'accounts', 'privacy',
     ])
     expect(visibleSettingsSections('global', { singleProject: false }).map((s) => s.id)).toEqual(GLOBAL_SECTIONS)
     expect(visibleSettingsSections('global').map((s) => s.id)).toEqual(GLOBAL_SECTIONS)

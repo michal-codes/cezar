@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /** The agent backends a run can be dispatched to. */
-export const runnerSchema = z.enum(['claude', 'codex', 'opencode', 'cursor', 'pi']);
+export const runnerSchema = z.enum(['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot']);
 export type Runner = z.infer<typeof runnerSchema>;
 
 /** Git facts about the project root, or `null` when it is not a repository. */
@@ -14,7 +14,7 @@ export type RepoInfo = z.infer<typeof repoInfoSchema>;
 
 /** One probed CLI behind the Tools menu. */
 export const backendCheckSchema = z.object({
-  name: z.enum(['claude', 'codex', 'opencode', 'cursor', 'pi', 'gh', 'git']),
+  name: z.enum(['claude', 'codex', 'opencode', 'cursor', 'pi', 'junie', 'copilot', 'gh', 'git']),
   available: z.boolean(),
   version: z.string().optional(),
   hint: z.string().optional(),
@@ -38,6 +38,9 @@ export type ForgeInfo = z.infer<typeof forgeInfoSchema>;
 /** Server-side feature switches the cockpit reads once at boot. */
 export const capabilitiesSchema = z.object({
   localHandoff: z.boolean(),
+  /** May this cockpit open an interactive terminal in a task worktree? Policy, not availability:
+   *  the terminal family's own endpoint says whether the optional PTY binding loaded. */
+  terminal: z.boolean(),
   followups: z.boolean(),
   singleProject: z.boolean(),
   /**
