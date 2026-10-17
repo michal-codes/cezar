@@ -567,6 +567,29 @@ describe('reduceThread — check-output (check steps, v1-only by nature)', () =>
     expect(spawn).toMatchObject({ status: 'failed', exitCode: -1 })
   })
 
+  it.each([
+    ['timed-out', 'timed out'],
+    ['could-not-run', 'could not run'],
+    ['cancelled', 'cancelled'],
+    ['skipped', 'skipped'],
+  ])('keeps a %s outcome visible instead of collapsing it into a bare failed card', (status, label) => {
+    const { turns } = reduceThread([
+      line(1, 'check-output', {
+        stepId: 'verify',
+        command: 'npm test',
+        text: 'nothing ran',
+        exitCode: -1,
+        status,
+      }),
+    ])
+    expect(turns[0]!.items[0]).toMatchObject({
+      kind: 'tool',
+      title: `Ran npm test (${label})`,
+      status: 'failed',
+      exitCode: -1,
+    })
+  })
+
   it('survives inside a v2-covered turn (it is meta, not an agent item twin)', () => {
     const { turns } = reduceThread([
       line(1, 'turn.started', { turnId: 'turn_1' }),
