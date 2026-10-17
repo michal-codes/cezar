@@ -16,6 +16,8 @@ import { workflowStepSchema, type WorkflowDef } from './types.ts';
 
 const run = promisify(execFile);
 const GIT_ID = ['-c', 'user.name=test', '-c', 'user.email=test@local'];
+/** The canned text a dry-run Cursor turn emits, so a resumed session carries a value we can watch. */
+const CURSOR_MOCK_OUTPUT = 'mock: cursor dry-run completed the task.';
 
 /**
  * Project and workspace secrets reach CHECK steps only (spec 2026-10-10-project-secrets-vault-options,
@@ -75,6 +77,27 @@ describe('project and workspace secrets in check steps', () => {
     while (!terminal.has(store.getRun(id)?.status ?? '')) {
       if (Date.now() > deadline) throw new Error('run did not finish in time');
       await new Promise((r) => setTimeout(r, 100));
+    }
+  };
+
+  /** Wait for a real text event to hit the run's NDJSON, then return its persisted text. */
+  const waitForPersistedText = async (id: string): Promise<string> => {
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      try {
+        const text = readFileSync(join(repoRoot, '.ai/cezar/runs', `${id}.ndjson`), 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as { type?: string; text?: string })
+          .filter((event) => event.type === 'text' && typeof event.text === 'string')
+          .map((event) => event.text as string)
+          .join('\n');
+        if (text) return text;
+      } catch {
+        // The NDJSON file may not exist until the resumed session emits its first event.
+      }
+      if (Date.now() > deadline) throw new Error('timed out waiting for a persisted text event');
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
   };
 
@@ -380,7 +403,7 @@ describe('project and workspace secrets in check steps', () => {
   }, 40_000);
 
   it('keeps the boot-scrub redactor for a live agent-cursor run that recovery resumes', async () => {
-    const credential = 'live-agent-cursor-secret-0123456789';
+    const credential = CURSOR_MOCK_OUTPUT;
     await secrets.set(scope, 'LIVE_AGENT_KEY', credential);
     const graph: WorkflowGraph = {
       nodes: [
@@ -400,10 +423,13 @@ describe('project and workspace secrets in check steps', () => {
     });
     store.updateRun(running.id, {
       status: 'running',
+      runner: 'cursor',
       workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
       graphState: { loops: {}, taken: [], cursor: 'agent', outputs: { first: { exitCode: 0, output: credential } } },
     });
-    store.updateStep(running.id, 'agent', { status: 'running', sessionId: 'legacy-agent-session' });
+    store.updateStep(running.id, 'agent', {
+      status: 'running', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
 
     manager.dispose();
     store.flush();
@@ -415,10 +441,241 @@ describe('project and workspace secrets in check steps', () => {
     // resumed session may echo a value from the pre-fix context before any check runs again.
     expect(store.getRun(running.id)?.graphState?.outputs?.first?.output).toContain('[REDACTED]');
     expect(store.redactRunText(running.id, credential)).toBe('[REDACTED]');
-    store.appendEvent(running.id, { type: 'text', text: `post-recovery output: ${credential}`, stepId: 'agent' });
-    expect(
-      readFileSync(join(repoRoot, '.ai/cezar/runs', `${running.id}.ndjson`), 'utf8'),
-    ).not.toContain(credential);
+    // Waiting for the resumed turn's own text event proves recovery actually started it; parsing
+    // the NDJSON then proves the event was redacted on the real persistence path, not just in a
+    // synthetic append.
+    const text = await waitForPersistedText(running.id);
+    expect(text).toContain('[REDACTED]');
+    expect(text).not.toContain(credential);
+  }, 40_000);
+
+  it('rehydrates before a user Continue of a recovered waiting run can persist text', async () => {
+    const credential = CURSOR_MOCK_OUTPUT;
+    await secrets.set(scope, 'WAITING_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'first', type: 'check', command: 'echo first' },
+        { id: 'agent', type: 'agent', prompt: 'mock:done' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'first' },
+        { from: 'first', to: 'agent' },
+        { from: 'agent', to: 'finish' },
+      ],
+    };
+    const waiting = store.createRun({
+      title: 'waiting', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph),
+    });
+    store.updateRun(waiting.id, {
+      status: 'waiting',
+      runner: 'cursor',
+      workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      graphState: { loops: {}, taken: [], cursor: 'agent', outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    store.updateStep(waiting.id, 'agent', {
+      status: 'waiting', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+    expect(manager.continueRun(waiting.id, { text: 'Continue probe' })).toEqual({ ok: true });
+    const text = await waitForPersistedText(waiting.id);
+    expect(text).toContain('[REDACTED]');
+    expect(text).not.toContain(credential);
+  }, 40_000);
+
+  it('keeps the checks audience out of a user Continue of an untrusted waiting run', async () => {
+    const credential = CURSOR_MOCK_OUTPUT;
+    await secrets.set(scope, 'WAITING_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'first', type: 'check', command: 'echo first' },
+        { id: 'agent', type: 'agent', prompt: 'mock:done' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'first' },
+        { from: 'first', to: 'agent' },
+        { from: 'agent', to: 'finish' },
+      ],
+    };
+    const waiting = store.createRun({
+      title: 'untrusted waiting', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph),
+    });
+    store.updateRun(waiting.id, {
+      status: 'waiting',
+      runner: 'cursor',
+      untrustedHead: true,
+      workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      graphState: { loops: {}, taken: [], cursor: 'agent', outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    store.updateStep(waiting.id, 'agent', {
+      status: 'waiting', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+    expect(manager.continueRun(waiting.id, { text: 'Continue probe' })).toEqual({ ok: true });
+    const text = await waitForPersistedText(waiting.id);
+    // A fork head never had checks secrets: rehydrating them on Continue would over-redact and
+    // silently change the meaning of its transcript. The raw canned value proves no rehydration.
+    expect(text).toContain(credential);
+    expect(store.redactRunText(waiting.id, credential)).toBe(credential);
+  }, 40_000);
+
+  it('releases the boot-scrub redactor when a recovered queued run cannot be revived', async () => {
+    const credential = 'queued-recovery-failure-secret-0123456789';
+    await secrets.set(scope, 'QUEUED_KEY', credential);
+    const queued = store.createRun({
+      title: 'queued failure', workflow: 'missing-workflow', task: 'x', worktree: false, steps: [],
+    });
+    store.updateRun(queued.id, {
+      status: 'queued',
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+
+    expect(store.getRun(queued.id)?.status).toBe('failed');
+    expect(readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8')).not.toContain(credential);
+    expect(store.redactRunText(queued.id, credential)).toBe(credential);
+  }, 40_000);
+
+  it('releases the boot-scrub redactor when a recovered queued run is cancelled', async () => {
+    const credential = 'queued-cancel-secret-0123456789';
+    await secrets.set(scope, 'QUEUED_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'first', type: 'check', command: 'echo first' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'first' },
+        { from: 'first', to: 'finish' },
+      ],
+    };
+    const queued = store.createRun({
+      title: 'queued cancel', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph),
+    });
+    store.updateRun(queued.id, {
+      status: 'queued',
+      workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    (manager as unknown as { pump: () => Promise<void> }).pump = async () => {};
+    await manager.recover();
+
+    // While it is still queued, the boot scrub's checks audience must be resident: a resumed
+    // continuation may echo the pre-fix output before its own check registers.
+    expect(store.redactRunText(queued.id, credential)).toBe('[REDACTED]');
+    expect(manager.cancel(queued.id)).toBe(true);
+    expect(store.getRun(queued.id)?.status).toBe('cancelled');
+    expect(store.redactRunText(queued.id, credential)).toBe(credential);
+  }, 40_000);
+
+  it('releases the boot-scrub redactor when a recovered running run cannot resume', async () => {
+    const credential = 'running-resume-failure-secret-0123456789';
+    await secrets.set(scope, 'RUNNING_KEY', credential);
+    const running = store.createRun({ title: 'running failure', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(running.id, {
+      status: 'running',
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    store.updateStep(running.id, 'agent', { status: 'running', sessionId: 'legacy-agent-session' });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    (manager as unknown as { continueRun: () => { ok: false; error: string } }).continueRun = () => ({
+      ok: false, error: 'probe — cannot resume',
+    });
+    await manager.recover();
+
+    expect(store.redactRunText(running.id, credential)).toBe(credential);
+  }, 40_000);
+
+  it('reserves a continuation in active before awaiting its rehydration', async () => {
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'agent', type: 'agent', prompt: 'mock:done' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'agent' },
+        { from: 'agent', to: 'finish' },
+      ],
+    };
+    const waiting = store.createRun({
+      title: 'reentrancy', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph),
+    });
+    store.updateRun(waiting.id, {
+      status: 'waiting',
+      workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      graphState: { loops: {}, taken: [], cursor: 'agent' },
+    });
+    store.updateStep(waiting.id, 'agent', { status: 'waiting', sessionId: 'legacy-agent-session' });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+
+    let release!: (error?: Error) => void;
+    const gate = new Promise<void>((resolve, reject) => {
+      release = (error) => (error ? reject(error) : resolve());
+    });
+    const spy = vi
+      .spyOn(manager as unknown as { rehydrateResumeRedaction: (id: string) => Promise<void> }, 'rehydrateResumeRedaction')
+      .mockImplementation(() => gate);
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'first' })).toEqual({ ok: true });
+      const activeDeadline = Date.now() + 5_000;
+      while (!manager.isActive(waiting.id)) {
+        if (Date.now() > activeDeadline) throw new Error('continuation never reserved the run');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      // The synchronous reservation must be visible while rehydration is still pending.
+      expect(manager.continueRun(waiting.id, { text: 'second' })).toEqual({
+        ok: false, error: 'run is still active',
+      });
+
+      release(new Error('probe — release the gated continuation'));
+      const failedDeadline = Date.now() + 5_000;
+      while (store.getRun(waiting.id)?.status !== 'failed') {
+        if (Date.now() > failedDeadline) throw new Error('gated continuation did not settle');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      release();
+      spy.mockRestore();
+    }
   }, 40_000);
 
   it('without a secret store the check runs with the minimal env: toolchain vars, no vendor keys (#1164)', async () => {

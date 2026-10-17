@@ -1833,6 +1833,9 @@ export class RunManager {
         error: 'interrupted — workflow definition not recoverable after a restart',
         finishedAt: new Date().toISOString(),
       });
+      // This terminal transition never enters `active`, so it never reaches `dropActive`; a
+      // boot scrub that registered the checks audience for this queued run must release it here.
+      this.store.clearRunSecrets(run.id);
       this.store.appendEvent(run.id, {
         type: 'lifecycle',
         message: `${reason} — workflow definition not recoverable, task failed`,
@@ -2022,6 +2025,9 @@ export class RunManager {
         },
         true,
       );
+      // A continuation that refuses to start never enters `active`, so `dropActive` cannot
+      // release the boot-scrub redactor this recovered `running` record was holding.
+      if (!resumed.ok) this.store.clearRunSecrets(run.id);
       this.store.appendEvent(run.id, {
         type: 'lifecycle',
         message: resumed.ok
@@ -3173,6 +3179,8 @@ export class RunManager {
       this.pendingBranchNames.delete(runId);
       this.pendingContinuations.delete(runId);
       this.store.updateRun(runId, { status: 'cancelled', finishedAt: new Date().toISOString() });
+      // A queued run never entered `active`; release the boot-scrub redactor here too.
+      this.store.clearRunSecrets(runId);
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'cancelled while queued' });
       // A queued run never entered `active`, so it never reaches `dropActive` — the one terminal
       // transition that misses the settle hook. Without this a parent waiting on a child the user
@@ -3860,10 +3868,6 @@ export class RunManager {
     ownerToken?: symbol,
   ): Promise<void> {
     const effectiveOwnerToken = ownerToken ?? Symbol('run-owner');
-    // A continuation can outlive the boot scrub (a user Continue of an old run, or a recovered
-    // agent-cursor session) and its model context may still hold a pre-fix check value. Register
-    // the checks audience for redaction before this turn can append any event.
-    await this.rehydrateResumeRedaction(runId);
     // Continuation runs in the task's worktree when it still exists (spec
     // 006) — the resumed session sees exactly what the original run left.
     // Retention (#483) may have reclaimed this run's worktree directory while
@@ -3917,6 +3921,15 @@ export class RunManager {
     this.checkArtifactSnapshots.set(runId, state.autosaveExcludedPaths);
     this.active.set(runId, state);
     this.starting.delete(runId);
+    // A continuation can outlive the boot scrub (a user Continue of an old run, or a recovered
+    // agent-cursor session) and its model context may still hold a pre-fix check value. The run
+    // is reserved in `active` by now — a second Continue or a delete must already see it — and
+    // this await still precedes every event this turn can append.
+    await this.rehydrateResumeRedaction(runId);
+    if (state.cancelled) {
+      this.dropActive(runId, state);
+      return;
+    }
     if (state.cwd === this.repoRoot) {
       if (repositoryRootLockDisabled()) {
         this.store.appendEvent(runId, {
