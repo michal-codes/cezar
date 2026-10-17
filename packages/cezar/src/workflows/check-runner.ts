@@ -229,6 +229,9 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
   if (limitMs !== undefined && limitMs <= 0) {
     return nothing('timed-out', `timed out: the gate deadline had already expired — nothing was run`);
   }
+  // The preflight above ran before shell resolution; a callback on the way here
+  // (or a signal already aborted by an injected resolver) must not buy a spawn.
+  if (options.signal?.aborted) return nothing('cancelled', 'cancelled before the command started');
 
   return await new Promise<CheckOutcome>((resolve) => {
     let output = '';
@@ -351,6 +354,9 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
       limitTimer.unref?.();
     }
     options.signal?.addEventListener('abort', onAbort, { once: true });
+    // `abort` does not replay for a listener added after it fired. Ask once more
+    // after registration so an abort that raced the spawn setup is not lost.
+    if (options.signal?.aborted) onAbort();
 
     child.stdout?.on('data', collect);
     child.stderr?.on('data', collect);

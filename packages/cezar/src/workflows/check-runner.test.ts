@@ -266,6 +266,25 @@ process.exit(0);
     expect(await waitUntilDead(readPid('grandchild'))).toBe(true);
   }, 15_000);
 
+  it('honours an abort that lands between the preflight check and the listener', async () => {
+    // The abort can race the spawn setup: the preflight check sees a live
+    // signal, then the signal aborts before `addEventListener` runs. Without a
+    // second check the event is lost and the command runs to completion.
+    const controller = new AbortController();
+    const outcome = await runCheckCommand({
+      cwd,
+      command: 'echo ran > ran.txt',
+      signal: controller.signal,
+      resolveShell: () => {
+        controller.abort();
+        return '/bin/bash';
+      },
+    });
+    expect(outcome.status).toBe('cancelled');
+    expect(outcome.ok).toBe(false);
+    expect(existsSync(join(cwd, 'ran.txt'))).toBe(false);
+  }, 10_000);
+
   /**
    * The review's hang probe. A group-escaping grandchild is unreachable by
    * `terminateGroup` (the group looks empty, so no SIGKILL is armed), and its
