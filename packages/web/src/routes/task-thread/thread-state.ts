@@ -256,6 +256,24 @@ function providerId(value: unknown): ThreadProviderAuthRequired['provider'] | un
 const isAskQuestion = (value: unknown): value is UiAskQuestion =>
   isRecord(value) && typeof value.header === 'string' && Array.isArray(value.options)
 
+/** The check outcomes that are neither a pass nor an ordinary non-zero exit. The exit-code
+ *  pill cannot tell a timeout from a spawn failure (both are `-1`), so these ride the title;
+ *  older runs predate the additive `status` field and keep the plain "Ran …" line. */
+function checkOutcomeLabel(value: unknown): string | undefined {
+  switch (value) {
+    case 'timed-out':
+      return 'timed out'
+    case 'could-not-run':
+      return 'could not run'
+    case 'cancelled':
+      return 'cancelled'
+    case 'skipped':
+      return 'skipped'
+    default:
+      return undefined
+  }
+}
+
 /** The engine's turn-end markers (`CEZ:DONE`, `CEZ:MONITORING` from #490) plus the in-band
  *  task-reference marker lines (`CEZ:PR=` / `CEZ:ISSUE=` / `CEZ:TITLE=`, spec
  *  2026-07-18-task-ref-markers). v1 `text` lines arrive pre-stripped by the server; v2 message
@@ -650,12 +668,13 @@ export function reduceThread(events: RunEvent[], options: ThreadReduceOptions = 
         // agent item and must survive the mixed-file dedup.
         const command = str(event.command) ?? 'check'
         const exitCode = typeof event.exitCode === 'number' ? event.exitCode : -1
+        const outcome = checkOutcomeLabel(event.status)
         const item: UiToolItem = {
           kind: 'tool',
           id: `v1:${event.seq}`,
           name: 'check',
           toolKind: 'execute',
-          title: `Ran ${command}`,
+          title: outcome === undefined ? `Ran ${command}` : `Ran ${command} (${outcome})`,
           status: exitCode === 0 ? 'completed' : 'failed',
           output: str(event.text) ?? '',
           exitCode,
