@@ -204,6 +204,39 @@ describe('project and workspace secrets in check steps', () => {
     expect(retried).not.toContain(token);
   }, 40_000);
 
+  it('scrubs a passing check\'s output before a node reference reaches the next agent, and before it is persisted', async () => {
+    const credential = 'e2e-credential-value-0123456789';
+    await secrets.set(scope, 'E2E_GATEWAY_KEY', credential);
+    const record = manager.startRun(
+      {
+        name: 'check-then-implement',
+        source: 'file',
+        steps: [
+          { id: 'verify', name: 'Verify', command: 'echo "$E2E_GATEWAY_KEY"' },
+          { id: 'implement', name: 'Implement', prompt: '{{task}} — check said: {{nodes.verify.output}}' },
+        ],
+      },
+      { task: 'mock:done go', worktree: false },
+    );
+    await settle(record.id);
+
+    const prompts = readFileSync(stdinLog, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => (JSON.parse(line) as { userText: string }).userText);
+    const nextPrompt = prompts.find((text) => text.includes('check said:'));
+    expect(nextPrompt).toBeDefined();
+    expect(nextPrompt).toContain('[REDACTED]');
+    expect(nextPrompt).not.toContain(credential);
+
+    const persisted = store.getRun(record.id)?.graphState?.outputs?.verify;
+    expect(persisted?.output).toContain('[REDACTED]');
+    expect(persisted?.output).not.toContain(credential);
+
+    store.flush();
+    expect(readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8')).not.toContain(credential);
+  }, 40_000);
+
   it('without a secret store the check runs with the minimal env: toolchain vars, no vendor keys (#1164)', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-exported-for-e2e-0123456789';
     try {

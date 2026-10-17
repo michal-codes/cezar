@@ -247,10 +247,12 @@ for follow-ups.
 - **cwd** is the task's worktree, and the command runs under
   `bash --noprofile --norc -c` (no login profile).
 - **Environment** is a minimal one — the toolchain basics (`PATH`, `HOME`,
-  locale, `TMPDIR`, …) with no vendor or cloud credentials, no `GITHUB_TOKEN`/`GH_*`
+  locale, `TMPDIR`, …) with no vendor or cloud credentials, no `GITHUB_*`/`GH_*`
   and no inherited `CEZ_*` — plus the run context and the **secrets** the step
   may read (below). A host variable a check genuinely needs that is not a
-  credential (a CI flag, `SSH_AUTH_SOCK`) can be named in `CEZ_ENV_PASSTHROUGH`. There is no per-step `env:` — workflow files are
+  credential (a CI flag, `SSH_AUTH_SOCK`) can be named in `CEZ_ENV_PASSTHROUGH`;
+  a fork-head check gets no passthrough at all, and the hatch can never reopen
+  a credential family. There is no per-step `env:` — workflow files are
   committed, and a secret's value does not belong in them; a step names the
   secrets it needs instead. Tests with no agent step need no model at all.
 - **Model credentials go in `cezar secrets`, not in your shell.** Store the

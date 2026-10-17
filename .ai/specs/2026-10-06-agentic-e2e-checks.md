@@ -212,7 +212,7 @@ docs show the two-call fallback.
 
 | Scenario | Before | After |
 | --- | --- | --- |
-| Workflow with checks, no `check-env` file | check gets `process.env` | same, plus `CEZ_*` context vars |
+| Workflow with checks, no `check-env` file | check gets `process.env` | minimal `buildCheckEnv()` base plus `CEZ_*` context vars (2026-10-17, #1164) |
 | Failing check output in the retry prompt | raw | redacted with host and run secrets |
 | User who exported `ANTHROPIC_API_KEY` per the old docs | works, and leaks into agents | unchanged (no behavior removed); docs now steer to `check-env` |
 | `pull_request.opened` automation without `checkout` | worktree from base | unchanged |
@@ -257,7 +257,8 @@ Prove-red rule applies: for each fix test, `git stash push -- <source files>`, c
   `check-env`, the claude agent env has no `ANTHROPIC_API_KEY`.
 - `check-retry-redaction.test.ts`: a check that echoes a `check-env` value and a `sk-ant-…` token fails; the
   retried agent's prompt contains `[REDACTED]` and neither value. Red on `main`.
-- Guard: no `check-env` file → check env equals `process.env` plus context vars.
+- Guard: no `check-env` file → check env is the minimal `buildCheckEnv()` base plus context vars, never the
+  full `process.env` (see the amended note above).
 
 **Phase 2**
 

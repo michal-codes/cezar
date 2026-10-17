@@ -5067,7 +5067,14 @@ export class RunManager {
         }
         const { ok, output, exitCode, status } = checkResult;
         if (state.cancelled) return null;
-        outputs.set(node.id, { exitCode, output });
+        // The check output has THREE consumers, not one: the transcript event
+        // (scrubbed by `appendEvent`), the retry prompt, and `{{nodes.<id>.output}}`
+        // — which is also what `graphState.outputs` persists to `runs.json` and
+        // replays on resume. Redact at the source so a passing check cannot carry
+        // a registered secret into the next agent prompt or a state file. The
+        // failing branch reuses this one scrubbed copy below.
+        const safeOutput = this.store.redactRunText(runId, output);
+        outputs.set(node.id, { exitCode, output: safeOutput });
         if (status !== 'passed' && status !== 'failed') {
           // Not a verdict on the diff (#1164): after the gate deadline every retry runs nothing,
           // and a missing shell never runs anything, so the fail port's loop back to an agent
@@ -5090,7 +5097,7 @@ export class RunManager {
           // The output goes into the next agent prompt — to the agent's model provider — so it is
           // scrubbed like an event is: host secrets, this run's registered secrets (project
           // secrets included) and token patterns. Strictly narrowing, for every workflow.
-          checkFailure = this.store.redactRunText(runId, output);
+          checkFailure = safeOutput;
           if (node.retryOn?.length && !node.retryOn.includes(exitCode)) {
             const codes = node.retryOn.join(', ');
             const error = `check "${node.id}" exited ${exitCode}, which onFail.retryOn (${codes}) does not retry`;
@@ -7311,6 +7318,7 @@ export class RunManager {
     this.store.registerRunSecrets(
       runId,
       Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN),
+    );
   }
 
   /**
