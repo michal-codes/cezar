@@ -874,6 +874,114 @@ describe('project and workspace secrets in check steps', () => {
     }
   }, 60_000);
 
+  it('wakes the workspace queue when a pump-started continuation fails before ActiveRun', async () => {
+    const interrupted = store.createRun({ title: 'pump continuation failure', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(interrupted.id, { status: 'queued' });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, {
+      projectId: project,
+      secrets,
+      semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 1 } }),
+    });
+
+    const internals = manager as unknown as {
+      pendingContinuations: Map<string, {
+        stepId: string;
+        sessionId: string | undefined;
+        backend: 'cursor';
+        prompt: string;
+        images: [];
+      }>;
+      queue: string[];
+      pump(): Promise<void>;
+      runContinuation: (runId: string, ...args: unknown[]) => Promise<void>;
+    };
+    internals.pendingContinuations.set(interrupted.id, {
+      stepId: 'continue-1',
+      sessionId: 'legacy-agent-session',
+      backend: 'cursor',
+      prompt: 'recovered after restart',
+      images: [],
+    });
+    internals.queue.push(interrupted.id);
+
+    let entered!: () => void;
+    const continuationEntered = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const continuationGate = new Promise<void>((resolve) => { release = resolve; });
+    const continuationSpy = vi.spyOn(internals, 'runContinuation').mockImplementation(async () => {
+      entered();
+      await continuationGate;
+      throw new Error('pre-active pump continuation failed');
+    });
+    try {
+      await internals.pump();
+      await continuationEntered;
+      // The starting reservation is the only busy slot, so this run must wait in the queue.
+      const queued = manager.startRun(checkOnly('echo queued'), { task: 'mock:done queued', worktree: false });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(store.getRun(queued.id)?.status).toBe('queued');
+
+      release();
+      // The continuation never entered `active`, so only its failure catch can wake the queue.
+      await until(queued.id, (record) => record.status !== 'queued', 5_000);
+      await settle(queued.id);
+      expect(store.getRun(queued.id)?.status).toBe('done');
+      expect(manager.isActive(interrupted.id)).toBe(false);
+    } finally {
+      release();
+      continuationSpy.mockRestore();
+    }
+  }, 60_000);
+
+  it('wakes the workspace queue when a direct Continue fails before ActiveRun', async () => {
+    const waiting = store.createRun({ title: 'direct continuation failure', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(waiting.id, { status: 'done', runner: 'cursor' });
+    store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
+    store.updateStep(waiting.id, 'agent', {
+      status: 'done', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, {
+      projectId: project,
+      secrets,
+      semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 1 } }),
+    });
+
+    const internals = manager as unknown as {
+      runContinuation: (runId: string, ...args: unknown[]) => Promise<void>;
+    };
+    let release!: () => void;
+    const continuationGate = new Promise<void>((resolve) => { release = resolve; });
+    const continuationSpy = vi.spyOn(internals, 'runContinuation').mockImplementation(async () => {
+      await continuationGate;
+      throw new Error('pre-active direct continuation failed');
+    });
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'hold the slot, then fail' })).toEqual({ ok: true });
+      expect(manager.isActive(waiting.id)).toBe(true);
+      const queued = manager.startRun(checkOnly('echo queued'), { task: 'mock:done queued', worktree: false });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(store.getRun(queued.id)?.status).toBe('queued');
+
+      release();
+      // The continuation never entered `active`, so only its failure catch can wake the queue.
+      await until(queued.id, (record) => record.status !== 'queued', 5_000);
+      await settle(queued.id);
+      expect(store.getRun(queued.id)?.status).toBe('done');
+      expect(manager.isActive(waiting.id)).toBe(false);
+    } finally {
+      release();
+      continuationSpy.mockRestore();
+    }
+  }, 60_000);
+
   it('clears secrets that resolve after a cancel during rehydration', async () => {
     const credential = 'cancel-during-rehydration-secret-0123456789';
     await secrets.set(scope, 'CANCEL_KEY', credential);
