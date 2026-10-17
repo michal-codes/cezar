@@ -683,6 +683,79 @@ describe('project and workspace secrets in check steps', () => {
     }
   }, 40_000);
 
+  it('reserves a user Continue synchronously before rematerialization can await', async () => {
+    const waiting = store.createRun({ title: 'pre-active reservation', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(waiting.id, { status: 'waiting', runner: 'cursor' });
+    store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
+    store.updateStep(waiting.id, 'agent', {
+      status: 'waiting', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+
+    expect(manager.continueRun(waiting.id, { text: 'first' })).toEqual({ ok: true });
+    // The synchronous reservation is what makes the second Continue and the delete guard work
+    // while runContinuation is still awaiting rematerialization, before ActiveRun exists.
+    expect(manager.isActive(waiting.id)).toBe(true);
+    expect(manager.continueRun(waiting.id, { text: 'second' })).toEqual({
+      ok: false, error: 'run is still active',
+    });
+    const app = createApp({ repoRoot, store, manager, version: '0.0.0-test' });
+    const deleted = await apiRequest(app, `/api/v1/runs/${waiting.id}`, { method: 'DELETE' });
+    expect(deleted.status).toBe(409);
+
+    await waitForPersistedText(waiting.id);
+    expect(store.getRun(waiting.id)?.steps.filter((step) => step.id.startsWith('continue-'))).toHaveLength(1);
+  }, 40_000);
+
+  it('cancels a continuation reserved before it builds an ActiveRun', async () => {
+    const waiting = store.createRun({ title: 'pre-active cancel', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(waiting.id, { status: 'waiting', runner: 'cursor' });
+    store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
+    store.updateStep(waiting.id, 'agent', {
+      status: 'waiting', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+
+    const internals = manager as unknown as {
+      runContinuation: (runId: string, ...args: unknown[]) => Promise<void>;
+      rehydrateResumeRedaction: (id: string) => Promise<void>;
+    };
+    let settled!: () => void;
+    const continuationSettled = new Promise<void>((resolve) => { settled = resolve; });
+    const realContinuation = internals.runContinuation.bind(manager);
+    const continuationSpy = vi.spyOn(internals, 'runContinuation').mockImplementation((...args) => {
+      const pending = realContinuation(...args);
+      void pending.then(settled, settled);
+      return pending;
+    });
+    const rehydrateSpy = vi.spyOn(internals, 'rehydrateResumeRedaction');
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'cancel before ActiveRun' })).toEqual({ ok: true });
+      expect(manager.cancel(waiting.id)).toBe(true);
+      expect(store.getRun(waiting.id)?.status).toBe('cancelled');
+
+      await continuationSettled;
+      expect(rehydrateSpy).not.toHaveBeenCalled();
+      expect(manager.isActive(waiting.id)).toBe(false);
+      expect(store.getRun(waiting.id)?.status).toBe('cancelled');
+    } finally {
+      continuationSpy.mockRestore();
+      rehydrateSpy.mockRestore();
+    }
+  }, 40_000);
+
   it('clears secrets that resolve after a cancel during rehydration', async () => {
     const credential = 'cancel-during-rehydration-secret-0123456789';
     await secrets.set(scope, 'CANCEL_KEY', credential);
@@ -707,18 +780,20 @@ describe('project and workspace secrets in check steps', () => {
     const realRehydrate = internals.rehydrateResumeRedaction.bind(manager);
     let registered!: () => void;
     const registration = new Promise<void>((resolve) => { registered = resolve; });
+    let entered!: () => void;
+    const rehydrateEntered = new Promise<void>((resolve) => { entered = resolve; });
     const spy = vi.spyOn(internals, 'rehydrateResumeRedaction').mockImplementation(async (id) => {
+      entered();
       await gate;
       await realRehydrate(id);
       registered();
     });
+    const registrations = vi.spyOn(store, 'registerRunSecrets');
     try {
       expect(manager.continueRun(waiting.id, { text: 'cancel probe' })).toEqual({ ok: true });
-      const activeDeadline = Date.now() + 5_000;
-      while (!manager.isActive(waiting.id)) {
-        if (Date.now() > activeDeadline) throw new Error('continuation never reserved the run');
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      // Wait for the ActiveRun + rehydration phase specifically; `isActive` is true from the
+      // synchronous reservation onward, so it can no longer distinguish those phases.
+      await rehydrateEntered;
 
       expect(manager.cancel(waiting.id)).toBe(true);
       expect(store.getRun(waiting.id)?.status).toBe('cancelled');
@@ -726,6 +801,7 @@ describe('project and workspace secrets in check steps', () => {
 
       release();
       await registration;
+      expect(registrations).toHaveBeenCalledWith(waiting.id, [credential]);
       const cleanDeadline = Date.now() + 5_000;
       while (store.redactRunText(waiting.id, credential) !== credential) {
         if (Date.now() > cleanDeadline) throw new Error('resolved rehydration left the cancelled run redacted');
@@ -735,6 +811,218 @@ describe('project and workspace secrets in check steps', () => {
     } finally {
       release();
       spy.mockRestore();
+      registrations.mockRestore();
+    }
+  }, 40_000);
+
+  it("keeps a newer owner's redactor when a cancelled continuation resolves late", async () => {
+    const credential = 'newer-owner-secret-0123456789';
+    await secrets.set(scope, 'OWNER_KEY', credential);
+    const waiting = store.createRun({ title: 'newer owner', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(waiting.id, {
+      status: 'waiting',
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
+    store.updateStep(waiting.id, 'agent', { status: 'waiting', sessionId: 'legacy-agent-session' });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+
+    const internals = manager as unknown as {
+      runContinuation: (runId: string, stepId: string, ...args: unknown[]) => Promise<void>;
+      rehydrateResumeRedaction: (id: string) => Promise<void>;
+    };
+    const realRehydrate = internals.rehydrateResumeRedaction.bind(manager);
+    const realContinuation = internals.runContinuation.bind(manager);
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstEntered!: () => void;
+    const firstRehydrate = new Promise<void>((resolve) => { firstEntered = resolve; });
+    let secondRegistered!: () => void;
+    const secondRehydrate = new Promise<void>((resolve) => { secondRegistered = resolve; });
+    let firstSettled!: () => void;
+    const firstDone = new Promise<void>((resolve) => { firstSettled = resolve; });
+    let calls = 0;
+    const rehydrateSpy = vi.spyOn(internals, 'rehydrateResumeRedaction').mockImplementation(async (id) => {
+      const call = ++calls;
+      if (call === 1) {
+        firstEntered();
+        await firstGate;
+      }
+      await realRehydrate(id);
+      if (call === 2) secondRegistered();
+    });
+    const continuationSpy = vi.spyOn(internals, 'runContinuation').mockImplementation((...args) => {
+      const pending = realContinuation(...args);
+      if (args[1] === 'continue-1') void pending.then(firstSettled, firstSettled);
+      return pending;
+    });
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'first owner' })).toEqual({ ok: true });
+      await firstRehydrate;
+      expect(manager.cancel(waiting.id)).toBe(true);
+
+      // The cancelled continuation dropped its ActiveRun, so a user Continue is admissible again.
+      expect(manager.continueRun(waiting.id, { text: 'second owner' })).toEqual({ ok: true });
+      await secondRehydrate;
+      expect(store.redactRunText(waiting.id, credential)).toBe('[REDACTED]');
+
+      // The first owner's late resolve must not clear the redactor its successor registered.
+      releaseFirst();
+      await firstDone;
+      expect(store.redactRunText(waiting.id, credential)).toBe('[REDACTED]');
+    } finally {
+      releaseFirst();
+      manager.cancel(waiting.id);
+      continuationSpy.mockRestore();
+      rehydrateSpy.mockRestore();
+    }
+  }, 40_000);
+
+  it('releases checks secrets resolved after a cancelled graph resume', async () => {
+    const credential = 'graph-resume-cancel-secret-0123456789';
+    await secrets.set(scope, 'GRAPH_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'check', type: 'check', command: 'echo check' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'check' },
+        { from: 'check', to: 'finish' },
+      ],
+    };
+    const queued = store.createRun({ title: 'graph resume cancel', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph) });
+    store.updateRun(queued.id, {
+      status: 'queued',
+      workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      graphState: { loops: {}, taken: [], cursor: 'check' },
+    });
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+
+    let releaseResolve!: () => void;
+    const resolveGate = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    let resolveEntered = false;
+    const realResolve = secrets.resolve.bind(secrets);
+    let held = false;
+    const resolveSpy = vi.spyOn(secrets, 'resolve').mockImplementation(async (projectRef, audience, bindings) => {
+      if (!held && audience === 'checks' && bindings === undefined) {
+        held = true;
+        resolveEntered = true;
+        await resolveGate;
+      }
+      return realResolve(projectRef, audience, bindings);
+    });
+
+    const sequence: string[] = [];
+    const realRegister = store.registerRunSecrets.bind(store);
+    const realClear = store.clearRunSecrets.bind(store);
+    const registerSpy = vi.spyOn(store, 'registerRunSecrets').mockImplementation((runId, values) => {
+      if (runId === queued.id) sequence.push('register');
+      return realRegister(runId, values);
+    });
+    const clearSpy = vi.spyOn(store, 'clearRunSecrets').mockImplementation((runId) => {
+      if (runId === queued.id) sequence.push('clear');
+      return realClear(runId);
+    });
+    let executeDone = false;
+    const internals = manager as unknown as { execute: (runId: string, ...args: unknown[]) => Promise<void> };
+    const realExecute = internals.execute.bind(manager);
+    const executeSpy = vi.spyOn(internals, 'execute').mockImplementation((...args) => {
+      const pending = realExecute(...args);
+      void pending.then(() => { executeDone = true; }, () => { executeDone = true; });
+      return pending;
+    });
+
+    try {
+      await manager.recover();
+      await vi.waitFor(() => expect(resolveEntered).toBe(true), { timeout: 5_000 });
+      expect(manager.isActive(queued.id)).toBe(true);
+      expect(manager.cancel(queued.id)).toBe(true);
+      expect(store.getRun(queued.id)?.status).toBe('cancelled');
+      expect(store.redactRunText(queued.id, credential)).toBe(credential);
+      sequence.length = 0;
+
+      releaseResolve();
+      await vi.waitFor(() => expect(executeDone).toBe(true), { timeout: 10_000 });
+      expect(sequence).toContain('register');
+      expect(sequence).toContain('clear');
+      expect(store.redactRunText(queued.id, credential)).toBe(credential);
+      expect(store.getRun(queued.id)?.status).toBe('cancelled');
+    } finally {
+      releaseResolve();
+      executeSpy.mockRestore();
+      clearSpy.mockRestore();
+      registerSpy.mockRestore();
+      resolveSpy.mockRestore();
+    }
+  }, 40_000);
+
+  it('skips a check-step secret registration that resolves after cancel', async () => {
+    const credential = 'check-step-cancel-secret-0123456789';
+    await secrets.set(scope, 'CHECK_KEY', credential);
+    const workflow: WorkflowDef = {
+      name: 'probe-check',
+      source: 'built-in',
+      steps: [{ id: 'check-1', name: 'Check', command: 'echo ok' }],
+    };
+
+    let releaseResolve!: () => void;
+    const resolveGate = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    let resolveEntered = false;
+    const realResolve = secrets.resolve.bind(secrets);
+    let held = false;
+    const resolveSpy = vi.spyOn(secrets, 'resolve').mockImplementation(async (projectRef, audience, bindings) => {
+      if (!held && audience === 'checks' && bindings === undefined) {
+        held = true;
+        resolveEntered = true;
+        await resolveGate;
+      }
+      return realResolve(projectRef, audience, bindings);
+    });
+
+    const sequence: string[] = [];
+    const realRegister = store.registerRunSecrets.bind(store);
+    const registerSpy = vi.spyOn(store, 'registerRunSecrets').mockImplementation((runId, values) => {
+      sequence.push('register');
+      return realRegister(runId, values);
+    });
+    let executeDone = false;
+    const internals = manager as unknown as { execute: (runId: string, ...args: unknown[]) => Promise<void> };
+    const realExecute = internals.execute.bind(manager);
+    const executeSpy = vi.spyOn(internals, 'execute').mockImplementation((...args) => {
+      const pending = realExecute(...args);
+      void pending.then(() => { executeDone = true; }, () => { executeDone = true; });
+      return pending;
+    });
+
+    try {
+      const record = manager.startRun(workflow, { task: 'probe', worktree: false });
+      await vi.waitFor(() => expect(resolveEntered).toBe(true), { timeout: 5_000 });
+      expect(manager.cancel(record.id)).toBe(true);
+      expect(store.getRun(record.id)?.status).toBe('cancelled');
+      expect(store.redactRunText(record.id, credential)).toBe(credential);
+      sequence.length = 0;
+
+      releaseResolve();
+      await vi.waitFor(() => expect(executeDone).toBe(true), { timeout: 10_000 });
+      expect(sequence).not.toContain('register');
+      expect(store.redactRunText(record.id, credential)).toBe(credential);
+      expect(store.getRun(record.id)?.status).toBe('cancelled');
+    } finally {
+      releaseResolve();
+      executeSpy.mockRestore();
+      registerSpy.mockRestore();
+      resolveSpy.mockRestore();
     }
   }, 40_000);
 

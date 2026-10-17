@@ -1118,6 +1118,10 @@ export class RunManager {
   // registering in `active`, so parallel-slot counting is never racy.
   private readonly queue: string[] = [];
   private readonly starting = new Set<string>();
+  /** The owner of a continuation between its `starting` reservation and its `ActiveRun`.
+   *  Cancelling that continuation removes the entry, and the pending `runContinuation` sees a
+   *  mismatch and exits before re-materialization can turn into a spawned session. */
+  private readonly startingOwners = new Map<string, symbol>();
   // Runs parked at `waiting` (open session, ball in the user's court). They
   // don't consume a `maxParallel` slot (#347) — an idle claude process costs
   // memory but no tokens, queued work progressing matters more, and the idle
@@ -1289,6 +1293,7 @@ export class RunManager {
     this.monitoring.clear();
     this.unitParents.clear();
     this.starting.clear();
+    this.startingOwners.clear();
     this.queue.length = 0;
     this.pendingJobs.clear();
     this.pendingBranchNames.clear();
@@ -1735,6 +1740,7 @@ export class RunManager {
           if (continuation) {
             const hydrated = this.hydrateQueuedContinuation(runId, continuation);
             const ownerToken = Symbol('run-owner');
+            this.startingOwners.set(runId, ownerToken);
             void this.runContinuation(
               runId,
               hydrated.stepId,
@@ -1748,7 +1754,7 @@ export class RunManager {
             ).catch((err: unknown) => {
               const message = err instanceof Error ? err.message : String(err);
               this.failOwnedContinuation(runId, ownerToken, message);
-              this.starting.delete(runId);
+              this.releaseStartingContinuation(runId, ownerToken);
             });
             continue;
           }
@@ -3189,7 +3195,26 @@ export class RunManager {
       return true;
     }
     const state = this.active.get(runId);
-    if (!state) return false;
+    if (!state) {
+      // A continuation reserves its slot synchronously, before re-materialization lets it build
+      // an `ActiveRun`. Cancelling in that window retires the owner token so the pending
+      // `runContinuation` exits without spawning; otherwise the cancel would report `false` for
+      // a run the cockpit already shows as active.
+      const ownerToken = this.startingOwners.get(runId);
+      if (ownerToken === undefined) return false;
+      this.releaseStartingContinuation(runId, ownerToken);
+      const finishedAt = new Date().toISOString();
+      for (const step of this.store.getRun(runId)?.steps ?? []) {
+        if (step.status === 'running' || step.status === 'waiting') {
+          this.store.updateStep(runId, step.id, { status: 'cancelled', finishedAt });
+        }
+      }
+      this.store.updateRun(runId, { status: 'cancelled', finishedAt, currentStepId: undefined });
+      this.store.clearRunSecrets(runId);
+      this.store.appendEvent(runId, { type: 'lifecycle', message: 'run cancelled' });
+      this.reportSettledChildToParent(runId);
+      return true;
+    }
     state.cancelled = true;
     this.clearIdleTimer(state);
     try {
@@ -3723,7 +3748,7 @@ export class RunManager {
     if (agentModelsLocked(this.repoRoot) && opts.model?.trim()) {
       return { ok: false, error: AGENT_MODELS_LOCKED_ERROR };
     }
-    if (this.active.has(runId)) return { ok: false, error: 'run is still active' };
+    if (this.active.has(runId) || this.starting.has(runId)) return { ok: false, error: 'run is still active' };
     const run = this.store.getRun(runId);
     if (!run) return { ok: false, error: 'not found' };
     // `review` is continuable too — that's the "Send back" path (spec 009).
@@ -3831,6 +3856,12 @@ export class RunManager {
       return { ok: true };
     }
     const ownerToken = Symbol('run-owner');
+    // Reserve synchronously: `runContinuation` awaits worktree re-materialization before it can
+    // build `ActiveRun`, and a second Continue or a delete must see this run as active during
+    // that window. The owner token is what lets a cancel stop the pending continuation rather
+    // than merely letting it look active; it is released at `active.set` or in the failure catch.
+    this.starting.add(runId);
+    this.startingOwners.set(runId, ownerToken);
     void this.runContinuation(
       runId,
       stepId,
@@ -3845,9 +3876,17 @@ export class RunManager {
       (err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);
         this.failOwnedContinuation(runId, ownerToken, message);
+        this.releaseStartingContinuation(runId, ownerToken);
       },
     );
     return { ok: true };
+  }
+
+  /** Release a continuation's pre-`ActiveRun` slot only when this owner still holds it. */
+  private releaseStartingContinuation(runId: string, ownerToken: symbol): void {
+    if (this.startingOwners.get(runId) !== ownerToken) return;
+    this.startingOwners.delete(runId);
+    this.starting.delete(runId);
   }
 
   private async runContinuation(
@@ -3876,6 +3915,10 @@ export class RunManager {
     // for retention again — otherwise it keeps a dir on disk while staying
     // invisible to the enforcer forever. Best-effort; falls back to repoRoot.
     await rematerializeReclaimedWorktree(this.repoRoot, this.store, runId);
+    // A cancel (or a replacement continuation) may have retired this reservation while the
+    // re-materialization above was awaiting. Stop before building context, touching the
+    // record again or spawning a session.
+    if (this.startingOwners.get(runId) !== effectiveOwnerToken) return;
     const record = this.store.getRun(runId);
     // A provider/account switch cannot resume the old provider-owned session. Reconstruct the
     // portable context from Cezar's durable record + redacted event stream before this new turn's
@@ -3920,7 +3963,7 @@ export class RunManager {
     };
     this.checkArtifactSnapshots.set(runId, state.autosaveExcludedPaths);
     this.active.set(runId, state);
-    this.starting.delete(runId);
+    this.releaseStartingContinuation(runId, effectiveOwnerToken);
     // A continuation can outlive the boot scrub (a user Continue of an old run, or a recovered
     // agent-cursor session) and its model context may still hold a pre-fix check value. The run
     // is reserved in `active` by now — a second Continue or a delete must already see it — and
@@ -4757,7 +4800,13 @@ export class RunManager {
     // The cancellation grace timer may have retired this owner while the async
     // workflow was unwinding, and a same-id continuation may now own the record.
     // No settlement branch below may touch that newer owner.
-    if (this.active.get(runId) !== state) return;
+    if (this.active.get(runId) !== state) {
+      // A secret resolve that outlived a cancel can register after `dropActive` cleared the
+      // registry. When this owner is gone and nobody newer owns the run, release the late
+      // registration too — this is the common exit for graph, check and agent paths.
+      if (state.cancelled && !this.active.has(runId)) this.store.clearRunSecrets(runId);
+      return;
+    }
 
     const finishedAt = new Date().toISOString();
     if (state.cancelled && this.active.get(runId) === state) {
@@ -7321,10 +7370,12 @@ export class RunManager {
     // cannot diagnose alone: the value is write-only, so `cezar secrets list` and Settings show
     // the same list whether this run read it or ignored it. Say which, once each, on the step.
     for (const note of resolved.notes) emit({ type: 'note', stepId: step.id, message: note });
-    this.store.registerRunSecrets(
-      runId,
-      Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN),
-    );
+    if (!state.cancelled && this.active.get(runId) === state) {
+      this.store.registerRunSecrets(
+        runId,
+        Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN),
+      );
+    }
     // The base is the MINIMAL check env, not the server's: a check is repository code running
     // unattended, so it never inherits `GITHUB_*`/`GH_*`, vendor or cloud credentials, or
     // cezar's own `CEZ_*` (`buildCheckEnv`; `CEZ_ENV_PASSTHROUGH` is the one explicit hatch).
