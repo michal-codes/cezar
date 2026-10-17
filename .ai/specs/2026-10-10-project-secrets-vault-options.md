@@ -251,7 +251,10 @@ features without touching the agents' subscription login.
 > `CEZ_WORKTREE`, `CEZ_SHARED_CACHE_DIR` and friends are present; an untrusted
 > fork head gets the minimal base plus context and **no** secrets.
 > `CEZ_ENV_PASSTHROUGH` forwards individual named host variables but can never
-> re-open a credential family, and `CEZ_AGENT_ENV_FULL` does not apply to checks.
+> re-open a credential family (and a fork head gets no passthrough at all), and
+> `CEZ_AGENT_ENV_FULL` does not apply to checks.
+> A trusted check also receives the documented `CEZ_API_URL`/`CEZ_BIN` CLI inputs
+> when they are set; a fork head gets neither.
 > **Migration:** an `ANTHROPIC_API_KEY` exported per the older docs no longer
 > reaches a check; store it with `cezar secrets set ANTHROPIC_API_KEY` (the
 > default audience is `checks`). The default-path row above is superseded on

@@ -272,10 +272,11 @@ that executes repository code unattended:
   (`"checkGateTimeoutMs"`); `0` removes either limit.
 - **Process group.** The command gets its own process group, so a timeout or a
   cancel SIGTERMs the group, waits 5 s, then SIGKILLs it — a grandchild that
-  traps SIGTERM still dies, and orphans left by a command that exits early are
-  reaped. `close` is never trusted to arrive on its own: if something that left
-  the group (`setsid`/`detached`) still holds the pipes after the grace, they
-  are cut so the outcome always settles.
+  traps SIGTERM still dies, and same-group orphans left by a command that exits
+  early are reaped. A process that escapes the group (`setsid`/`detached`) is
+  beyond the group signal: if it still holds the pipes after the grace they are
+  cut so the outcome always settles, but that process may survive. `close` is
+  never trusted to arrive on its own.
 - **Tail-preserving output.** The transcript keeps its last 20,000 characters
   with a marker naming how much was elided; the failing line is at the tail, so
   the old head-kept cap no longer hides the reason from the retried agent.
@@ -286,11 +287,18 @@ that executes repository code unattended:
   flag, a tool's config dir or `SSH_AUTH_SOCK`), never one of those credential
   families even when named. `CEZ_AGENT_ENV_FULL` does not apply. This is **not a
   sandbox**: the check still runs as your user and can read files by path; it
-  only stops ambient credentials from riding along.
+  only stops ambient credentials from riding along. The cockpit address and
+  cezar's own entrypoint are the two deliberate exceptions for a trusted check:
+  `CEZ_API_URL` and `CEZ_BIN` are forwarded when they are set, so
+  `node "$CEZ_BIN" task …` works. A fork-head check gets neither, just as it
+  gets no secrets — and no `CEZ_ENV_PASSTHROUGH` at all.
 - **Non-green outcomes are named.** A timeout, a cancellation, a missing `bash`
   (Windows, or a trimmed image) and a `CEZ_DRY_RUN=1` dry run all produce a
   distinct non-green outcome — `timed-out`, `cancelled`, `could-not-run`,
   `skipped` — so "it did not run" can never be read as "it passed".
+  Windows is a deliberate `could-not-run` boundary: the runner refuses win32
+  before spawning because there is no CI coverage for POSIX process-group
+  semantics there; Git Bash is not a supported check shell.
 
 A check step runs `bash --noprofile --norc -c <command>` in the task's worktree
 with the minimal environment above plus the **secrets** it may read, which no
@@ -356,7 +364,11 @@ check the outer task's id:
 (it is how `cez task` and `cez automation` address a cockpit, see
 [backward compatibility](../BACKWARD_COMPATIBILITY.md) §1). A run that knows its
 own project replaces it; a headless `cezar run` that does not leaves whatever
-you exported alone, so a check step can still reach the cockpit you named.
+you exported alone. A trusted check also receives the cockpit's `CEZ_API_URL`
+and cezar's `CEZ_BIN` when they are set, so a check step can reach the cockpit
+you named with `node "$CEZ_BIN" task …`. A fork-head check (`checkout: "pr-head"`
+for an untrusted fork) gets neither the address nor the binary, exactly as it
+gets no secrets.
 
 A GitHub automation whose events are all `pull_request.*` can set `"checkout": "pr-head"` in its `task`: each launched run forks its worktree from the matched PR's head (fetched into `refs/cezar/pr/<n>`) instead of the base branch, so its check steps verify the PR itself. A closed PR or a fork head launches nothing (`skipped` in the execution log) unless `"allowForkHeads": true` admits forks — whose checks then run without secrets. Such a run cannot open a draft PR (`409`). See [Verify a pull request](e2e-verification.md#verify-a-pull-request).
 

@@ -369,9 +369,13 @@ describe('buildCheckEnv — the minimal check env', () => {
     SSH_AUTH_SOCK: '/tmp/ssh-abc/agent.1',
     // Credentials that must never ride along:
     GITHUB_TOKEN: 'ghs_probe',
+    GITHUB_ENTERPRISE_TOKEN: 'ghp_probe',
     GH_HOST: 'github.com',
+    GH_DEBUG: '1',
     ANTHROPIC_API_KEY: 'sk-ant-probe',
     AWS_SECRET_ACCESS_KEY: 'aws-probe',
+    GOOGLE_APPLICATION_CREDENTIALS: '/home/dev/gcp.json',
+    CLOUD_ML_REGION: 'us-east5',
     NPM_TOKEN: 'npm-probe',
     CEZ_CHECK_PROBE: 'cez-probe',
   };
@@ -384,8 +388,12 @@ describe('buildCheckEnv — the minimal check env', () => {
     expect(env.TMPDIR).toBe('/tmp');
     expect(env.GITHUB_TOKEN).toBeUndefined();
     expect(env.GH_HOST).toBeUndefined();
+    expect(env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+    expect(env.GH_DEBUG).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
+    expect(env.CLOUD_ML_REGION).toBeUndefined();
     expect(env.NPM_TOKEN).toBeUndefined();
     expect(env.CEZ_CHECK_PROBE).toBeUndefined();
     // Not named, and the name patterns read `_AUTH_` as credential-shaped.
@@ -418,13 +426,30 @@ describe('buildCheckEnv — the minimal check env', () => {
   it('cannot reopen the credential families by naming them', () => {
     const env = buildCheckEnv({
       ...HOST,
-      CEZ_ENV_PASSTHROUGH: 'GITHUB_TOKEN,ANTHROPIC_API_KEY,AWS_SECRET_ACCESS_KEY,CEZ_CHECK_PROBE',
+      CEZ_ENV_PASSTHROUGH:
+        'GITHUB_TOKEN,GITHUB_ENTERPRISE_TOKEN,GH_DEBUG,ANTHROPIC_API_KEY,AWS_SECRET_ACCESS_KEY,GOOGLE_APPLICATION_CREDENTIALS,CLOUD_ML_REGION,CEZ_CHECK_PROBE',
     });
     expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+    expect(env.GH_DEBUG).toBeUndefined();
     expect(env.GH_HOST).toBeUndefined();
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(env.GOOGLE_APPLICATION_CREDENTIALS).toBeUndefined();
+    expect(env.CLOUD_ML_REGION).toBeUndefined();
     expect(env.CEZ_CHECK_PROBE).toBeUndefined();
+  });
+
+  it('can suppress passthrough entirely for a fork head', () => {
+    const env = buildCheckEnv(
+      { ...HOST, CEZ_ENV_PASSTHROUGH: 'MY_CHECK_TOKEN,SSH_AUTH_SOCK' },
+      { passthrough: false },
+    );
+    expect(env.MY_CHECK_TOKEN).toBeUndefined();
+    expect(env.SSH_AUTH_SOCK).toBeUndefined();
+    // The ordinary base allowlist is unaffected.
+    expect(env.PATH).toBe('/usr/bin:/bin');
+    expect(env.HOME).toBe('/home/dev');
   });
 
   it('never applies CEZ_AGENT_ENV_FULL to a check', () => {

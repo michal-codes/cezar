@@ -5068,7 +5068,14 @@ export class RunManager {
         }
         const { ok, output, exitCode, status } = checkResult;
         if (state.cancelled) return null;
-        outputs.set(node.id, { exitCode, output });
+        // The check output has THREE consumers, not one: the transcript event
+        // (scrubbed by `appendEvent`), the retry prompt, and `{{nodes.<id>.output}}`
+        // — which is also what `graphState.outputs` persists to `runs.json` and
+        // replays on resume. Redact at the source so a passing check cannot carry
+        // a registered secret into the next agent prompt or a state file. The
+        // failing branch reuses this one scrubbed copy below.
+        const safeOutput = this.store.redactRunText(runId, output);
+        outputs.set(node.id, { exitCode, output: safeOutput });
         if (ok) {
           this.finishStep(runId, node.id, 'done', undefined, emit);
           port = 'pass';
@@ -5098,7 +5105,7 @@ export class RunManager {
           // The output goes into the next agent prompt — to the agent's model provider — so it is
           // scrubbed like an event is: host secrets, this run's registered secrets (project
           // secrets included) and token patterns. Strictly narrowing, for every workflow.
-          checkFailure = this.store.redactRunText(runId, output);
+          checkFailure = safeOutput;
           if (node.retryOn?.length && !node.retryOn.includes(exitCode)) {
             const codes = node.retryOn.join(', ');
             const error = `check "${node.id}" exited ${exitCode}, which onFail.retryOn (${codes}) does not retry`;
@@ -7297,7 +7304,16 @@ export class RunManager {
     // The run context wins last (Phase 2): its names are removed from the base first, so a
     // variable this run does not set is absent, never a stale value from somewhere else. The
     // seam spawns a non-login shell, so a profile cannot re-add what this cut removed.
-    const base: NodeJS.ProcessEnv = buildCheckEnv();
+    const base: NodeJS.ProcessEnv = buildCheckEnv(process.env, { passthrough: !untrusted });
+    // The cockpit address and cezar's own entrypoint are documented CLI inputs, not ambient
+    // cezar state: a trusted check may run `node "$CEZ_BIN" task …`. A fork head must not be
+    // able to drive the cockpit, so it gets neither (and no secrets, above).
+    if (!untrusted) {
+      for (const name of ['CEZ_API_URL', 'CEZ_BIN'] as const) {
+        const value = process.env[name];
+        if (value !== undefined) base[name] = value;
+      }
+    }
     for (const name of CHECK_CONTEXT_VARS) {
       // `CEZ_PROJECT_ID` is the one context name that is ALSO a documented CLI input
       // (BACKWARD_COMPATIBILITY.md §1 — `cez task`/`cez automation` address a cockpit with it),

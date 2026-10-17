@@ -253,15 +253,18 @@ for follow-ups.
 - **Environment is deliberately small.** The base is a minimal allowlist —
   `PATH`, `HOME`, locale, temp dir and the usual shell/toolchain variables —
   plus the **secrets** the step may read (below) and the run context cezar sets.
-  It is not the server's `process.env`: `GITHUB_TOKEN`/`GH_*`, every vendor and
-  cloud credential (`ANTHROPIC_*`, `OPENAI_*`, `AWS_*`, …) and cezar's own
+  It is not the server's `process.env`: `GITHUB_TOKEN`/`GH_*`/`GITHUB_*`, every
+  vendor and cloud credential (`ANTHROPIC_*`, `OPENAI_*`, `AWS_*`, `GOOGLE_*`, …) and cezar's own
   `CEZ_*` are dropped. An exported `ANTHROPIC_API_KEY` therefore no longer
   reaches a check — store it with `cezar secrets set` instead. A host variable
   a check genuinely needs can be named in `CEZ_ENV_PASSTHROUGH`, but that hatch
-  can never re-open the credential families. There is no per-step `env:` —
+  can never re-open the credential families, and a fork-head check gets no
+  passthrough at all. There is no per-step `env:` —
   workflow files are committed, and a secret's value does not belong in them; a
   step names the secrets it needs instead. Tests with no agent step need no
-  model at all.
+  model at all. Two documented CLI inputs are forwarded on purpose: a trusted
+  check gets `CEZ_API_URL` and `CEZ_BIN` when they are set, so a check can run
+  `node "$CEZ_BIN" task …`; a fork-head check gets neither (nor secrets).
 - **Model credentials go in `cezar secrets`, not in your shell.** Store the
   key your provider reads once per project:
 

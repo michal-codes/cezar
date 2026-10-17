@@ -23,9 +23,12 @@ process that needs it.
 > `buildCheckEnv()` (a minimal base allowlist) plus the resolved `checks`-audience secrets, then
 > `CHECK_CONTEXT_VARS` — **not** the server's `process.env`. Fork-head (`untrustedHead`) runs get the minimal
 > base and the run context with no secrets. `CEZ_ENV_PASSTHROUGH` forwards individual host variables but can
-> never re-open `GH_*`, the vendor/cloud credential families or the rest of `CEZ_*`. The shell is
+> never re-open `GH_*`/`GITHUB_*`, the vendor/cloud credential families or the rest of `CEZ_*`; a fork-head run
+> gets no passthrough at all. The shell is
 > `bash --noprofile --norc -c` (non-login), each command has a 20-minute wall clock, and cancellation kills the
-> whole process group (`SIGTERM`, 5 s, `SIGKILL`).
+> whole process group (`SIGTERM`, 5 s, `SIGKILL`). The two documented CLI inputs are the deliberate exception
+> to the `CEZ_*` cut: a trusted check gets `CEZ_API_URL` and `CEZ_BIN` when they are set (so
+> `node "$CEZ_BIN" task …` reaches the cockpit), while a fork-head run gets neither.
 >
 > **Migration for the old "export `ANTHROPIC_API_KEY`" advice:** an exported provider key no longer reaches a
 > check. Store it once with `cezar secrets set ANTHROPIC_API_KEY` (the default audience is `checks`) or bind it
@@ -221,7 +224,7 @@ docs show the two-call fallback.
 
 | Scenario | Before | After |
 | --- | --- | --- |
-| Workflow with checks, no `check-env` file | check gets `process.env` | minimal `buildCheckEnv()` base plus `CEZ_*` context vars (2026-10-17, #1164) |
+| Workflow with checks, no `check-env` file | check gets `process.env` | minimal `buildCheckEnv()` base plus `CEZ_*` context vars, and `CEZ_API_URL`/`CEZ_BIN` for a trusted check (2026-10-17, #1164) |
 | Failing check output in the retry prompt | raw | redacted with host and run secrets |
 | User who exported `ANTHROPIC_API_KEY` per the old docs | works, and leaks into agents | **changed in #1164:** no longer inherited by checks; store it as a `checks` secret. Docs steer to `cezar secrets` |
 | `pull_request.opened` automation without `checkout` | worktree from base | unchanged |
@@ -266,8 +269,9 @@ Prove-red rule applies: for each fix test, `git stash push -- <source files>`, c
   `check-env`, the claude agent env has no `ANTHROPIC_API_KEY`.
 - `check-retry-redaction.test.ts`: a check that echoes a `check-env` value and a `sk-ant-…` token fails; the
   retried agent's prompt contains `[REDACTED]` and neither value. Red on `main`.
-- Guard: no `check-env` file → check env is the minimal `buildCheckEnv()` base plus context vars, never the
-  full `process.env` (see the 2026-10-17 implementation note).
+- Guard: no `check-env` file → check env is the minimal `buildCheckEnv()` base plus context vars (and the
+  trusted check's `CEZ_API_URL`/`CEZ_BIN`), never the full `process.env` (see the 2026-10-17 implementation
+  note).
 
 **Phase 2**
 

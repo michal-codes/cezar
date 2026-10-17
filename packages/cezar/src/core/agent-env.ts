@@ -328,6 +328,22 @@ const ALL_VENDOR_PREFIXES: readonly string[] = [
   ]),
 ];
 
+/** The credential families a CHECK never needs, even when the operator names
+ *  one in `CEZ_ENV_PASSTHROUGH`. `ALL_VENDOR_PREFIXES` covers the backend and
+ *  Bedrock/Vertex prefixes; these extra families close the exact-name holes
+ *  (`GITHUB_ENTERPRISE_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`,
+ *  `CLOUD_ML_REGION`) and the `GH_*`/`GITHUB_*` handoff families wholesale. */
+const CHECK_DENY_PREFIXES: readonly string[] = [
+  ...new Set([...ALL_VENDOR_PREFIXES, 'GH_', 'GITHUB_', 'GOOGLE_', 'GCP_', 'AZURE_', 'CLOUD_']),
+];
+const CHECK_DENY_NAMES: ReadonlySet<string> = upperSet([...GH_ALLOW_NAMES, ...VERTEX_ALLOW_NAMES]);
+
+export interface BuildCheckEnvOptions {
+  /** `false` disables `CEZ_ENV_PASSTHROUGH` entirely (a fork-head check has no
+   *  operator-named host vars). Default: honour the variable. */
+  passthrough?: boolean;
+}
+
 /**
  * The environment a CHECK command gets — the minimal sibling of
  * `buildChildEnv`, and deliberately NOT a reuse of it.
@@ -346,10 +362,12 @@ const ALL_VENDOR_PREFIXES: readonly string[] = [
  * names individual host vars to forward, exactly as it does for the agent env
  * (`MY_CHECK_TOKEN`, a tool's config dir, `SSH_AUTH_SOCK` — an agent handle the
  * name patterns read as credential-shaped). The named vars widen the env and
- * nothing else: `GH_*`, the vendor/cloud families and the rest of `CEZ_*` stay
- * dropped even when named, so the hatch can never reopen what this cut exists
- * to close. `CEZ_AGENT_ENV_FULL` deliberately does NOT apply — the thing being
- * fenced off is repository code, not a backend that needs to authenticate.
+ * nothing else: `GH_*`/`GITHUB_*`, the vendor/cloud families and the rest of
+ * `CEZ_*` stay dropped even when named, so the hatch can never reopen what this
+ * cut exists to close. An untrusted fork-head check gets no passthrough at all
+ * (`BuildCheckEnvOptions.passthrough: false`). `CEZ_AGENT_ENV_FULL` deliberately
+ * does NOT apply — the thing being fenced off is repository code, not a backend
+ * that needs to authenticate.
  *
  * NOT a sandbox, and it does not pretend to be: the check still runs as the
  * local user, in the worktree, and can read `~/.ssh`, `~/.config/gh` or any
@@ -357,22 +375,28 @@ const ALL_VENDOR_PREFIXES: readonly string[] = [
  * `/proc/<pid>/environ`; containment is an OS-level job (see the trust-boundary
  * section of the landing-check design).
  */
-export function buildCheckEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function buildCheckEnv(
+  source: NodeJS.ProcessEnv = process.env,
+  options: BuildCheckEnvOptions = {},
+): NodeJS.ProcessEnv {
   // The explicit opt-in, parsed exactly like `buildChildEnv`'s: comma-separated,
   // trimmed, case-insensitive.
-  const passthrough = upperSet(
-    (readVar(source, 'CEZ_ENV_PASSTHROUGH') ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
+  const passthrough =
+    options.passthrough === false
+      ? new Set<string>()
+      : upperSet(
+          (readVar(source, 'CEZ_ENV_PASSTHROUGH') ?? '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+        );
   const out: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(source)) {
     if (value === undefined) continue;
     const key = name.toUpperCase();
     if (key.startsWith('CEZ_')) continue; // cezar's own namespace (incl. CEZ_DRY_RUN)
-    if (GH_ALLOW_NAMES.has(key)) continue; // gh/PR handoff — agent steps only
-    if (matchesPrefix(key, ALL_VENDOR_PREFIXES)) continue; // vendor auth, cloud creds
+    if (CHECK_DENY_NAMES.has(key)) continue; // gh/PR handoff — agent steps only
+    if (matchesPrefix(key, CHECK_DENY_PREFIXES)) continue; // vendor auth, cloud creds
     // A var the operator NAMED is taken at its word: the heuristic would flag
     // `SSH_AUTH_SOCK` (`_AUTH_`) and `MY_CHECK_TOKEN`, and both are exactly the
     // kind of handle a check is given by hand. The families above are not

@@ -208,6 +208,92 @@ describe('project and workspace secrets in check steps', () => {
     expect(retried).not.toContain(token);
   }, 40_000);
 
+  it('scrubs a passing check\'s output before a node reference reaches the next agent, and before it is persisted', async () => {
+    const credential = 'e2e-credential-value-0123456789';
+    await secrets.set(scope, 'E2E_GATEWAY_KEY', credential);
+    const record = manager.startRun(
+      {
+        name: 'check-then-implement',
+        source: 'file',
+        steps: [
+          { id: 'verify', name: 'Verify', command: 'echo "$E2E_GATEWAY_KEY"' },
+          { id: 'implement', name: 'Implement', prompt: '{{task}} — check said: {{nodes.verify.output}}' },
+        ],
+      },
+      { task: 'mock:done go', worktree: false },
+    );
+    await settle(record.id);
+
+    const prompts = readFileSync(stdinLog, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => (JSON.parse(line) as { userText: string }).userText);
+    const nextPrompt = prompts.find((text) => text.includes('check said:'));
+    expect(nextPrompt).toBeDefined();
+    expect(nextPrompt).toContain('[REDACTED]');
+    expect(nextPrompt).not.toContain(credential);
+
+    const persisted = store.getRun(record.id)?.graphState?.outputs?.verify;
+    expect(persisted?.output).toContain('[REDACTED]');
+    expect(persisted?.output).not.toContain(credential);
+
+    store.flush();
+    expect(readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8')).not.toContain(credential);
+  }, 40_000);
+
+  it('hands a trusted check the cockpit address and binary, and a fork head neither', async () => {
+    const savedApi = process.env.CEZ_API_URL;
+    const savedBin = process.env.CEZ_BIN;
+    const savedPassthrough = process.env.CEZ_ENV_PASSTHROUGH;
+    const savedHostToken = process.env.MY_HOST_TOKEN;
+    process.env.CEZ_API_URL = 'http://127.0.0.1:4321';
+    process.env.CEZ_BIN = '/opt/cez/dist/index.js';
+    process.env.CEZ_ENV_PASSTHROUGH = 'MY_HOST_TOKEN';
+    process.env.MY_HOST_TOKEN = 'host-token-value';
+    const credential = 'stored-check-credential-0123456789';
+    await secrets.set(scope, 'STORED_CHECK_TOKEN', credential);
+    try {
+      const record = store.createRun({
+        title: 'env',
+        workflow: 'w',
+        task: 'x',
+        steps: [{ id: 'verify', name: 'Verify', kind: 'check' }],
+      });
+      const envOf = () =>
+        (manager as unknown as {
+          checkStepEnv(
+            runId: string,
+            state: { cwd: string },
+            step: { id: string },
+            emit: () => void,
+          ): Promise<NodeJS.ProcessEnv>;
+        }).checkStepEnv(record.id, { cwd: repoRoot }, { id: 'verify' }, () => undefined);
+
+      const trusted = await envOf();
+      expect(trusted.CEZ_API_URL).toBe('http://127.0.0.1:4321');
+      expect(trusted.CEZ_BIN).toBe('/opt/cez/dist/index.js');
+      expect(trusted.STORED_CHECK_TOKEN).toBe(credential);
+      expect(trusted.MY_HOST_TOKEN).toBe('host-token-value');
+
+      store.updateRun(record.id, { untrustedHead: true });
+      const fork = await envOf();
+      expect(fork.CEZ_API_URL).toBeUndefined();
+      expect(fork.CEZ_BIN).toBeUndefined();
+      expect(fork.MY_HOST_TOKEN).toBeUndefined();
+      // The security boundary this PR exists for: fork-head code gets no stored secret.
+      expect(fork.STORED_CHECK_TOKEN).toBeUndefined();
+    } finally {
+      if (savedApi === undefined) delete process.env.CEZ_API_URL;
+      else process.env.CEZ_API_URL = savedApi;
+      if (savedBin === undefined) delete process.env.CEZ_BIN;
+      else process.env.CEZ_BIN = savedBin;
+      if (savedPassthrough === undefined) delete process.env.CEZ_ENV_PASSTHROUGH;
+      else process.env.CEZ_ENV_PASSTHROUGH = savedPassthrough;
+      if (savedHostToken === undefined) delete process.env.MY_HOST_TOKEN;
+      else process.env.MY_HOST_TOKEN = savedHostToken;
+    }
+  });
+
   it('without a secret store the check keeps the base server env and still drops credentials', async () => {
     const savedEditor = process.env.EDITOR;
     const savedGithubToken = process.env.GITHUB_TOKEN;
