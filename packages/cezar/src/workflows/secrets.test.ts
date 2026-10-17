@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -10,6 +10,7 @@ import { RunStore, type RunRecord } from '../runs/store.ts';
 import { apiRequest } from '../server/loopback-request.testkit.ts';
 import { createApp } from '../server/server.ts';
 import { SecretStore } from '../workspace/secrets.ts';
+import { WorkspaceSemaphore } from '../workspace/semaphore.ts';
 import { graphRailSteps, graphToSteps, type WorkflowGraph } from './graph.ts';
 import { CHECK_CONTEXT_VARS, RunManager } from './run.ts';
 import { workflowStepSchema, type WorkflowDef } from './types.ts';
@@ -698,24 +699,54 @@ describe('project and workspace secrets in check steps', () => {
     await manager.recover();
     expect(store.getRun(waiting.id)?.status).toBe('done');
 
-    expect(manager.continueRun(waiting.id, { text: 'first' })).toEqual({ ok: true });
-    // The synchronous reservation is what makes the second Continue and the delete guard work
-    // while runContinuation is still awaiting rematerialization, before ActiveRun exists.
-    expect(manager.isActive(waiting.id)).toBe(true);
-    expect(manager.continueRun(waiting.id, { text: 'second' })).toEqual({
-      ok: false, error: 'run is still active',
+    const internals = manager as unknown as {
+      runContinuation: (runId: string, ...args: unknown[]) => Promise<void>;
+    };
+    let releaseContinuation!: () => void;
+    const continuationGate = new Promise<void>((resolve) => { releaseContinuation = resolve; });
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      releaseContinuation();
+    };
+    const realContinuation = internals.runContinuation.bind(manager);
+    const continuationSpy = vi.spyOn(internals, 'runContinuation').mockImplementation(async (...args) => {
+      await continuationGate;
+      return realContinuation(...args);
     });
-    const app = createApp({ repoRoot, store, manager, version: '0.0.0-test' });
-    const deleted = await apiRequest(app, `/api/v1/runs/${waiting.id}`, { method: 'DELETE' });
-    expect(deleted.status).toBe(409);
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'first' })).toEqual({ ok: true });
+      // The synchronous reservation is what makes the second Continue and the delete guard work
+      // while runContinuation is still awaiting rematerialization, before ActiveRun exists.
+      expect(manager.isActive(waiting.id)).toBe(true);
+      expect(manager.continueRun(waiting.id, { text: 'second' })).toEqual({
+        ok: false, error: 'run is still active',
+      });
+      const app = createApp({ repoRoot, store, manager, version: '0.0.0-test' });
+      const deleted = await apiRequest(app, `/api/v1/runs/${waiting.id}`, { method: 'DELETE' });
+      expect(deleted.status).toBe(409);
 
-    await waitForPersistedText(waiting.id);
-    expect(store.getRun(waiting.id)?.steps.filter((step) => step.id.startsWith('continue-'))).toHaveLength(1);
+      release();
+      await waitForPersistedText(waiting.id);
+      expect(store.getRun(waiting.id)?.steps.filter((step) => step.id.startsWith('continue-'))).toHaveLength(1);
+    } finally {
+      release();
+      continuationSpy.mockRestore();
+    }
   }, 40_000);
 
   it('cancels a continuation reserved before it builds an ActiveRun', async () => {
+    const credential = 'pre-active-cancel-secret-0123456789';
+    await secrets.set(scope, 'PREACTIVE_KEY', credential);
+    const parent = store.createRun({ title: 'pre-active parent', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(parent.id, { status: 'waiting', dispatch: { rootRunId: parent.id } });
     const waiting = store.createRun({ title: 'pre-active cancel', workflow: 'graph', task: 'x', worktree: false, steps: [] });
-    store.updateRun(waiting.id, { status: 'waiting', runner: 'cursor' });
+    store.updateRun(waiting.id, {
+      status: 'waiting',
+      runner: 'cursor',
+      dispatch: { rootRunId: parent.id, parentRunId: parent.id },
+    });
     store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
     store.updateStep(waiting.id, 'agent', {
       status: 'waiting', sessionId: 'legacy-agent-session', backend: 'cursor',
@@ -727,6 +758,9 @@ describe('project and workspace secrets in check steps', () => {
     manager = new RunManager(store, repoRoot, { projectId: project, secrets });
     await manager.recover();
     expect(store.getRun(waiting.id)?.status).toBe('done');
+    // Recovery settles the waiting child as `done` and reports it once. Clear that report so
+    // the assertion below can only be satisfied by the pre-active CANCEL branch.
+    store.updateRun(parent.id, { dispatch: { rootRunId: parent.id } });
 
     const internals = manager as unknown as {
       runContinuation: (runId: string, ...args: unknown[]) => Promise<void>;
@@ -741,20 +775,104 @@ describe('project and workspace secrets in check steps', () => {
       return pending;
     });
     const rehydrateSpy = vi.spyOn(internals, 'rehydrateResumeRedaction');
+    const savedDispatch = process.env.CEZ_DISPATCH;
+    process.env.CEZ_DISPATCH = '1';
     try {
+      store.registerRunSecrets(waiting.id, [credential]);
+      expect(store.redactRunText(waiting.id, credential)).toBe('[REDACTED]');
+
       expect(manager.continueRun(waiting.id, { text: 'cancel before ActiveRun' })).toEqual({ ok: true });
+      // Model the pre-active continuation's step as the one in flight, so the cancel branch's
+      // step/currentStepId cleanup is observable rather than trivially already empty.
+      store.updateStep(waiting.id, 'continue-1', { status: 'waiting' });
+      store.updateRun(waiting.id, { currentStepId: 'continue-1' });
       expect(manager.cancel(waiting.id)).toBe(true);
-      expect(store.getRun(waiting.id)?.status).toBe('cancelled');
+
+      const cancelled = store.getRun(waiting.id);
+      expect(cancelled?.status).toBe('cancelled');
+      expect(cancelled?.currentStepId).toBeUndefined();
+      expect(cancelled?.steps.find((step) => step.id === 'continue-1')?.status).toBe('cancelled');
+      expect(store.redactRunText(waiting.id, credential)).toBe(credential);
+      // The child's terminal transition never reaches `dropActive`; the parent report must still
+      // be persisted by the pre-active cancel branch.
+      expect(store.getRun(parent.id)?.dispatch?.pendingReports?.map((report) => report.fromRunId)).toContain(waiting.id);
 
       await continuationSettled;
       expect(rehydrateSpy).not.toHaveBeenCalled();
       expect(manager.isActive(waiting.id)).toBe(false);
       expect(store.getRun(waiting.id)?.status).toBe('cancelled');
     } finally {
+      if (savedDispatch === undefined) delete process.env.CEZ_DISPATCH;
+      else process.env.CEZ_DISPATCH = savedDispatch;
       continuationSpy.mockRestore();
       rehydrateSpy.mockRestore();
     }
   }, 40_000);
+
+  it('wakes the workspace queue when a pre-ActiveRun continuation is cancelled', async () => {
+    const waiting = store.createRun({ title: 'pre-active queue wake', workflow: 'graph', task: 'x', worktree: false, steps: [] });
+    store.updateRun(waiting.id, { status: 'waiting', runner: 'cursor' });
+    store.addStep(waiting.id, { id: 'agent', name: 'Agent', kind: 'agent' });
+    store.updateStep(waiting.id, 'agent', {
+      status: 'waiting', sessionId: 'legacy-agent-session', backend: 'cursor',
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, {
+      projectId: project,
+      secrets,
+      semaphore: new WorkspaceSemaphore({ initial: { maxParallel: 1 } }),
+    });
+    await manager.recover();
+    expect(store.getRun(waiting.id)?.status).toBe('done');
+
+    const internals = manager as unknown as {
+      runContinuation: (runId: string, ...args: unknown[]) => Promise<void>;
+    };
+    let releaseContinuation!: () => void;
+    const continuationGate = new Promise<void>((resolve) => { releaseContinuation = resolve; });
+    let releasedContinuation = false;
+    const releaseHeldContinuation = () => {
+      if (releasedContinuation) return;
+      releasedContinuation = true;
+      releaseContinuation();
+    };
+    let settled!: () => void;
+    const continuationSettled = new Promise<void>((resolve) => { settled = resolve; });
+    const realContinuation = internals.runContinuation.bind(manager);
+    const continuationSpy = vi.spyOn(internals, 'runContinuation').mockImplementation(async (...args) => {
+      await continuationGate;
+      const pending = realContinuation(...args);
+      void pending.then(settled, settled);
+      return pending;
+    });
+    try {
+      expect(manager.continueRun(waiting.id, { text: 'hold the only slot' })).toEqual({ ok: true });
+      const queued = manager.startRun(checkOnly('echo queued'), { task: 'mock:done queued', worktree: false });
+      // The pre-active reservation counts as a busy slot: with maxParallel 1 this run must wait.
+      expect(store.getRun(queued.id)?.status).toBe('queued');
+      // Let the startRun-triggered pump finish its sweep first, so this test observes the
+      // cancellation wake-up rather than a pump that was already in flight and sees the freed
+      // slot for free.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(store.getRun(queued.id)?.status).toBe('queued');
+
+      expect(manager.cancel(waiting.id)).toBe(true);
+      expect(store.getRun(waiting.id)?.status).toBe('cancelled');
+      // The cancelled continuation never enters `active`, so only the terminal branch can wake
+      // the queue; without it this run sits here until the 60 s stalled-queue watchdog.
+      await until(queued.id, (record) => record.status !== 'queued', 5_000);
+      await settle(queued.id);
+      expect(store.getRun(queued.id)?.status).toBe('done');
+      releaseHeldContinuation();
+      await continuationSettled;
+    } finally {
+      releaseHeldContinuation();
+      continuationSpy.mockRestore();
+    }
+  }, 60_000);
 
   it('clears secrets that resolve after a cancel during rehydration', async () => {
     const credential = 'cancel-during-rehydration-secret-0123456789';
@@ -924,10 +1042,14 @@ describe('project and workspace secrets in check steps', () => {
     });
 
     const sequence: string[] = [];
+    const registeredCalls: string[][] = [];
     const realRegister = store.registerRunSecrets.bind(store);
     const realClear = store.clearRunSecrets.bind(store);
     const registerSpy = vi.spyOn(store, 'registerRunSecrets').mockImplementation((runId, values) => {
-      if (runId === queued.id) sequence.push('register');
+      if (runId === queued.id) {
+        sequence.push('register');
+        registeredCalls.push([...values]);
+      }
       return realRegister(runId, values);
     });
     const clearSpy = vi.spyOn(store, 'clearRunSecrets').mockImplementation((runId) => {
@@ -951,11 +1073,14 @@ describe('project and workspace secrets in check steps', () => {
       expect(store.getRun(queued.id)?.status).toBe('cancelled');
       expect(store.redactRunText(queued.id, credential)).toBe(credential);
       sequence.length = 0;
+      registeredCalls.length = 0;
 
       releaseResolve();
       await vi.waitFor(() => expect(executeDone).toBe(true), { timeout: 10_000 });
       expect(sequence).toContain('register');
       expect(sequence).toContain('clear');
+      expect(registeredCalls.length).toBeGreaterThan(0);
+      for (const values of registeredCalls) expect(values).toEqual([credential]);
       expect(store.redactRunText(queued.id, credential)).toBe(credential);
       expect(store.getRun(queued.id)?.status).toBe('cancelled');
     } finally {
@@ -973,7 +1098,7 @@ describe('project and workspace secrets in check steps', () => {
     const workflow: WorkflowDef = {
       name: 'probe-check',
       source: 'built-in',
-      steps: [{ id: 'check-1', name: 'Check', command: 'echo ok' }],
+      steps: [{ id: 'check-1', name: 'Check', command: 'printf ran > check-ran.txt' }],
     };
 
     let releaseResolve!: () => void;
@@ -1016,6 +1141,10 @@ describe('project and workspace secrets in check steps', () => {
       releaseResolve();
       await vi.waitFor(() => expect(executeDone).toBe(true), { timeout: 10_000 });
       expect(sequence).not.toContain('register');
+      // A cancel that lands during the resolve must stop the command itself, not just its secret
+      // registration: no side effect and no `check-output` event may exist after the late resolve.
+      expect(existsSync(join(repoRoot, 'check-ran.txt'))).toBe(false);
+      expect(store.readEvents(record.id).some((event) => event.type === 'check-output')).toBe(false);
       expect(store.redactRunText(record.id, credential)).toBe(credential);
       expect(store.getRun(record.id)?.status).toBe('cancelled');
     } finally {
@@ -1025,6 +1154,42 @@ describe('project and workspace secrets in check steps', () => {
       resolveSpy.mockRestore();
     }
   }, 40_000);
+
+  it('does not register check secrets for an ActiveRun a newer owner replaced', async () => {
+    const credential = 'replacement-owner-check-secret-0123456789';
+    await secrets.set(scope, 'REPLACE_KEY', credential);
+    const record = store.createRun({
+      title: 'replacement owner check', workflow: 'probe', task: 'x', worktree: false, steps: [],
+    });
+    const oldState = { cancelled: false };
+    const newState = { cancelled: false };
+    const internals = manager as unknown as {
+      active: Map<string, unknown>;
+      checkStepEnv: (
+        runId: string,
+        state: unknown,
+        step: { id: string; command: string },
+        emit: (event: unknown) => void,
+      ) => Promise<unknown>;
+      checkContextEnv: (...args: unknown[]) => Promise<Record<string, string>>;
+    };
+    internals.active.set(record.id, newState);
+    const contextSpy = vi.spyOn(internals, 'checkContextEnv').mockResolvedValue({});
+    const registerSpy = vi.spyOn(store, 'registerRunSecrets');
+    try {
+      await internals.checkStepEnv(
+        record.id,
+        oldState,
+        { id: 'check-1', command: 'echo ok' },
+        () => undefined,
+      );
+      expect(registerSpy).not.toHaveBeenCalledWith(record.id, expect.anything());
+    } finally {
+      internals.active.delete(record.id);
+      registerSpy.mockRestore();
+      contextSpy.mockRestore();
+    }
+  });
 
   it('without a secret store the check runs with the minimal env: toolchain vars, no vendor keys (#1164)', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-ant-exported-for-e2e-0123456789';

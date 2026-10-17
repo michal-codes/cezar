@@ -1754,7 +1754,7 @@ export class RunManager {
             ).catch((err: unknown) => {
               const message = err instanceof Error ? err.message : String(err);
               this.failOwnedContinuation(runId, ownerToken, message);
-              this.releaseStartingContinuation(runId, ownerToken);
+              if (this.releaseStartingContinuation(runId, ownerToken)) this.releaseSlot();
             });
             continue;
           }
@@ -3202,7 +3202,7 @@ export class RunManager {
       // a run the cockpit already shows as active.
       const ownerToken = this.startingOwners.get(runId);
       if (ownerToken === undefined) return false;
-      this.releaseStartingContinuation(runId, ownerToken);
+      const released = this.releaseStartingContinuation(runId, ownerToken);
       const finishedAt = new Date().toISOString();
       for (const step of this.store.getRun(runId)?.steps ?? []) {
         if (step.status === 'running' || step.status === 'waiting') {
@@ -3213,6 +3213,10 @@ export class RunManager {
       this.store.clearRunSecrets(runId);
       this.store.appendEvent(runId, { type: 'lifecycle', message: 'run cancelled' });
       this.reportSettledChildToParent(runId);
+      // The reservation counted as a busy slot until the line above. Nothing entered `active`,
+      // so no `dropActive` will run for this run — wake the workspace queue here, after the
+      // status, secret and parent-report writes, matching `dropActive`'s ordering.
+      if (released) this.releaseSlot();
       return true;
     }
     state.cancelled = true;
@@ -3876,17 +3880,21 @@ export class RunManager {
       (err: unknown) => {
         const message = err instanceof Error ? err.message : String(err);
         this.failOwnedContinuation(runId, ownerToken, message);
-        this.releaseStartingContinuation(runId, ownerToken);
+        if (this.releaseStartingContinuation(runId, ownerToken)) this.releaseSlot();
       },
     );
     return { ok: true };
   }
 
-  /** Release a continuation's pre-`ActiveRun` slot only when this owner still holds it. */
-  private releaseStartingContinuation(runId: string, ownerToken: symbol): void {
-    if (this.startingOwners.get(runId) !== ownerToken) return;
+  /**
+   * Release a continuation's pre-`ActiveRun` slot only when this owner still holds it.
+   * Returns true when a reservation was actually removed — callers that do not go on to create
+   * an `ActiveRun` must wake the workspace queue afterwards, exactly like `dropActive` does.
+   */
+  private releaseStartingContinuation(runId: string, ownerToken: symbol): boolean {
+    if (this.startingOwners.get(runId) !== ownerToken) return false;
     this.startingOwners.delete(runId);
-    this.starting.delete(runId);
+    return this.starting.delete(runId);
   }
 
   private async runContinuation(
