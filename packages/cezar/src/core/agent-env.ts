@@ -332,9 +332,20 @@ const ALL_VENDOR_PREFIXES: readonly string[] = [
  *  one in `CEZ_ENV_PASSTHROUGH`. `ALL_VENDOR_PREFIXES` covers the backend and
  *  Bedrock/Vertex prefixes; these extra families close the exact-name holes
  *  (`GITHUB_ENTERPRISE_TOKEN`, `GOOGLE_APPLICATION_CREDENTIALS`,
- *  `CLOUD_ML_REGION`) and the `GH_*`/`GITHUB_*` handoff families wholesale. */
+ *  `CLOUD_ML_REGION`) and the `GH_*`/`GITHUB_*` handoff families wholesale.
+ *  `CLOUDSDK_*` is the gcloud family: it spells `CLOUDSDK_AUTH_ACCESS_TOKEN`
+ *  without a `CLOUD_` separator, so it needs its own prefix. */
 const CHECK_DENY_PREFIXES: readonly string[] = [
-  ...new Set([...ALL_VENDOR_PREFIXES, 'GH_', 'GITHUB_', 'GOOGLE_', 'GCP_', 'AZURE_', 'CLOUD_']),
+  ...new Set([
+    ...ALL_VENDOR_PREFIXES,
+    'GH_',
+    'GITHUB_',
+    'GOOGLE_',
+    'GCP_',
+    'AZURE_',
+    'CLOUD_',
+    'CLOUDSDK_',
+  ]),
 ];
 const CHECK_DENY_NAMES: ReadonlySet<string> = upperSet([...GH_ALLOW_NAMES, ...VERTEX_ALLOW_NAMES]);
 
