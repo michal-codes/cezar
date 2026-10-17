@@ -427,6 +427,18 @@ describe('buildCheckEnv — the minimal check env', () => {
     expect(env.CEZ_CHECK_PROBE).toBeUndefined();
   });
 
+  it('never applies CEZ_AGENT_ENV_FULL to a check', () => {
+    // The agent-side escape hatch must not widen repository-authored code: a
+    // check stays on the minimal base even when an operator asked agents for
+    // the full host environment.
+    const env = buildCheckEnv({ ...HOST, CEZ_AGENT_ENV_FULL: '1' });
+    expect(env.PATH).toBe('/usr/bin:/bin');
+    expect(env.GITHUB_TOKEN).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
+    expect(env.CEZ_CHECK_PROBE).toBeUndefined();
+  });
+
   it('reads the passthrough case-insensitively and ignores an empty list', () => {
     expect(buildCheckEnv({ ...HOST, CEZ_ENV_PASSTHROUGH: 'my_check_token' }).MY_CHECK_TOKEN).toBe(
       'check-token-probe',

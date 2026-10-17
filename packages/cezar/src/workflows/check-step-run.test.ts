@@ -225,7 +225,7 @@ posix('check steps through the run loop', () => {
     ).toHaveLength(2);
   }, 30_000);
 
-  it('is dry-run aware by DEFAULT: `checkTimeoutMs` and `checkGateTimeoutMs` are the documented defaults', async () => {
+  it('uses the documented check limits by default, and treats 0 as off', async () => {
     const config = await loadConfig(repoRoot);
     expect(config.checkTimeoutMs).toBe(20 * 60_000);
     expect(config.checkGateTimeoutMs).toBe(45 * 60_000);
