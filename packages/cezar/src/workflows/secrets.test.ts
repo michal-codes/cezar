@@ -368,7 +368,6 @@ describe('project and workspace secrets in check steps', () => {
     expect(store.getRun(untrusted.id)?.graphState?.outputs?.first?.output).toBe('fork-output');
     expect(register.mock.calls.some(([runId]) => runId === untrusted.id)).toBe(false);
 
-    store.flush();
     const runsJson = readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8');
     expect(runsJson).not.toContain(credential);
 
@@ -378,6 +377,48 @@ describe('project and workspace secrets in check steps', () => {
       expect(response.status).toBe(200);
       expect(await response.text()).not.toContain(credential);
     }
+  }, 40_000);
+
+  it('keeps the boot-scrub redactor for a live agent-cursor run that recovery resumes', async () => {
+    const credential = 'live-agent-cursor-secret-0123456789';
+    await secrets.set(scope, 'LIVE_AGENT_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'first', type: 'check', command: 'echo first' },
+        { id: 'agent', type: 'agent', prompt: 'mock:done' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'first' },
+        { from: 'first', to: 'agent' },
+        { from: 'agent', to: 'finish' },
+      ],
+    };
+    const running = store.createRun({
+      title: 'running', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph),
+    });
+    store.updateRun(running.id, {
+      status: 'running',
+      workflowDef: { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      graphState: { loops: {}, taken: [], cursor: 'agent', outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    store.updateStep(running.id, 'agent', { status: 'running', sessionId: 'legacy-agent-session' });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+
+    // The scrub must leave the redactor registered while recovery drives this run onward: its
+    // resumed session may echo a value from the pre-fix context before any check runs again.
+    expect(store.getRun(running.id)?.graphState?.outputs?.first?.output).toContain('[REDACTED]');
+    expect(store.redactRunText(running.id, credential)).toBe('[REDACTED]');
+    store.appendEvent(running.id, { type: 'text', text: `post-recovery output: ${credential}`, stepId: 'agent' });
+    expect(
+      readFileSync(join(repoRoot, '.ai/cezar/runs', `${running.id}.ndjson`), 'utf8'),
+    ).not.toContain(credential);
   }, 40_000);
 
   it('without a secret store the check runs with the minimal env: toolchain vars, no vendor keys (#1164)', async () => {

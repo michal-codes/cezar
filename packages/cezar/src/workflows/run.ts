@@ -3860,6 +3860,10 @@ export class RunManager {
     ownerToken?: symbol,
   ): Promise<void> {
     const effectiveOwnerToken = ownerToken ?? Symbol('run-owner');
+    // A continuation can outlive the boot scrub (a user Continue of an old run, or a recovered
+    // agent-cursor session) and its model context may still hold a pre-fix check value. Register
+    // the checks audience for redaction before this turn can append any event.
+    await this.rehydrateResumeRedaction(runId);
     // Continuation runs in the task's worktree when it still exists (spec
     // 006) — the resumed session sees exactly what the original run left.
     // Retention (#483) may have reclaimed this run's worktree directory while
@@ -7354,6 +7358,7 @@ export class RunManager {
       'checks',
     );
     const values = Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN);
+    let persisted = false;
     for (const run of withOutputs) {
       if (run.untrustedHead !== true) this.store.registerRunSecrets(run.id, values);
       const graphState = run.graphState;
@@ -7373,10 +7378,18 @@ export class RunManager {
         }
         outputs[nodeId] = safeFields;
       }
-      if (changed) this.store.updateRun(run.id, { graphState: { ...graphState, outputs } });
-      // The values were needed only for this pass; a resumed check re-registers its own audience.
-      this.store.clearRunSecrets(run.id);
+      if (changed) {
+        this.store.updateRun(run.id, { graphState: { ...graphState, outputs } });
+        persisted = true;
+      }
+      // A run recovery can still drive may echo a value from its pre-fix context before its own
+      // check re-registers the audience. Keep the redactor for live runs; every terminal state
+      // clears it through `dropActive`. A waiting run is settled here, so it is safe to clear.
+      if (run.status !== 'running' && run.status !== 'queued') this.store.clearRunSecrets(run.id);
     }
+    // Do not leave the healed record on the debounce timer: `recover()` runs before the server
+    // accepts requests, and `runs.json` must be clean the moment it returns.
+    if (persisted) this.store.flush();
   }
 
   /**
