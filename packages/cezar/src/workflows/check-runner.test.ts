@@ -77,6 +77,12 @@ describe('capCheckOutput — the tail is kept', () => {
     const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
     expect(loneSurrogate.test(capped)).toBe(false);
   });
+
+  it('drops a lone low surrogate handed in as the whole tail', () => {
+    const capped = capCheckOutput('\uDE00', 4, 9);
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(loneSurrogate.test(capped)).toBe(false);
+  });
 });
 
 describe('runCheckCommand — outcomes', () => {
@@ -124,6 +130,19 @@ describe('runCheckCommand — outcomes', () => {
     expect(outcome.status).toBe('passed');
     expect(outcome.output).toBe('€');
     expect(outcome.output).not.toContain('\uFFFD');
+  });
+
+  it('never lets the rolling window leave a lone surrogate after trimming', async () => {
+    // 9 UTF-16 units with cap 4: the 8-unit rolling window starts on the emoji's low
+    // surrogate, and `.trim()` then removes every trailing space, leaving it alone.
+    const outcome = await runCheckCommand({
+      cwd,
+      cap: 4,
+      command: `printf '\\360\\237\\230\\200       '`,
+    });
+    expect(outcome.status).toBe('passed');
+    const loneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    expect(loneSurrogate.test(outcome.output)).toBe(false);
   });
 });
 

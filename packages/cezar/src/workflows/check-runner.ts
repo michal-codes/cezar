@@ -58,6 +58,12 @@ export function capCheckOutput(text: string, cap = CHECK_OUTPUT_CAP, totalChars?
   const total = totalChars ?? text.length;
   if (total <= cap) return text;
   let start = Math.max(0, text.length - cap);
+  // A caller can hand us a fragment whose first code unit is a low surrogate (the rolling
+  // window below used to do exactly that). Never keep one: it is not a character.
+  if (text.length > 0) {
+    const first = text.charCodeAt(0);
+    if (first >= 0xdc00 && first <= 0xdfff) start = Math.max(start, 1);
+  }
   // Slice on a code-point boundary: a low surrogate at the cut means its high
   // half is outside the window. Keeping it would put a lone surrogate in the
   // transcript (and in JSON); drop both halves and account for them instead.
@@ -339,7 +345,13 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
       output += text;
       // Rolling window so a chatty command cannot grow memory without bound; the
       // final cap keeps the last `cap` characters (plus the marker).
-      if (output.length > cap * 2) output = output.slice(-cap * 2);
+      if (output.length > cap * 2) {
+        let start = output.length - cap * 2;
+        // Keep the window's first code unit from being a low surrogate: `.trim()` later
+        // can leave it as the whole transcript.
+        if (output.charCodeAt(start) >= 0xdc00 && output.charCodeAt(start) <= 0xdfff) start += 1;
+        output = output.slice(start);
+      }
       options.onOutput?.(text);
     };
 
