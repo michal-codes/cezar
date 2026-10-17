@@ -7282,11 +7282,35 @@ export class RunManager {
       runId,
       Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN),
     );
-    // Minimal base (#1164): `buildCheckEnv` drops every `CEZ_*` (so a context var this run does
-    // not set is absent, never a value inherited from an outer cezar task), `GH_*` and the
-    // vendor/cloud families. A credential a check needs comes from the vault above, and the run
-    // context wins last (Phase 2).
-    return { ...buildCheckEnv(), ...resolved.values, ...(await this.checkContextEnv(runId, state, step.id)) };
+    // The base is the MINIMAL check env, not the server's: a check is repository code running
+    // unattended, so it never inherits `GITHUB_*`/`GH_*`, vendor or cloud credentials, or
+    // cezar's own `CEZ_*` (`buildCheckEnv`; `CEZ_ENV_PASSTHROUGH` is the one explicit hatch).
+    // A fork head gets no passthrough at all. The run context wins last (Phase 2): its names are
+    // added after the base, so a variable this run does not set is absent, never a stale value
+    // from somewhere else. The seam spawns a non-login shell, so a profile cannot re-add what
+    // this cut removed.
+    const base: NodeJS.ProcessEnv = buildCheckEnv(process.env, { passthrough: !untrusted });
+    return { ...base, ...resolved.values, ...(await this.checkContextEnv(runId, state, step.id)) };
+  }
+
+  /**
+   * Teach the run's redactor the checks audience before a resumed graph state is replayed.
+   * Run secrets are memory-only and are normally registered by `checkStepEnv`; a restart has
+   * none, so `redactRunText` would know only host values and could let a pre-fix persisted
+   * output carry a project/workspace secret into a prompt or back into runs.json. Resolving
+   * the whole checks audience is deliberate: the map holds outputs from checks with different
+   * bindings, and these values are used for redaction only. A fork head never had checks
+   * secrets, so it is not read here.
+   */
+  private async rehydrateResumeRedaction(runId: string): Promise<void> {
+    if (this.store.getRun(runId)?.untrustedHead === true) return;
+    const resolved = await this.secrets.resolve(
+      this.projectId ? { projectId: this.projectId, root: this.repoRoot } : undefined,
+      'checks',
+    );
+    this.store.registerRunSecrets(
+      runId,
+      Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN),
   }
 
   /**

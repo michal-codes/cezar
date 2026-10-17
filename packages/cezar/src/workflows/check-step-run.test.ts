@@ -91,6 +91,23 @@ posix('check steps through the run loop', () => {
     expect(String(output?.text)).toContain('all good');
   });
 
+  it('records a synchronous spawn failure as could-not-run instead of crashing the run', async () => {
+    // Node rejects a NUL byte in argv synchronously. The engine must still settle the
+    // step and emit the check-output event, rather than leaving the run stuck or throwing.
+    const record = manager.startRun(checkWorkflow('echo hi\u0000there'), { task: 'verify', worktree: false });
+    currentId = record.id;
+    await settle(record.id);
+
+    const final = store.getRun(record.id);
+    expect(final?.status).toBe('failed');
+    expect(final?.steps.map(({ id, status }) => ({ id, status }))).toEqual([{ id: 'check-1', status: 'failed' }]);
+    const outputs = events(record.id).filter((e) => e.type === 'check-output');
+    expect(outputs).toHaveLength(1);
+    expect(outputs[0]?.status).toBe('could-not-run');
+    expect(outputs[0]?.exitCode).toBe(-1);
+    expect(String(outputs[0]?.text)).toMatch(/could not run: failed to spawn/);
+  });
+
   it('CEZ_DRY_RUN=1 still runs the check — dry run swaps the agent, not the gate', async () => {
     process.env.CEZ_DRY_RUN = '1';
     const record = manager.startRun(

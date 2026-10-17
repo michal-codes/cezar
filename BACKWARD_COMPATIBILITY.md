@@ -200,6 +200,15 @@ The `version: 2` graph format (spec `2026-09-30-workflow-node-editor`, `packages
 
 Breaking: renaming a key, tightening a refinement so previously valid files fail to load, changing `{{task}}` substitution, changing `onFail` semantics (retry target, `max` default of 2), or removing a `runner` value. Note the loader already degrades per file (bad files are reported in `issues` and skipped, `cezar run` prints `! skipped …`) — but "your existing workflow is now skipped" is still a break. Required path: accept the old spelling alongside the new, and have `POST /api/workflows` keep writing the most portable form.
 
+**Check-step execution (#1164; behavior changes, each with an opt-out).**
+
+- **Shell:** `bash --noprofile --norc -c` (non-login) in the run's worktree. A command that relied on a login profile exporting a variable must source that profile itself, name the variable in `CEZ_ENV_PASSTHROUGH`, or store it as a `checks` secret.
+- **Wall clock:** 20 minutes per command (`checkTimeoutMs`) and 45 minutes for the whole gate — every check of one run, retries included (`checkGateTimeoutMs`). Both are configurable in `.ai/cezar/config.json`; `0` restores the old unbounded behaviour. A timeout is non-green and does not loop back to an agent.
+- **Process group:** a timeout or cancellation SIGTERMs the check's detached process group, waits 5 s, then SIGKILLs it. A grandchild that stays in that group and traps SIGTERM still dies. A process that escapes the group (`setsid`/`detached`) may survive; if it still holds the pipes they are cut so the outcome always settles.
+- **Output:** the transcript keeps the last 20,000 Unicode code points (characters; an astral character counts once) plus one marker line naming what was elided. This is deliberately tail-preserving, so a test-runner summary is not cut off.
+- **Outcomes:** only `passed` (exit 0) is green. `failed` may loop through `onFail`/`retryOn` as before. `timed-out`, `cancelled`, `could-not-run` and the opt-in `dryRun: true` outcome `skipped` end the run and never trigger `onFail`; a command that did not execute cannot be fixed by another agent turn. `CEZ_DRY_RUN=1` mocks the agents only, so checks still run.
+
+Migration for an existing workflow is additive: a check longer than 20 minutes needs `checkTimeoutMs` raised (or `0`), and a check needing a login shell or an ambient variable names it explicitly. No workflow YAML key changed.
 ## 5. Skills Markdown format (`packages/cezar/src/skills.ts`)
 
 A skill is a `.md` file with optional YAML frontmatter (`name`, `description`); the body becomes the agent's extra system prompt. Protected: frontmatter keys; the `SKILL.md`-in-a-directory convention; the discovery locations and their precedence (`.ai/cezar/skills` → `.ai/skills` → `.agents/skills` + agent mirrors → `~/.agents/skills`, `~/.claude/skills` → team repos); name-collision resolution ("the user's repo is the source of truth"); the `config.json` `skillsRepos` source shape (`{repo, ref}` — GitHub shorthand, git URL, or local path).

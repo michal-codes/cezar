@@ -71,6 +71,12 @@ describe('capCheckOutput — the tail is kept', () => {
     expect(capped).toContain(checkTruncationMarker(4_995));
   });
 
+  it('counts the cap in code points, so an astral character is one character', () => {
+    const capped = capCheckOutput('😀'.repeat(10_001), 10_000);
+    expect(capped).toContain(checkTruncationMarker(1));
+    expect((capped.match(/😀/gu) ?? []).length).toBe(10_000);
+  });
+
   it('never starts a kept tail with a lone surrogate', () => {
     const capped = capCheckOutput(`${'x'.repeat(10)}😀END`, 4);
     expect(capped).toContain('END');

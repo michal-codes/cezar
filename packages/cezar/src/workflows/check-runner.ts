@@ -40,7 +40,8 @@ export const CHECK_GATE_TIMEOUT_MS = 45 * 60_000;
 export const CHECK_TERMINATE_GRACE_MS = 5_000;
 /** How much of a command's transcript is kept, and which END is kept: the tail.
  *  A failing command says WHY at the end (`npm test` prints its summary last),
- *  so the old head-kept cap threw away the one line the retried agent needed. */
+ *  so the old head-kept cap threw away the one line the retried agent needed.
+ *  Measured in Unicode code points, so an astral character (an emoji) counts once. */
 export const CHECK_OUTPUT_CAP = 20_000;
 
 /** Marker line placed before the retained tail. The elided count is the whole
@@ -49,30 +50,42 @@ export function checkTruncationMarker(elidedChars: number): string {
   return `… (${elidedChars} characters elided at the head — the tail is kept)`;
 }
 
+/** Count Unicode code points, not UTF-16 code units. */
+function countCodePoints(text: string): number {
+  let count = 0;
+  for (const _ of text) count += 1;
+  return count;
+}
+
 /**
- * Tail-preserving cap. `totalChars` is the FULL transcript length when the
+ * Tail-preserving cap. `totalCodePoints` is the FULL transcript length when the
  * caller streamed the output through a rolling buffer; it defaults to the
- * length of `text` for a direct call.
+ * number of code points in `text` for a direct call.
  */
-export function capCheckOutput(text: string, cap = CHECK_OUTPUT_CAP, totalChars?: number): string {
-  const total = totalChars ?? text.length;
+export function capCheckOutput(text: string, cap = CHECK_OUTPUT_CAP, totalCodePoints?: number): string {
+  const total = totalCodePoints ?? countCodePoints(text);
   if (total <= cap) return text;
-  let start = Math.max(0, text.length - cap);
+  // Walk backwards one code point at a time. A surrogate pair is one code point,
+  // so the window can never start on the low half of an astral character.
+  let start = text.length;
+  let kept = 0;
+  while (start > 0 && kept < cap) {
+    start -= 1;
+    const code = text.charCodeAt(start);
+    if (code >= 0xdc00 && code <= 0xdfff && start > 0) {
+      const high = text.charCodeAt(start - 1);
+      if (high >= 0xd800 && high <= 0xdbff) start -= 1;
+    }
+    kept += 1;
+  }
+  let tail = text.slice(start);
   // A caller can hand us a fragment whose first code unit is a low surrogate (the rolling
   // window below used to do exactly that). Never keep one: it is not a character.
-  if (text.length > 0) {
-    const first = text.charCodeAt(0);
-    if (first >= 0xdc00 && first <= 0xdfff) start = Math.max(start, 1);
+  if (tail.length > 0) {
+    const first = tail.charCodeAt(0);
+    if (first >= 0xdc00 && first <= 0xdfff) tail = tail.slice(1);
   }
-  // Slice on a code-point boundary: a low surrogate at the cut means its high
-  // half is outside the window. Keeping it would put a lone surrogate in the
-  // transcript (and in JSON); drop both halves and account for them instead.
-  if (start > 0 && start < text.length) {
-    const code = text.charCodeAt(start);
-    if (code >= 0xdc00 && code <= 0xdfff) start += 1;
-  }
-  const tail = text.slice(start);
-  return `${checkTruncationMarker(Math.max(0, total - tail.length))}\n${tail}`;
+  return `${checkTruncationMarker(Math.max(0, total - countCodePoints(tail)))}\n${tail}`;
 }
 
 /**
@@ -126,7 +139,7 @@ export interface CheckCommandOptions {
   gateDeadlineAt?: number;
   /** SIGTERM → SIGKILL grace, ms. Default `CHECK_TERMINATE_GRACE_MS`. */
   graceMs?: number;
-  /** Output cap in characters (tail kept). Default `CHECK_OUTPUT_CAP`. */
+  /** Output cap in Unicode code points (tail kept). Default `CHECK_OUTPUT_CAP`. */
   cap?: number;
   /** Spawn nothing and report `skipped`. Opt-in only: `CEZ_DRY_RUN=1` swaps the
    *  agent for the bundled mock and still runs checks (#1164 review). */
@@ -249,7 +262,7 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
 
   return await new Promise<CheckOutcome>((resolve) => {
     let output = '';
-    let totalChars = 0;
+    let totalCodePoints = 0;
     let settled = false;
     let timedOut = false;
     let cancelled = false;
@@ -341,10 +354,10 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
 
     const collect = (chunk: string | Buffer): void => {
       const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      totalChars += text.length;
+      totalCodePoints += countCodePoints(text);
       output += text;
       // Rolling window so a chatty command cannot grow memory without bound; the
-      // final cap keeps the last `cap` characters (plus the marker).
+      // final cap keeps the last `cap` code points (plus the marker).
       if (output.length > cap * 2) {
         let start = output.length - cap * 2;
         // Keep the window's first code unit from being a low surrogate: `.trim()` later
@@ -359,7 +372,7 @@ export async function runCheckCommand(options: CheckCommandOptions): Promise<Che
       if (settled) return;
       settled = true;
       cleanup();
-      const transcript = capCheckOutput(output.trim(), cap, totalChars);
+      const transcript = capCheckOutput(output.trim(), cap, totalCodePoints);
       const lines = [transcript, reason].filter((line): line is string => Boolean(line));
       resolve({
         status,

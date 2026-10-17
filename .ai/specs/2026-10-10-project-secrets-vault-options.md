@@ -7,8 +7,10 @@ Status: decided 2026-10-10 (owner: backend D with A as fallback, reworked on PR 
 
 > **Amended 2026-10-17 (#1164, owner decision):** the check env base is no longer `process.env`. A check
 > gets `{ ...buildCheckEnv(), ...secrets('checks'), ...context }`: a minimal toolchain env with no
-> `CEZ_*`, `GH_*`/`GITHUB_TOKEN` or vendor/cloud credentials, under `bash --noprofile --norc`. A
+> `CEZ_*`, `GH_*`/`GITHUB_*` or vendor/cloud credentials, under `bash --noprofile --norc`. A
 > provider key exported on the server no longer reaches a check; it has to be stored as a secret.
+> `CEZ_ENV_PASSTHROUGH` can name toolchain vars but cannot reopen those families, and a fork head
+> gets no passthrough at all.
 
 ## The ask
 

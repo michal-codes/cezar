@@ -130,7 +130,7 @@ loops back, exactly as before this field existed.
 
 That is already what the `onFail` loop does, and it is the reason to prefer
 `--reporter list,markdown` over bare output: when a check loops back, cezar
-appends its output (capped at 20 000 characters) to the retried agent's prompt
+appends its output (capped at 20,000 Unicode code points) to the retried agent's prompt
 under *"A verification command failed after the previous attempt. Fix the
 cause."* `summary.md` is written for exactly that — counts, errors, and the
 failing line, steps and screen for each failure — where a raw `report.json` is
@@ -329,9 +329,16 @@ for follow-ups.
   `CEZ_BRANCH`, `CEZ_BASE`, `CEZ_STEP_ID` and `CEZ_ATTEMPT`, plus
   `CEZ_GITHUB_REPO`/`CEZ_GITHUB_NUMBER`/`CEZ_GITHUB_EVENT` on a run a GitHub
   automation launched — see the [reference](reference.md#workflow-format).
-- **No timeout.** cezar does not bound a check step; e2e's own startup,
-  test and exploration timeouts are what stop a hung app from holding the
-  task's parallel slot. Keep them configured.
+- **Bounded wall clock.** Each command has 20 minutes and a whole check gate —
+  every check of one run, retries included — has 45 minutes. Configure them with
+  `"checkTimeoutMs"` and `"checkGateTimeoutMs"` in `.ai/cezar/config.json`; `0`
+  removes either limit. Keep e2e's own startup, test and exploration timeouts
+  configured too: a timed-out check ends the run, it does not loop back to the
+  agent.
+- **Only the tail comes back.** A check's output is kept to its last 20,000
+  Unicode code points (characters), with a marker naming what was elided. The failing line and the
+  test-runner summary are at the tail, so they survive the cap when the output
+  is appended to the retried agent's prompt.
 - **No service orchestration.** e2e starts `app.command` and nothing else. A
   database or a mock stack has to be up before the run, or started by the
   command the config names.
