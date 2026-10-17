@@ -1893,6 +1893,7 @@ export class RunManager {
    * Call once, before the server starts taking requests.
    */
   async recover(): Promise<void> {
+    await this.scrubPersistedGraphOutputs();
     const live = this.store
       .listRuns()
       .filter((r) => ['queued', 'waiting', 'running'].includes(r.status))
@@ -7336,6 +7337,49 @@ export class RunManager {
   }
 
   /**
+   * Scrub graph outputs persisted by versions before the fresh-path redaction. `recover()` is
+   * the one boot-time pass that sees every record, including finished runs that never resume,
+   * so it is where a legacy `runs.json` can be healed before the API or a resumed agent reads
+   * it. The values are registered for redaction only; a fork-head run is scrubbed against host
+   * secrets but never gets the project/workspace checks secrets.
+   */
+  private async scrubPersistedGraphOutputs(): Promise<void> {
+    const withOutputs = this.store.listRuns().filter((run) => {
+      const outputs = run.graphState?.outputs;
+      return outputs !== undefined && Object.keys(outputs).length > 0;
+    });
+    if (withOutputs.length === 0) return;
+    const resolved = await this.secrets.resolve(
+      this.projectId ? { projectId: this.projectId, root: this.repoRoot } : undefined,
+      'checks',
+    );
+    const values = Object.values(resolved.values).filter((value) => value.length >= MIN_SECRET_LEN);
+    for (const run of withOutputs) {
+      if (run.untrustedHead !== true) this.store.registerRunSecrets(run.id, values);
+      const graphState = run.graphState;
+      if (!graphState?.outputs) continue;
+      let changed = false;
+      const outputs: Record<string, Record<string, string | number>> = {};
+      for (const [nodeId, fields] of Object.entries(graphState.outputs)) {
+        const safeFields: Record<string, string | number> = {};
+        for (const [key, value] of Object.entries(fields)) {
+          if (typeof value === 'string') {
+            const safe = this.store.redactRunText(run.id, value);
+            if (safe !== value) changed = true;
+            safeFields[key] = safe;
+          } else {
+            safeFields[key] = value;
+          }
+        }
+        outputs[nodeId] = safeFields;
+      }
+      if (changed) this.store.updateRun(run.id, { graphState: { ...graphState, outputs } });
+      // The values were needed only for this pass; a resumed check re-registers its own audience.
+      this.store.clearRunSecrets(run.id);
+    }
+  }
+
+  /**
    * What a check step knows about the run it verifies (spec 2026-10-06-agentic-e2e-checks
    * Phase 2). Cezar-set outputs, not knobs: every value is a string, and a value this run does
    * not have is omitted rather than set empty, so `[ -n "$CEZ_GITHUB_NUMBER" ]` means what it
@@ -7403,15 +7447,21 @@ export class RunManager {
     const env = await this.checkStepEnv(runId, state, step, emit);
     // A cancel that landed during the read had no child to interrupt; do not spawn one now.
     if (state.cancelled) return { ok: false, output: 'cancelled', exitCode: -1, status: 'cancelled' };
-    const limits = await checkLimits(this.repoRoot);
-    if (state.checkGateDeadline === undefined && limits.gateTimeoutMs > 0) {
-      state.checkGateDeadline = Date.now() + limits.gateTimeoutMs;
-    }
     const controller = new AbortController();
     const previousInterrupt = state.interrupt;
     state.interrupt = () => controller.abort();
     let outcome: CheckOutcome;
     try {
+      const limits = await checkLimits(this.repoRoot);
+      // `cancel()` can land while the limits are being read. It calls the interrupt hook, but
+      // the hook only exists once this check owns it; do not spawn after a cancel that raced
+      // that read. The signal check also covers a resolver that aborted synchronously.
+      if (state.cancelled || controller.signal.aborted) {
+        return { ok: false, output: 'cancelled', exitCode: -1, status: 'cancelled' };
+      }
+      if (state.checkGateDeadline === undefined && limits.gateTimeoutMs > 0) {
+        state.checkGateDeadline = Date.now() + limits.gateTimeoutMs;
+      }
       // Check steps run in the same cwd as the agent steps — the worktree.
       const options: CheckCommandOptions = {
         cwd: state.cwd,

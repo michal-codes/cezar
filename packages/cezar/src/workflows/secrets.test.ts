@@ -4,11 +4,13 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildChildEnv } from '../core/agent-env.ts';
 import { RunStore, type RunRecord } from '../runs/store.ts';
+import { apiRequest } from '../server/loopback-request.testkit.ts';
+import { createApp } from '../server/server.ts';
 import { SecretStore } from '../workspace/secrets.ts';
-import { graphToSteps, type WorkflowGraph } from './graph.ts';
+import { graphRailSteps, graphToSteps, type WorkflowGraph } from './graph.ts';
 import { CHECK_CONTEXT_VARS, RunManager } from './run.ts';
 import { workflowStepSchema, type WorkflowDef } from './types.ts';
 
@@ -300,6 +302,82 @@ describe('project and workspace secrets in check steps', () => {
 
     store.flush();
     expect(readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8')).not.toContain(credential);
+  }, 40_000);
+
+  it('scrubs legacy graph outputs for every recovered record, including an agent-cursor run', async () => {
+    const credential = 'agent-cursor-legacy-secret-0123456789';
+    await secrets.set(scope, 'AGENT_CURSOR_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'first', type: 'check', command: 'echo first' },
+        { id: 'agent', type: 'agent', prompt: 'mock:done' },
+        { id: 'finish', type: 'end', status: 'success' },
+      ],
+      edges: [
+        { from: 'start', to: 'first' },
+        { from: 'first', to: 'agent' },
+        { from: 'agent', to: 'finish' },
+      ],
+    };
+    const definition: WorkflowDef = {
+      name: 'graph',
+      source: 'file',
+      steps: graphToSteps(graph),
+      graph,
+    };
+    const parked = store.createRun({
+      title: 'parked', workflow: 'graph', task: 'x', worktree: false, steps: graphRailSteps(graph),
+    });
+    store.updateRun(parked.id, {
+      status: 'waiting',
+      workflowDef: definition,
+      graphState: { loops: {}, taken: [], cursor: 'agent', outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    const finished = store.createRun({
+      title: 'finished', workflow: 'graph', task: 'x', worktree: false, steps: [],
+    });
+    store.updateRun(finished.id, {
+      status: 'done',
+      finishedAt: new Date().toISOString(),
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: credential } } },
+    });
+    const untrusted = store.createRun({
+      title: 'fork', workflow: 'graph', task: 'x', worktree: false, steps: [],
+    });
+    store.updateRun(untrusted.id, {
+      status: 'done',
+      untrustedHead: true,
+      finishedAt: new Date().toISOString(),
+      graphState: { loops: {}, taken: [], outputs: { first: { exitCode: 0, output: 'fork-output' } } },
+    });
+
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    const register = vi.spyOn(store, 'registerRunSecrets');
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+
+    for (const id of [parked.id, finished.id]) {
+      const output = store.getRun(id)?.graphState?.outputs?.first?.output;
+      expect(output).toContain('[REDACTED]');
+      expect(output).not.toContain(credential);
+    }
+    // A fork head never had the checks audience; recovery must not register it for that run.
+    expect(store.getRun(untrusted.id)?.graphState?.outputs?.first?.output).toBe('fork-output');
+    expect(register.mock.calls.some(([runId]) => runId === untrusted.id)).toBe(false);
+
+    store.flush();
+    const runsJson = readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8');
+    expect(runsJson).not.toContain(credential);
+
+    const app = createApp({ repoRoot, store, manager, version: '0.0.0-test' });
+    for (const id of [parked.id, finished.id]) {
+      const response = await apiRequest(app, `/api/v1/runs/${id}`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).not.toContain(credential);
+    }
   }, 40_000);
 
   it('without a secret store the check runs with the minimal env: toolchain vars, no vendor keys (#1164)', async () => {

@@ -3,11 +3,39 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig } from '../config.ts';
 import { RunStore, type RunRecord } from '../runs/store.ts';
 import { RunManager } from './run.ts';
 import type { WorkflowDef } from './types.ts';
+
+/** Lets one test hold the config read inside `checkLimits` open. Every other caller delegates. */
+const configGate = vi.hoisted(() => {
+  let enter!: () => void;
+  let release!: () => void;
+  return {
+    armed: false,
+    entered: new Promise<void>((resolve) => { enter = resolve; }),
+    held: new Promise<void>((resolve) => { release = resolve; }),
+    enter: () => enter(),
+    release: () => release(),
+  };
+});
+
+vi.mock('../config.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../config.ts')>();
+  return {
+    ...actual,
+    loadConfig: async (repoRoot: string) => {
+      if (configGate.armed && new Error().stack?.includes('checkLimits')) {
+        configGate.armed = false;
+        configGate.enter();
+        await configGate.held;
+      }
+      return actual.loadConfig(repoRoot);
+    },
+  };
+});
 
 /**
  * The check step as the ENGINE uses it (#landing-check S1): the seam's
@@ -90,6 +118,37 @@ posix('check steps through the run loop', () => {
     expect(output?.status).toBe('passed');
     expect(String(output?.text)).toContain('all good');
   });
+
+  it('does not spawn a check when a real cancel lands while its limits are being read', async () => {
+    // Hold the config read that `checkLimits` awaits, so the cancel below lands in exactly the
+    // window a fast local JSON read makes hard to hit.
+    configGate.armed = true;
+    const record = manager.startRun(
+      checkWorkflow(`node -e "require('node:fs').writeFileSync('check-ran','yes')"`),
+      { task: 'verify', worktree: false },
+    );
+    currentId = record.id;
+    try {
+      await Promise.race([
+        configGate.entered,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('run never reached checkLimits')), 10_000)),
+      ]);
+      expect(manager.cancel(record.id)).toBe(true);
+      expect(store.getRun(record.id)?.status).toBe('cancelled');
+      configGate.release();
+      // In the buggy shape the check spawns as soon as the read resolves; give it ample time.
+      const spawnDeadline = Date.now() + 1_500;
+      while (!existsSync(join(repoRoot, 'check-ran')) && Date.now() < spawnDeadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(existsSync(join(repoRoot, 'check-ran'))).toBe(false);
+      expect(store.getRun(record.id)?.status).toBe('cancelled');
+      expect(store.getRun(record.id)?.steps[0]?.status).toBe('cancelled');
+      expect(events(record.id).some((e) => e.type === 'check-output')).toBe(false);
+    } finally {
+      configGate.release();
+    }
+  }, 30_000);
 
   it('records a synchronous spawn failure as could-not-run instead of crashing the run', async () => {
     // Node rejects a NUL byte in argv synchronously. The engine must still settle the
