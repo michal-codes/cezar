@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { buildChildEnv } from '../core/agent-env.ts';
-import { RunStore } from '../runs/store.ts';
+import { RunStore, type RunRecord } from '../runs/store.ts';
 import { SecretStore } from '../workspace/secrets.ts';
+import { graphToSteps, type WorkflowGraph } from './graph.ts';
 import { CHECK_CONTEXT_VARS, RunManager } from './run.ts';
 import { workflowStepSchema, type WorkflowDef } from './types.ts';
 
@@ -72,6 +73,16 @@ describe('project and workspace secrets in check steps', () => {
     while (!terminal.has(store.getRun(id)?.status ?? '')) {
       if (Date.now() > deadline) throw new Error('run did not finish in time');
       await new Promise((r) => setTimeout(r, 100));
+    }
+  };
+
+  const until = async (id: string, pred: (record: RunRecord) => boolean, ms = 20_000): Promise<RunRecord> => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      const record = store.getRun(id);
+      if (record && pred(record)) return record;
+      if (Date.now() > deadline) throw new Error(`timed out; status=${record?.status}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
   };
 
@@ -232,6 +243,60 @@ describe('project and workspace secrets in check steps', () => {
     const persisted = store.getRun(record.id)?.graphState?.outputs?.verify;
     expect(persisted?.output).toContain('[REDACTED]');
     expect(persisted?.output).not.toContain(credential);
+
+    store.flush();
+    expect(readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8')).not.toContain(credential);
+  }, 40_000);
+
+  it('scrubs a persisted graph output when a restart replays it into a later agent prompt', async () => {
+    const credential = 'resume-replay-secret-0123456789';
+    await secrets.set(scope, 'RESUME_GATEWAY_KEY', credential);
+    const graph: WorkflowGraph = {
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'first', type: 'check', command: 'echo clean-output' },
+        { id: 'gate', type: 'gate.human', message: 'Ship?' },
+        { id: 'after', type: 'agent', prompt: 'mock:done / {{nodes.first.output}}' },
+      ],
+      edges: [
+        { from: 'start', to: 'first' },
+        { from: 'first', to: 'gate' },
+        { from: 'gate.approve', to: 'after' },
+      ],
+    };
+    const record = manager.startRun(
+      { name: 'graph', source: 'file', steps: graphToSteps(graph), graph },
+      { task: 'x', worktree: false },
+    );
+    const parked = await until(record.id, (run) => run.status === 'waiting');
+    expect(parked.graphState?.cursor).toBe('gate');
+
+    // Simulate a record written before the fresh-path redaction: the old process persisted a
+    // registered checks secret raw. A restart must not hand it to the next agent or re-persist it.
+    store.updateRun(record.id, {
+      graphState: {
+        ...parked.graphState!,
+        outputs: { ...(parked.graphState?.outputs ?? {}), first: { exitCode: 0, output: credential } },
+      },
+    });
+    manager.dispose();
+    store.flush();
+    store = RunStore.open(join(repoRoot, '.ai/cezar'), { keepLive: true });
+    manager = new RunManager(store, repoRoot, { projectId: project, secrets });
+    await manager.recover();
+    await until(record.id, (run) => run.status === 'waiting');
+
+    manager.sendMessage(record.id, [{ type: 'text', text: 'Approve' }]);
+    await settle(record.id);
+
+    const prompts = readFileSync(stdinLog, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => (JSON.parse(line) as { userText: string }).userText);
+    const resumed = prompts.find((text) => text.includes('mock:done /'));
+    expect(resumed).toBeDefined();
+    expect(resumed).toContain('[REDACTED]');
+    expect(resumed).not.toContain(credential);
 
     store.flush();
     expect(readFileSync(join(repoRoot, '.ai/cezar/runs.json'), 'utf8')).not.toContain(credential);

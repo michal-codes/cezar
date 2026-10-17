@@ -4839,7 +4839,21 @@ export class RunManager {
       : undefined;
     const resume = resumeNode ? ctx.resume : undefined;
     const loopCounts = new Map<string, number>(Object.entries(resume?.loops ?? {}));
-    const outputs = new Map<string, Record<string, string | number>>(Object.entries(resume?.outputs ?? {}));
+    // A resumed map comes from a PREVIOUS process and may predate the fresh-path redaction.
+    // Rehydrate the run's checks secrets first, then scrub every string field before any node
+    // reference, condition or persistence can see it.
+    if (resume) await this.rehydrateResumeRedaction(runId);
+    const outputs = new Map<string, Record<string, string | number>>(
+      Object.entries(resume?.outputs ?? {}).map(([nodeId, fields]) => [
+        nodeId,
+        Object.fromEntries(
+          Object.entries(fields).map(([key, value]) => [
+            key,
+            typeof value === 'string' ? this.store.redactRunText(runId, value) : value,
+          ]),
+        ),
+      ]),
+    );
     let checkFailure: string | null = null;
     /** The last agent failure, for the run error when its `failed` port is unwired (v1 wording). */
     let agentFailure: string | undefined;
