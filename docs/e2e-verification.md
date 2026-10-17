@@ -244,11 +244,24 @@ for follow-ups.
 
 ## What cezar gives the check, and what it does not
 
-- **cwd** is the task's worktree, and the command runs under `bash -lc`.
-- **Environment** is the cezar server's own `process.env` plus the **secrets**
-  the step may read (below). There is no per-step `env:` — workflow files are
-  committed, and a secret's value does not belong in them; a step names the
-  secrets it needs instead. Tests with no agent step need no model at all.
+- **cwd** is the task's worktree, and the command runs under
+  `bash --noprofile --norc -c`. It is a non-login shell: your shell profile does
+  not run, so set up anything the command needs in the command itself (or pass
+  it as a secret). `bash -lc` was the old behaviour; a check that relied on a
+  profile-exported variable must now name that variable in
+  `CEZ_ENV_PASSTHROUGH` or store it with `cezar secrets`.
+- **Environment is deliberately small.** The base is a minimal allowlist —
+  `PATH`, `HOME`, locale, temp dir and the usual shell/toolchain variables —
+  plus the **secrets** the step may read (below) and the run context cezar sets.
+  It is not the server's `process.env`: `GITHUB_TOKEN`/`GH_*`, every vendor and
+  cloud credential (`ANTHROPIC_*`, `OPENAI_*`, `AWS_*`, …) and cezar's own
+  `CEZ_*` are dropped. An exported `ANTHROPIC_API_KEY` therefore no longer
+  reaches a check — store it with `cezar secrets set` instead. A host variable
+  a check genuinely needs can be named in `CEZ_ENV_PASSTHROUGH`, but that hatch
+  can never re-open the credential families. There is no per-step `env:` —
+  workflow files are committed, and a secret's value does not belong in them; a
+  step names the secrets it needs instead. Tests with no agent step need no
+  model at all.
 - **Model credentials go in `cezar secrets`, not in your shell.** Store the
   key your provider reads once per project:
 
@@ -261,9 +274,10 @@ for follow-ups.
   (or Settings → *Secrets* in the cockpit; `--workspace` / Settings → Global →
   *Secrets* for a key every project shares). `set` reads the value from stdin —
   run it bare to type it at a hidden prompt — so it never lands in shell history
-  or `ps`. The values are handed to this project's **check steps only** and live
-  encrypted under `~/.cezar/secrets/`, with the data key in your OS keychain
-  when one is available (see [reference](reference.md#workflows) for the file
+  or `ps`. The values are handed to **check steps only** — a project secret to
+  that project's checks, a `--workspace` secret to every project's — and live
+  encrypted under `~/.cezar/secrets/`, with the data key in your OS keychain when
+  one is available (see [reference](reference.md#workflows) for the file
   fallback). A check step gets every secret stored for check steps by default,
   or exactly the ones it binds:
 
@@ -282,12 +296,14 @@ for follow-ups.
   scrubbed from the run transcript or the retry prompt, so keep anything that
   must not be logged above the floor — every real API key already is.
 
-  **Why not just `export ANTHROPIC_API_KEY` before starting cezar?** Because
-  cezar passes provider-prefixed variables (`ANTHROPIC_*`, `OPENAI_*`, …) to
-  the agents it starts. A key exported for e2e would reach every Claude Code or
-  Codex session too, and switch it from the subscription account you chose in
-  Agent accounts to API billing — silently. A secret never reaches an agent:
-  agents are not an audience a secret can have.
+  **Why not just `export ANTHROPIC_API_KEY` before starting cezar?** Two
+  reasons. A check no longer inherits it — exported provider keys are filtered
+  out of the check environment, so exporting one silently does nothing for the
+  check. And cezar passes provider-prefixed variables (`ANTHROPIC_*`,
+  `OPENAI_*`, …) to the agents it starts, so the same export would reach every
+  Claude Code or Codex session and switch it from the subscription account you
+  chose in Agent accounts to API billing — silently. A secret reaches the check
+  and never an agent: agents are not an audience a secret can have.
 - **Use an API key or a service-account key**, not a subscription login: a
   check runs unattended, and `npx e2e login`-style sessions are not supported
   there.
@@ -324,14 +340,25 @@ for follow-ups.
   `CEZ_BRANCH`, `CEZ_BASE`, `CEZ_STEP_ID` and `CEZ_ATTEMPT`, plus
   `CEZ_GITHUB_REPO`/`CEZ_GITHUB_NUMBER`/`CEZ_GITHUB_EVENT` on a run a GitHub
   automation launched — see the [reference](reference.md#workflow-format).
-- **No timeout.** cezar does not bound a check step; e2e's own startup,
-  test and exploration timeouts are what stop a hung app from holding the
-  task's parallel slot. Keep them configured.
+- **Bounded wall clock.** Each command has 20 minutes and a whole check gate —
+  every check of one run, retries included — has 45 minutes. Configure them with
+  `"checkTimeoutMs"` and `"checkGateTimeoutMs"` in `.ai/cezar/config.json`; `0`
+  removes either limit. Keep e2e's own startup, test and exploration timeouts
+  configured too: a timed-out check ends the run, it does not loop back to the
+  agent.
+- **Only the tail comes back.** A check's output is kept to its last 20,000
+  characters, with a marker naming what was elided. The failing line and the
+  test-runner summary are at the tail, so they survive the cap when the output
+  is appended to the retried agent's prompt.
 - **No service orchestration.** e2e starts `app.command` and nothing else. A
   database or a mock stack has to be up before the run, or started by the
   command the config names.
-- **Cancelling a task** sends SIGTERM to the running check, and e2e stops the
-  app process it started.
+- **Cancelling a task** SIGTERMs the check's whole process group, waits 5 s,
+  then SIGKILLs it; e2e's app process is in that group and stops with it.
+- **"Did not run" is never green.** A timeout, a cancellation, a platform
+  without a POSIX shell, or `CEZ_DRY_RUN=1` settles the step as `timed-out`,
+  `cancelled`, `could-not-run` or `skipped` and ends the run instead of looping
+  back to the agent. Only exit 0 is a pass.
 
 ## Verify a pull request
 
@@ -361,6 +388,12 @@ automation whose worktree is the PR's head instead of the base branch:
 (`cezar automation create --file verify-prs.json` — created paused; preview it
 with `cezar automation check <id>` before enabling.) The workflow has no agent
 step: the check is the whole job, and the run settles like any other.
+
+The check's minimal environment does not include `GH_TOKEN`/`GH_*`. `gh` still
+works from its own on-disk login (`gh auth login`) — and if the machine has no
+such login, store a token as a `checks` secret and bind it on the step:
+`secrets: [GH_TOKEN]`. A `GH_TOKEN` merely exported in the server's environment
+is filtered out, by design.
 
 What `checkout: "pr-head"` does at launch:
 

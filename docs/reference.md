@@ -317,6 +317,10 @@ or in Settings. Names are `[A-Z_][A-Z0-9_]*`; `CEZ_*`, `DYLD_*` and shell/loader
 variables (`PATH`, `HOME`, `NODE_OPTIONS`, `LD_PRELOAD`, …) are refused. This is
 where an e2e runner's model key belongs: an exported `ANTHROPIC_API_KEY` or
 `OPENAI_API_KEY` also reaches the agents and switches them to API billing.
+Since the hardened check runner, an exported provider key **no longer reaches a
+check at all** — those families are filtered out of the minimal base env — so an
+older setup that exported `ANTHROPIC_API_KEY` for e2e must migrate it into this
+store (`cezar secrets set ANTHROPIC_API_KEY`; the default audience is `checks`).
 
 Values are stored encrypted (AES-256-GCM) under `~/.cezar/secrets/`, with one
 per-machine data key in the OS keychain (macOS Keychain, Linux Secret Service,
@@ -331,7 +335,9 @@ are stored again.
 
 cezar also tells a check step about the run it is verifying. These are set by
 cezar, not settings — a variable the run does not have is absent (never empty),
-and a value inherited from the server's own environment is replaced:
+and no inherited value leaks through: the minimal base drops the whole `CEZ_*`
+namespace first, so a cezar running inside another cezar task cannot hand the
+check the outer task's id:
 
 | Variable | Value |
 |---|---|

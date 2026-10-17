@@ -237,11 +237,25 @@ features without touching the agents' subscription login.
 
 | Scenario | Before (main) | After |
 | --- | --- | --- |
-| Workflow with checks, nothing stored | `process.env` | same, plus `CEZ_*` context |
+| Workflow with checks, nothing stored | `process.env` | minimal `buildCheckEnv()` base, plus `CEZ_*` context (#1164) |
 | Check step without `secrets:` | — | all `checks`-audience project secrets (PR behavior) |
 | No keychain on the machine | — | file backend, one `note` the first time, never a failure |
 | `@napi-rs/keyring` platform package absent | — | file backend, CLI boots |
 | Agent step with `secrets:` in YAML | — | load-time `stepsIssue`, never a silent drop |
+
+> **Implementation note (2026-10-17, #1164).** The check environment is
+> `{ ...buildCheckEnv(), ...secrets('checks'), ...CHECK_CONTEXT_VARS }`, not
+> `{ ...process.env, ...secrets('checks'), ...context }`: the base is a minimal
+> allowlist, so `GITHUB_TOKEN`/`GH_*`, vendor and cloud credentials and the rest of
+> `CEZ_*` no longer ride along. Context is still layered last, so `CEZ_RUN_ID`,
+> `CEZ_WORKTREE`, `CEZ_SHARED_CACHE_DIR` and friends are present; an untrusted
+> fork head gets the minimal base plus context and **no** secrets.
+> `CEZ_ENV_PASSTHROUGH` forwards individual named host variables but can never
+> re-open a credential family, and `CEZ_AGENT_ENV_FULL` does not apply to checks.
+> **Migration:** an `ANTHROPIC_API_KEY` exported per the older docs no longer
+> reaches a check; store it with `cezar secrets set ANTHROPIC_API_KEY` (the
+> default audience is `checks`). The default-path row above is superseded on
+> that point.
 
 ## Decision (2026-10-10) and what shipped
 

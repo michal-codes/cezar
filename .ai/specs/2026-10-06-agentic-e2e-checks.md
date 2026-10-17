@@ -18,6 +18,21 @@ Throughout, cezar keeps its existing stance on credentials: it never owns, ships
 credential. A check's credential is the project owner's own key, stored on their machine, handed to the one
 process that needs it.
 
+> **Implementation note (2026-10-17, #1164).** The check executor is now
+> `packages/cezar/src/workflows/check-runner.ts`, called from the graph check node. Its environment is
+> `buildCheckEnv()` (a minimal base allowlist) plus the resolved `checks`-audience secrets, then
+> `CHECK_CONTEXT_VARS` — **not** the server's `process.env`. Fork-head (`untrustedHead`) runs get the minimal
+> base and the run context with no secrets. `CEZ_ENV_PASSTHROUGH` forwards individual host variables but can
+> never re-open `GH_*`, the vendor/cloud credential families or the rest of `CEZ_*`. The shell is
+> `bash --noprofile --norc -c` (non-login), each command has a 20-minute wall clock, and cancellation kills the
+> whole process group (`SIGTERM`, 5 s, `SIGKILL`).
+>
+> **Migration for the old "export `ANTHROPIC_API_KEY`" advice:** an exported provider key no longer reaches a
+> check. Store it once with `cezar secrets set ANTHROPIC_API_KEY` (the default audience is `checks`) or bind it
+> in the step's `secrets:`. The compatibility table below is superseded on that row: this is a deliberate
+> security tightening in #1164, not "unchanged". A check that relied on a login-shell profile must source it
+> explicitly or forward the needed variable with `CEZ_ENV_PASSTHROUGH`.
+
 ## Current state (evidence)
 
 All references are to `main` @ `05471fd`.
@@ -26,6 +41,7 @@ All references are to `main` @ `05471fd`.
   `bash -lc <command>` with `env: process.env` (`packages/cezar/src/workflows/run.ts` ~5530). There is no
   per-step and no per-project env. `docs/e2e-verification.md` therefore tells users to "export the model
   credential your provider reads (`AI_GATEWAY_API_KEY`, `ANTHROPIC_API_KEY`, …) before starting cezar".
+  *(Superseded by the 2026-10-17 implementation note above.)*
 - **That advice leaks the key into agent sessions.** Agents get a curated env from `buildChildEnv`
   (`core/agent-env.ts`), and the curation is prefix-based: `claude: ['ANTHROPIC_', 'CLAUDE_']`,
   `codex: ['OPENAI_', 'CODEX_', 'AZURE_OPENAI_']`, and `MULTI_PROVIDER_PREFIXES` for opencode and pi
@@ -205,12 +221,12 @@ docs show the two-call fallback.
 
 | Scenario | Before | After |
 | --- | --- | --- |
-| Workflow with checks, no `check-env` file | check gets `process.env` | same, plus `CEZ_*` context vars |
+| Workflow with checks, no `check-env` file | check gets `process.env` | minimal `buildCheckEnv()` base plus `CEZ_*` context vars (2026-10-17, #1164) |
 | Failing check output in the retry prompt | raw | redacted with host and run secrets |
-| User who exported `ANTHROPIC_API_KEY` per the old docs | works, and leaks into agents | unchanged (no behavior removed); docs now steer to `check-env` |
+| User who exported `ANTHROPIC_API_KEY` per the old docs | works, and leaks into agents | **changed in #1164:** no longer inherited by checks; store it as a `checks` secret. Docs steer to `cezar secrets` |
 | `pull_request.opened` automation without `checkout` | worktree from base | unchanged |
 | `create-pr` on any existing run | works | unchanged; only `forkRef` runs get 409 |
-| `CEZ_DRY_RUN=1` | — | `check-env` resolves normally; Phase 3 makes no `gh`/`git fetch` calls and uses a fixture PR |
+| `CEZ_DRY_RUN=1` | — | `check-env` resolves normally but the check itself spawns nothing: the step is `skipped` and the run ends `failed` (#1164). Phase 3 makes no `gh`/`git fetch` calls and uses a fixture PR |
 
 No timer, lock, cap or timeout is removed. The only behavior change on the zero-config path is the redaction of
 the retry prompt, which can only remove text.
@@ -232,7 +248,7 @@ A `pr-head` launch has exactly these outcomes, and each one ends somewhere:
 | Question | Answer |
 | --- | --- |
 | Why not a per-step `env:` in workflow YAML? | Workflow files are committed. Secrets would end up in the repo, or the YAML would need an interpolation language. A project store keeps values off disk in the repo and off the agent. |
-| Why not reuse `CEZ_ENV_PASSTHROUGH`? | It widens what agents receive. The goal is the opposite. |
+| Why not reuse `CEZ_ENV_PASSTHROUGH` for secrets? | It forwards individual host variables, not values from a store, and it cannot name a secret's scope or audience. Since #1164 it also applies to checks as a narrow hatch, but it can never re-open a credential family; it is not a substitute for the secret store. |
 | Why not put model keys into Agent accounts? | Accounts select how a coding agent authenticates. A check's credential belongs to the project, not to the agent backend, and must never reach the agent. |
 | Should cezar set `E2E_TELEMETRY_FLEET` by default? | No. That is a vendor-specific default in the engine. Documented in `docs/e2e-verification.md`; users can put it in `check-env`. |
 | Does a checks-only workflow work? | Must be verified by a test (below). The PR verification workflow has no agent step. If the engine requires one, fixing that is in scope for Phase 3. |
@@ -250,7 +266,8 @@ Prove-red rule applies: for each fix test, `git stash push -- <source files>`, c
   `check-env`, the claude agent env has no `ANTHROPIC_API_KEY`.
 - `check-retry-redaction.test.ts`: a check that echoes a `check-env` value and a `sk-ant-…` token fails; the
   retried agent's prompt contains `[REDACTED]` and neither value. Red on `main`.
-- Guard: no `check-env` file → check env equals `process.env` plus context vars.
+- Guard: no `check-env` file → check env is the minimal `buildCheckEnv()` base plus context vars, never the
+  full `process.env` (see the 2026-10-17 implementation note).
 
 **Phase 2**
 
